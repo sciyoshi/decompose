@@ -1,48 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 320" role="img" aria-labelledby="title desc">
-  <title id="title">decompose logo</title>
-  <desc id="desc">A cute worm with glasses emerging from soil next to the word decompose.</desc>
-  <defs>
-    <linearGradient id="wormGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#f8b29a"/>
-      <stop offset="100%" stop-color="#e68d72"/>
-    </linearGradient>
-    <linearGradient id="soilGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#2d2320"/>
-      <stop offset="100%" stop-color="#171312"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.25"/>
-    </filter>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 180" role="img" aria-labelledby="title desc">
+  <title id="title">decompose</title>
+  <desc id="desc">A 2x2 grid of rounded tiles with one tile detaching, next to the wordmark "decompose".</desc>
+  <style>
+    .ink { fill: #0f1a1d; }
+    .ink-stroke { stroke: #0f1a1d; }
+    .bg { fill: #ffffff; }
+    .accent { fill: #e8552b; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #e8eaed; }
+      .ink-stroke { stroke: #e8eaed; }
+      .bg { fill: #0d1117; }
+    }
+  </style>
 
-  <rect x="0" y="0" width="980" height="320" fill="#f7faf8"/>
-
-  <g transform="translate(78,22)" filter="url(#shadow)">
-    <path d="M90 210c20-30 14-64 14-96 0-43 28-76 67-76s70 33 70 76v88c0 29-22 52-50 52h-50c-24 0-45-18-51-44z" fill="url(#wormGrad)" stroke="#0f1a1d" stroke-width="6"/>
-    <path d="M104 120h132M101 158h136M98 196h140" stroke="#0f1a1d" stroke-width="6" stroke-linecap="round"/>
-    <circle cx="148" cy="78" r="16" fill="none" stroke="#0f1a1d" stroke-width="7"/>
-    <circle cx="198" cy="78" r="16" fill="none" stroke="#0f1a1d" stroke-width="7"/>
-    <path d="M164 78h18M132 77h-18M214 77h18" stroke="#0f1a1d" stroke-width="7" stroke-linecap="round"/>
-    <path d="M158 106c10 10 30 10 40 0" fill="none" stroke="#0f1a1d" stroke-width="7" stroke-linecap="round"/>
-    <ellipse cx="170" cy="72" rx="4" ry="6" fill="#0f1a1d"/>
-    <ellipse cx="194" cy="72" rx="4" ry="6" fill="#0f1a1d"/>
-
-    <path d="M16 206c28-44 70-52 119-46 24 3 42-9 64-12 58-7 112 14 146 58-13 20-42 29-76 29H82c-33 0-61-9-66-29z" fill="url(#soilGrad)" stroke="#0f1a1d" stroke-width="6"/>
-    <path d="M52 219c14-26 30-33 58-28M117 226c15-21 34-29 55-25M182 224c11-18 28-26 47-22M233 219c12-16 26-20 43-18" fill="none" stroke="#61463d" stroke-width="5" stroke-linecap="round"/>
-    <circle cx="48" cy="224" r="4" fill="#61463d"/>
-    <circle cx="100" cy="206" r="4" fill="#61463d"/>
-    <circle cx="158" cy="212" r="4" fill="#61463d"/>
-    <circle cx="210" cy="204" r="4" fill="#61463d"/>
-    <circle cx="260" cy="220" r="4" fill="#61463d"/>
+  <g transform="translate(30,22)">
+    <!-- 2x2 grid: three attached tiles, one detached -->
+    <rect x="0"  y="72" width="60" height="60" rx="10" class="ink"/>
+    <rect x="72" y="72" width="60" height="60" rx="10" class="ink"/>
+    <rect x="0"  y="0"  width="60" height="60" rx="10" class="ink"/>
+    <!-- Detached tile: translated up-right and rotated, filled with accent -->
+    <g transform="translate(92,-14) rotate(14 30 30)">
+      <rect x="0" y="0" width="60" height="60" rx="10" class="accent"/>
+    </g>
   </g>
 
-  <g transform="translate(420,72)">
-    <rect x="0" y="46" width="128" height="86" rx="14" fill="#152127" stroke="#0f1a1d" stroke-width="4"/>
-    <path d="M28 83l19-18-19-18" fill="none" stroke="#54d36a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-    <rect x="57" y="94" width="40" height="8" rx="4" fill="#54d36a"/>
-  </g>
-
-  <g transform="translate(585,215)">
-    <text x="0" y="0" font-size="112" font-family="ui-rounded, SF Pro Rounded, Nunito, Arial, sans-serif" fill="#0f1a1d" font-weight="800" letter-spacing="1">decompose</text>
+  <g transform="translate(210,124)">
+    <text x="0" y="0"
+          font-family="ui-rounded, 'SF Pro Rounded', Nunito, Inter, system-ui, -apple-system, Segoe UI, Arial, sans-serif"
+          font-size="88"
+          font-weight="800"
+          letter-spacing="-2"
+          class="ink">decompose</text>
   </g>
 </svg>
