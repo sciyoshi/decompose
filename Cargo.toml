@@ -2,9 +2,25 @@
 name = "decompose"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Samuel Cormier-Iijima <samuel@cormier-iijima.com>"]
 description = "A simple and flexible scheduler and orchestrator to manage non-containerized applications"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sciyoshi/decompose"
+homepage = "https://github.com/sciyoshi/decompose"
+documentation = "https://docs.rs/decompose"
+readme = "README.md"
+keywords = ["process", "orchestration", "compose", "daemon", "devtools"]
+categories = ["development-tools", "command-line-utilities"]
+exclude = [
+    "/.github",
+    "/.claude",
+    "/.cursor",
+    "/.decompose",
+    "/examples",
+    "CLAUDE.md",
+    "TASKS.md",
+]
 
 [dependencies]
 anyhow = "1"
