@@ -1,0 +1,9 @@
+processes:
+  hello:
+    command: echo 'Hello World from decompose'
+    
+  date:
+    command: date
+    depends_on:
+      hello:
+        condition: process_completed_successfully

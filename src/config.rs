@@ -1,0 +1,1172 @@
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+
+use crate::model::{
+    DependencyCondition, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime,
+    ProcessStatus, RestartPolicy,
+};
+
+// ---------------------------------------------------------------------------
+// Environment variable container
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct EnvVars(pub BTreeMap<String, String>);
+
+impl EnvVars {
+    pub fn merged(&self, other: &EnvVars) -> BTreeMap<String, String> {
+        let mut out = self.0.clone();
+        out.extend(other.0.clone());
+        out
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvVars {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawEnv {
+            Map(BTreeMap<String, String>),
+            List(Vec<String>),
+        }
+
+        let raw = RawEnv::deserialize(deserializer)?;
+        let mut env = BTreeMap::new();
+
+        match raw {
+            RawEnv::Map(m) => env.extend(m),
+            RawEnv::List(entries) => {
+                for entry in entries {
+                    let (k, v) = entry
+                        .split_once('=')
+                        .ok_or_else(|| serde::de::Error::custom("invalid env entry, expected KEY=VALUE"))?;
+                    env.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+
+        Ok(Self(env))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProjectConfig {
+    #[serde(default)]
+    pub environment: EnvVars,
+    pub processes: BTreeMap<String, ProcessConfig>,
+    #[serde(default)]
+    pub disable_env_expansion: bool,
+    #[serde(default)]
+    pub exit_mode: ExitMode,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProcessConfig {
+    pub command: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub environment: EnvVars,
+    #[serde(default)]
+    pub env_file: Vec<String>,
+    #[serde(default)]
+    pub depends_on: BTreeMap<String, ProcessDependency>,
+    #[serde(default = "default_replicas")]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_log_line: Option<String>,
+    #[serde(default)]
+    pub restart_policy: Option<RestartPolicy>,
+    #[serde(default)]
+    pub backoff_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
+    #[serde(default)]
+    pub shutdown: Option<ShutdownConfig>,
+    #[serde(default)]
+    pub readiness_probe: Option<HealthProbe>,
+    #[serde(default)]
+    pub liveness_probe: Option<HealthProbe>,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+fn default_replicas() -> u16 {
+    1
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ShutdownConfig {
+    #[serde(default = "default_signal")]
+    pub signal: i32,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+fn default_signal() -> i32 {
+    15
+}
+
+fn default_timeout() -> u64 {
+    10
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProcessDependency {
+    #[serde(default)]
+    pub condition: DependencyCondition,
+}
+
+// ---------------------------------------------------------------------------
+// Loading and validation
+// ---------------------------------------------------------------------------
+
+pub fn load_config(path: &Path) -> Result<ProjectConfig> {
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let cfg: ProjectConfig = serde_yaml::from_str(&data).context("invalid yaml")?;
+    validate_config(&cfg)?;
+    Ok(cfg)
+}
+
+pub fn load_and_merge_configs(paths: &[PathBuf]) -> Result<ProjectConfig> {
+    assert!(!paths.is_empty(), "at least one config path is required");
+    let mut cfg = load_config(&paths[0])?;
+    for path in &paths[1..] {
+        let overlay = load_config(path)?;
+        cfg = merge_configs(cfg, overlay);
+    }
+    validate_config(&cfg)?;
+    Ok(cfg)
+}
+
+pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
+    if cfg.processes.is_empty() {
+        bail!("config has no processes");
+    }
+
+    for (name, proc_cfg) in &cfg.processes {
+        if proc_cfg.command.trim().is_empty() {
+            bail!("process `{name}` has an empty command");
+        }
+        if proc_cfg.replicas == 0 {
+            bail!("process `{name}` has replicas=0");
+        }
+        for (dep, dep_cfg) in &proc_cfg.depends_on {
+            if !cfg.processes.contains_key(dep) {
+                bail!("process `{name}` depends on unknown process `{dep}`");
+            }
+            if dep_cfg.condition == DependencyCondition::ProcessLogReady {
+                if let Some(dep_proc) = cfg.processes.get(dep) {
+                    if dep_proc.ready_log_line.is_none() {
+                        bail!(
+                            "process `{name}` depends on `{dep}` with condition process_log_ready, \
+                             but `{dep}` has no ready_log_line defined"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config merging
+// ---------------------------------------------------------------------------
+
+pub fn merge_configs(base: ProjectConfig, overlay: ProjectConfig) -> ProjectConfig {
+    let mut env = base.environment.0;
+    env.extend(overlay.environment.0);
+
+    let mut processes = base.processes;
+    for (name, overlay_proc) in overlay.processes {
+        if let Some(base_proc) = processes.get_mut(&name) {
+            base_proc.command = overlay_proc.command;
+            if overlay_proc.description.is_some() {
+                base_proc.description = overlay_proc.description;
+            }
+            if overlay_proc.working_dir.is_some() {
+                base_proc.working_dir = overlay_proc.working_dir;
+            }
+            base_proc.environment.0.extend(overlay_proc.environment.0);
+            base_proc.depends_on.extend(overlay_proc.depends_on);
+            if !overlay_proc.env_file.is_empty() {
+                base_proc.env_file = overlay_proc.env_file;
+            }
+            if overlay_proc.replicas != 1 {
+                base_proc.replicas = overlay_proc.replicas;
+            }
+            if overlay_proc.ready_log_line.is_some() {
+                base_proc.ready_log_line = overlay_proc.ready_log_line;
+            }
+            if overlay_proc.restart_policy.is_some() {
+                base_proc.restart_policy = overlay_proc.restart_policy;
+            }
+            if overlay_proc.backoff_seconds.is_some() {
+                base_proc.backoff_seconds = overlay_proc.backoff_seconds;
+            }
+            if overlay_proc.max_restarts.is_some() {
+                base_proc.max_restarts = overlay_proc.max_restarts;
+            }
+            if overlay_proc.shutdown.is_some() {
+                base_proc.shutdown = overlay_proc.shutdown;
+            }
+            if overlay_proc.readiness_probe.is_some() {
+                base_proc.readiness_probe = overlay_proc.readiness_probe;
+            }
+            if overlay_proc.liveness_probe.is_some() {
+                base_proc.liveness_probe = overlay_proc.liveness_probe;
+            }
+            if overlay_proc.disabled {
+                base_proc.disabled = true;
+            }
+        } else {
+            processes.insert(name, overlay_proc);
+        }
+    }
+
+    ProjectConfig {
+        environment: EnvVars(env),
+        processes,
+        disable_env_expansion: overlay.disable_env_expansion || base.disable_env_expansion,
+        exit_mode: if overlay.exit_mode != ExitMode::WaitAll {
+            overlay.exit_mode
+        } else {
+            base.exit_mode
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process subset filtering (Phase A3)
+// ---------------------------------------------------------------------------
+
+pub fn filter_process_subset(
+    cfg: &mut ProjectConfig,
+    names: &[String],
+    include_deps: bool,
+) -> Result<()> {
+    for name in names {
+        if !cfg.processes.contains_key(name) {
+            bail!("unknown process `{name}`");
+        }
+    }
+
+    let keep: HashSet<String> = if include_deps {
+        let mut visited = HashSet::new();
+        let mut queue: VecDeque<String> = names.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if let Some(proc_cfg) = cfg.processes.get(&current) {
+                for dep_name in proc_cfg.depends_on.keys() {
+                    queue.push_back(dep_name.clone());
+                }
+            }
+        }
+        visited
+    } else {
+        names.iter().cloned().collect()
+    };
+
+    cfg.processes.retain(|name, _| keep.contains(name));
+
+    // If --no-deps, strip depends_on references to excluded processes
+    if !include_deps {
+        for proc_cfg in cfg.processes.values_mut() {
+            proc_cfg.depends_on.retain(|dep, _| keep.contains(dep));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config path resolution
+// ---------------------------------------------------------------------------
+
+pub fn resolve_config_paths(user_supplied: &[PathBuf], cwd: &Path) -> Result<Vec<PathBuf>> {
+    if user_supplied.is_empty() {
+        let discovered = discover_config(cwd)?;
+        let resolved = if discovered.exists() {
+            discovered
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", discovered.display()))?
+        } else {
+            discovered
+        };
+        return Ok(vec![resolved]);
+    }
+
+    let mut resolved = Vec::with_capacity(user_supplied.len());
+    for path in user_supplied {
+        let abs = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let canonical = if abs.exists() {
+            abs.canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", abs.display()))?
+        } else {
+            abs
+        };
+        resolved.push(canonical);
+    }
+    Ok(resolved)
+}
+
+pub fn discover_config(cwd: &Path) -> Result<PathBuf> {
+    const CANDIDATES: [&str; 4] = ["compose.yml", "compose.yaml", "decompose.yml", "decompose.yaml"];
+    for name in CANDIDATES {
+        let candidate = cwd.join(name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("no config file found (tried compose.yml, compose.yaml, decompose.yml, decompose.yaml)")
+}
+
+// ---------------------------------------------------------------------------
+// .env file loading
+// ---------------------------------------------------------------------------
+
+pub fn parse_dotenv(path: &Path) -> Result<BTreeMap<String, String>> {
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("failed to read env file {}", path.display()))?;
+    parse_dotenv_str(&data)
+}
+
+pub fn parse_dotenv_str(data: &str) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+
+    for line in data.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+
+        let key = key.trim().to_string();
+        let value = strip_quotes(value.trim());
+        env.insert(key, value);
+    }
+
+    Ok(env)
+}
+
+fn strip_quotes(s: &str) -> String {
+    if s.len() >= 2 {
+        if (s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\''))
+        {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+pub fn load_dotenv_files(
+    cwd: &Path,
+    explicit: &[PathBuf],
+    disable_auto: bool,
+) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+
+    if !disable_auto {
+        let dotenv_path = cwd.join(".env");
+        if dotenv_path.exists() {
+            let parsed = parse_dotenv(&dotenv_path)?;
+            env.extend(parsed);
+        }
+    }
+
+    for path in explicit {
+        let abs = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let parsed = parse_dotenv(&abs)?;
+        env.extend(parsed);
+    }
+
+    Ok(env)
+}
+
+// ---------------------------------------------------------------------------
+// Variable interpolation
+// ---------------------------------------------------------------------------
+
+pub fn interpolate_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] != '$' {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 1 < len && chars[i + 1] == '$' {
+            result.push('$');
+            i += 2;
+            continue;
+        }
+
+        if i + 1 < len && chars[i + 1] == '{' {
+            if let Some(close) = chars[i + 2..].iter().position(|&c| c == '}') {
+                let inner: String = chars[i + 2..i + 2 + close].iter().collect();
+                let (var_name, default) = if let Some((name, def)) = inner.split_once(":-") {
+                    (name, Some(def.to_string()))
+                } else {
+                    (inner.as_str(), None)
+                };
+
+                let value = lookup_var(var_name, vars);
+                match value {
+                    Some(v) => result.push_str(&v),
+                    None => {
+                        if let Some(def) = default {
+                            result.push_str(&def);
+                        }
+                    }
+                }
+                i = i + 2 + close + 1;
+                continue;
+            }
+            result.push('$');
+            i += 1;
+            continue;
+        }
+
+        if i + 1 < len && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+            let start = i + 1;
+            let mut end = start;
+            while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            let var_name: String = chars[start..end].iter().collect();
+            if let Some(v) = lookup_var(&var_name, vars) {
+                result.push_str(&v);
+            }
+            i = end;
+            continue;
+        }
+
+        result.push('$');
+        i += 1;
+    }
+
+    result
+}
+
+fn lookup_var(name: &str, vars: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(v) = vars.get(name) {
+        return Some(v.clone());
+    }
+    std::env::var(name).ok()
+}
+
+pub fn apply_interpolation(cfg: &mut ProjectConfig) {
+    if cfg.disable_env_expansion {
+        return;
+    }
+
+    let mut global_vars = BTreeMap::new();
+    let keys: Vec<String> = cfg.environment.0.keys().cloned().collect();
+    for key in &keys {
+        if let Some(raw) = cfg.environment.0.get(key) {
+            let interpolated = interpolate_vars(raw, &global_vars);
+            global_vars.insert(key.clone(), interpolated.clone());
+            cfg.environment.0.insert(key.clone(), interpolated);
+        }
+    }
+
+    for proc_cfg in cfg.processes.values_mut() {
+        let mut vars = global_vars.clone();
+        vars.extend(proc_cfg.environment.0.clone());
+
+        proc_cfg.command = interpolate_vars(&proc_cfg.command, &vars);
+
+        if let Some(ref desc) = proc_cfg.description {
+            proc_cfg.description = Some(interpolate_vars(desc, &vars));
+        }
+
+        if let Some(ref wd) = proc_cfg.working_dir {
+            let interpolated = interpolate_vars(&wd.to_string_lossy(), &vars);
+            proc_cfg.working_dir = Some(PathBuf::from(interpolated));
+        }
+
+        if let Some(ref line) = proc_cfg.ready_log_line {
+            proc_cfg.ready_log_line = Some(interpolate_vars(line, &vars));
+        }
+
+        if let Some(ref mut shutdown) = proc_cfg.shutdown {
+            if let Some(ref cmd) = shutdown.command {
+                shutdown.command = Some(interpolate_vars(cmd, &vars));
+            }
+        }
+
+        let env_keys: Vec<String> = proc_cfg.environment.0.keys().cloned().collect();
+        for key in &env_keys {
+            if let Some(raw) = proc_cfg.environment.0.get(key) {
+                let interpolated = interpolate_vars(raw, &vars);
+                proc_cfg.environment.0.insert(key.clone(), interpolated);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process instance building
+// ---------------------------------------------------------------------------
+
+pub fn build_process_instances(
+    cfg: &ProjectConfig,
+    cwd: &Path,
+    dotenv: &BTreeMap<String, String>,
+) -> BTreeMap<String, ProcessRuntime> {
+    let mut out = BTreeMap::new();
+
+    for (base_name, proc_cfg) in &cfg.processes {
+        for idx in 0..proc_cfg.replicas {
+            let replica = idx + 1;
+            let instance_name = if proc_cfg.replicas > 1 {
+                format!("{base_name}[{replica}]")
+            } else {
+                base_name.clone()
+            };
+
+            let mut env = dotenv.clone();
+            env.extend(cfg.environment.0.clone());
+
+            for env_file_path in &proc_cfg.env_file {
+                let abs = if Path::new(env_file_path).is_absolute() {
+                    PathBuf::from(env_file_path)
+                } else {
+                    cwd.join(env_file_path)
+                };
+                if let Ok(parsed) = parse_dotenv(&abs) {
+                    env.extend(parsed);
+                }
+            }
+
+            env.extend(proc_cfg.environment.0.clone());
+            env.insert("PC_PROC_NAME".to_string(), base_name.clone());
+            env.insert("PC_REPLICA_NUM".to_string(), replica.to_string());
+
+            let working_dir = match &proc_cfg.working_dir {
+                Some(d) if d.is_absolute() => d.clone(),
+                Some(d) => cwd.join(d),
+                None => cwd.to_path_buf(),
+            };
+
+            let depends_on = proc_cfg
+                .depends_on
+                .iter()
+                .map(|(k, dep)| (k.clone(), dep.condition))
+                .collect::<BTreeMap<_, _>>();
+
+            let disabled = proc_cfg.disabled;
+
+            let spec = ProcessInstanceSpec {
+                name: instance_name.clone(),
+                base_name: base_name.clone(),
+                replica,
+                command: proc_cfg.command.clone(),
+                description: proc_cfg.description.clone(),
+                working_dir,
+                environment: env,
+                depends_on,
+                ready_log_line: proc_cfg.ready_log_line.clone(),
+                restart_policy: proc_cfg.restart_policy.unwrap_or(RestartPolicy::No),
+                backoff_seconds: proc_cfg.backoff_seconds.unwrap_or(1),
+                max_restarts: proc_cfg.max_restarts,
+                shutdown_signal: proc_cfg.shutdown.as_ref().map(|s| s.signal),
+                shutdown_timeout_seconds: proc_cfg
+                    .shutdown
+                    .as_ref()
+                    .map(|s| s.timeout_seconds)
+                    .unwrap_or(10),
+                shutdown_command: proc_cfg
+                    .shutdown
+                    .as_ref()
+                    .and_then(|s| s.command.clone()),
+                readiness_probe: proc_cfg.readiness_probe.clone(),
+                liveness_probe: proc_cfg.liveness_probe.clone(),
+                disabled,
+            };
+
+            out.insert(
+                instance_name,
+                ProcessRuntime {
+                    spec,
+                    status: if disabled {
+                        ProcessStatus::Disabled
+                    } else {
+                        ProcessStatus::Pending
+                    },
+                    started_once: false,
+                    log_ready: false,
+                    restart_count: 0,
+                    healthy: false,
+                },
+            );
+        }
+    }
+
+    out
+}
+
+/// Resolve a single optional config path (backward compat).
+pub fn resolve_config_path(user_supplied: Option<PathBuf>, cwd: &Path) -> Result<PathBuf> {
+    let paths = match user_supplied {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    let mut resolved = resolve_config_paths(&paths, cwd)?;
+    Ok(resolved.remove(0))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn env_vars_deserialize_from_map() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo hi"
+environment:
+  A: "1"
+  B: "2"
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        assert_eq!(cfg.environment.0.get("A"), Some(&"1".to_string()));
+        assert_eq!(cfg.environment.0.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn env_vars_deserialize_from_list() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo hi"
+environment:
+  - A=1
+  - B=2
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        assert_eq!(cfg.environment.0.get("A"), Some(&"1".to_string()));
+        assert_eq!(cfg.environment.0.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_dependency() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo hi"
+    depends_on:
+      missing:
+        condition: process_started
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject missing dep");
+        assert!(err.to_string().contains("depends on unknown process"));
+    }
+
+    #[test]
+    fn validate_rejects_log_ready_without_ready_log_line() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo hi"
+    depends_on:
+      b:
+        condition: process_log_ready
+  b:
+    command: "echo"
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject missing ready_log_line");
+        assert!(err.to_string().contains("ready_log_line"));
+    }
+
+    #[test]
+    fn validate_accepts_log_ready_with_ready_log_line() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo hi"
+    depends_on:
+      b:
+        condition: process_log_ready
+  b:
+    command: "echo ready"
+    ready_log_line: "ready"
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        validate_config(&cfg).expect("should be valid");
+    }
+
+    #[test]
+    fn build_instances_applies_replicas_and_injected_env() {
+        let yaml = r#"
+environment:
+  GLOBAL: g
+processes:
+  api:
+    command: "echo hi"
+    replicas: 2
+    environment:
+      LOCAL: l
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        validate_config(&cfg).expect("valid config");
+        let cwd = Path::new("/tmp");
+        let dotenv = BTreeMap::new();
+        let out = build_process_instances(&cfg, cwd, &dotenv);
+
+        assert_eq!(out.len(), 2);
+        let first = out.get("api[1]").expect("first replica");
+        let second = out.get("api[2]").expect("second replica");
+        assert_eq!(first.spec.environment.get("GLOBAL"), Some(&"g".to_string()));
+        assert_eq!(first.spec.environment.get("LOCAL"), Some(&"l".to_string()));
+        assert_eq!(
+            first.spec.environment.get("PC_REPLICA_NUM"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            second.spec.environment.get("PC_REPLICA_NUM"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[test]
+    fn build_instances_includes_restart_fields() {
+        let yaml = r#"
+processes:
+  api:
+    command: "echo hi"
+    restart_policy: on_failure
+    backoff_seconds: 5
+    max_restarts: 3
+    shutdown:
+      signal: 9
+      timeout_seconds: 30
+      command: "cleanup.sh"
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cwd = Path::new("/tmp");
+        let dotenv = BTreeMap::new();
+        let out = build_process_instances(&cfg, cwd, &dotenv);
+
+        let api = out.get("api").expect("api process");
+        assert_eq!(api.spec.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(api.spec.backoff_seconds, 5);
+        assert_eq!(api.spec.max_restarts, Some(3));
+        assert_eq!(api.spec.shutdown_signal, Some(9));
+        assert_eq!(api.spec.shutdown_timeout_seconds, 30);
+        assert_eq!(api.spec.shutdown_command, Some("cleanup.sh".to_string()));
+    }
+
+    #[test]
+    fn discover_config_uses_documented_priority() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::write(root.join("decompose.yaml"), "processes: {a: {command: 'echo'}}").expect("write");
+        fs::write(root.join("compose.yaml"), "processes: {a: {command: 'echo'}}").expect("write");
+        fs::write(root.join("compose.yml"), "processes: {a: {command: 'echo'}}").expect("write");
+
+        let chosen = discover_config(root).expect("discover");
+        assert_eq!(chosen, root.join("compose.yml"));
+    }
+
+    #[test]
+    fn merge_overlays_process_fields() {
+        let base_yaml = r#"
+processes:
+  api:
+    command: "echo base"
+    description: "base desc"
+    replicas: 1
+    environment:
+      A: "1"
+"#;
+        let overlay_yaml = r#"
+processes:
+  api:
+    command: "echo overlay"
+    replicas: 3
+    environment:
+      B: "2"
+"#;
+        let base: ProjectConfig = serde_yaml::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml::from_str(overlay_yaml).unwrap();
+        let merged = merge_configs(base, overlay);
+
+        let api = merged.processes.get("api").unwrap();
+        assert_eq!(api.command, "echo overlay");
+        assert_eq!(api.description.as_deref(), Some("base desc"));
+        assert_eq!(api.replicas, 3);
+        assert_eq!(api.environment.0.get("A"), Some(&"1".to_string()));
+        assert_eq!(api.environment.0.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn merge_adds_new_processes() {
+        let base_yaml = r#"
+processes:
+  api:
+    command: "echo api"
+"#;
+        let overlay_yaml = r#"
+processes:
+  worker:
+    command: "echo worker"
+"#;
+        let base: ProjectConfig = serde_yaml::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml::from_str(overlay_yaml).unwrap();
+        let merged = merge_configs(base, overlay);
+
+        assert!(merged.processes.contains_key("api"));
+        assert!(merged.processes.contains_key("worker"));
+    }
+
+    #[test]
+    fn merge_global_env() {
+        let base_yaml = r#"
+environment:
+  A: "1"
+  B: "base"
+processes:
+  x:
+    command: "echo"
+"#;
+        let overlay_yaml = r#"
+environment:
+  B: "overlay"
+  C: "3"
+processes:
+  x:
+    command: "echo"
+"#;
+        let base: ProjectConfig = serde_yaml::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml::from_str(overlay_yaml).unwrap();
+        let merged = merge_configs(base, overlay);
+
+        assert_eq!(merged.environment.0.get("A"), Some(&"1".to_string()));
+        assert_eq!(merged.environment.0.get("B"), Some(&"overlay".to_string()));
+        assert_eq!(merged.environment.0.get("C"), Some(&"3".to_string()));
+    }
+
+    #[test]
+    fn load_and_merge_works() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().join("base.yaml");
+        let overlay_path = dir.path().join("overlay.yaml");
+
+        fs::write(&base_path, r#"
+processes:
+  api:
+    command: "echo base"
+    environment:
+      PORT: "3000"
+"#).unwrap();
+
+        fs::write(&overlay_path, r#"
+processes:
+  api:
+    command: "echo overlay"
+    environment:
+      PORT: "8080"
+"#).unwrap();
+
+        let cfg = load_and_merge_configs(&[base_path, overlay_path]).unwrap();
+        let api = cfg.processes.get("api").unwrap();
+        assert_eq!(api.command, "echo overlay");
+        assert_eq!(api.environment.0.get("PORT"), Some(&"8080".to_string()));
+    }
+
+    #[test]
+    fn filter_process_subset_with_deps() {
+        let yaml = r#"
+processes:
+  db:
+    command: "echo db"
+  api:
+    command: "echo api"
+    depends_on:
+      db:
+        condition: process_started
+  worker:
+    command: "echo worker"
+"#;
+        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        filter_process_subset(&mut cfg, &["api".to_string()], true).unwrap();
+        assert!(cfg.processes.contains_key("api"));
+        assert!(cfg.processes.contains_key("db"));
+        assert!(!cfg.processes.contains_key("worker"));
+    }
+
+    #[test]
+    fn filter_process_subset_no_deps() {
+        let yaml = r#"
+processes:
+  db:
+    command: "echo db"
+  api:
+    command: "echo api"
+    depends_on:
+      db:
+        condition: process_started
+  worker:
+    command: "echo worker"
+"#;
+        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        filter_process_subset(&mut cfg, &["api".to_string()], false).unwrap();
+        assert!(cfg.processes.contains_key("api"));
+        assert!(!cfg.processes.contains_key("db"));
+        // depends_on should be stripped for excluded processes
+        assert!(cfg.processes.get("api").unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn filter_process_subset_rejects_unknown() {
+        let yaml = r#"
+processes:
+  api:
+    command: "echo"
+"#;
+        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = filter_process_subset(&mut cfg, &["nope".to_string()], true).unwrap_err();
+        assert!(err.to_string().contains("unknown process"));
+    }
+
+    #[test]
+    fn parse_dotenv_basic() {
+        let data = r#"
+# comment
+KEY1=value1
+KEY2="quoted value"
+KEY3='single quoted'
+export KEY4=exported
+
+"#;
+        let env = parse_dotenv_str(data).unwrap();
+        assert_eq!(env.get("KEY1"), Some(&"value1".to_string()));
+        assert_eq!(env.get("KEY2"), Some(&"quoted value".to_string()));
+        assert_eq!(env.get("KEY3"), Some(&"single quoted".to_string()));
+        assert_eq!(env.get("KEY4"), Some(&"exported".to_string()));
+    }
+
+    #[test]
+    fn load_dotenv_from_cwd() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "AUTO=loaded\n").unwrap();
+
+        let env = load_dotenv_files(dir.path(), &[], false).unwrap();
+        assert_eq!(env.get("AUTO"), Some(&"loaded".to_string()));
+    }
+
+    #[test]
+    fn load_dotenv_disabled() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "AUTO=loaded\n").unwrap();
+
+        let env = load_dotenv_files(dir.path(), &[], true).unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn load_dotenv_explicit_overrides() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "KEY=auto\n").unwrap();
+        fs::write(dir.path().join("custom.env"), "KEY=custom\n").unwrap();
+
+        let explicit = vec![dir.path().join("custom.env")];
+        let env = load_dotenv_files(dir.path(), &explicit, false).unwrap();
+        assert_eq!(env.get("KEY"), Some(&"custom".to_string()));
+    }
+
+    #[test]
+    fn dotenv_precedence_in_build_instances() {
+        let yaml = r#"
+environment:
+  GLOBAL: from_config
+processes:
+  api:
+    command: "echo"
+    environment:
+      LOCAL: from_process
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cwd = Path::new("/tmp");
+        let mut dotenv = BTreeMap::new();
+        dotenv.insert("GLOBAL".to_string(), "from_dotenv".to_string());
+        dotenv.insert("DOTONLY".to_string(), "dotenv_val".to_string());
+
+        let out = build_process_instances(&cfg, cwd, &dotenv);
+        let api = out.get("api").unwrap();
+        assert_eq!(api.spec.environment.get("GLOBAL"), Some(&"from_config".to_string()));
+        assert_eq!(api.spec.environment.get("DOTONLY"), Some(&"dotenv_val".to_string()));
+        assert_eq!(api.spec.environment.get("LOCAL"), Some(&"from_process".to_string()));
+    }
+
+    #[test]
+    fn interpolate_basic_braced() {
+        let mut vars = BTreeMap::new();
+        vars.insert("NAME".to_string(), "world".to_string());
+        assert_eq!(interpolate_vars("hello ${NAME}", &vars), "hello world");
+    }
+
+    #[test]
+    fn interpolate_basic_unbraced() {
+        let mut vars = BTreeMap::new();
+        vars.insert("NAME".to_string(), "world".to_string());
+        assert_eq!(interpolate_vars("hello $NAME!", &vars), "hello world!");
+    }
+
+    #[test]
+    fn interpolate_default_value() {
+        let vars = BTreeMap::new();
+        assert_eq!(interpolate_vars("${MISSING:-fallback}", &vars), "fallback");
+    }
+
+    #[test]
+    fn interpolate_default_not_used_when_set() {
+        let mut vars = BTreeMap::new();
+        vars.insert("VAR".to_string(), "actual".to_string());
+        assert_eq!(interpolate_vars("${VAR:-fallback}", &vars), "actual");
+    }
+
+    #[test]
+    fn interpolate_dollar_escape() {
+        let vars = BTreeMap::new();
+        assert_eq!(interpolate_vars("price is $$5", &vars), "price is $5");
+    }
+
+    #[test]
+    fn interpolate_undefined_becomes_empty() {
+        let vars = BTreeMap::new();
+        assert_eq!(interpolate_vars("hello ${UNDEF} world", &vars), "hello  world");
+    }
+
+    #[test]
+    fn interpolate_lone_dollar() {
+        let vars = BTreeMap::new();
+        assert_eq!(interpolate_vars("just $ here", &vars), "just $ here");
+    }
+
+    #[test]
+    fn interpolate_multiple_vars() {
+        let mut vars = BTreeMap::new();
+        vars.insert("A".to_string(), "1".to_string());
+        vars.insert("B".to_string(), "2".to_string());
+        assert_eq!(interpolate_vars("$A and ${B}", &vars), "1 and 2");
+    }
+
+    #[test]
+    fn apply_interpolation_on_config() {
+        let yaml = r#"
+environment:
+  VERSION: "1.0"
+processes:
+  api:
+    command: "run --version ${VERSION}"
+    description: "API v${VERSION}"
+"#;
+        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        apply_interpolation(&mut cfg);
+
+        let api = cfg.processes.get("api").unwrap();
+        assert_eq!(api.command, "run --version 1.0");
+        assert_eq!(api.description.as_deref(), Some("API v1.0"));
+    }
+
+    #[test]
+    fn apply_interpolation_disabled() {
+        let yaml = r#"
+disable_env_expansion: true
+environment:
+  VERSION: "1.0"
+processes:
+  api:
+    command: "run --version ${VERSION}"
+"#;
+        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        apply_interpolation(&mut cfg);
+
+        let api = cfg.processes.get("api").unwrap();
+        assert_eq!(api.command, "run --version ${VERSION}");
+    }
+
+    #[test]
+    fn resolve_config_paths_empty_uses_discovery() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("decompose.yaml"), "processes: {a: {command: 'echo'}}").unwrap();
+
+        let paths = resolve_config_paths(&[], dir.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("decompose.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_paths_explicit() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("custom.yaml");
+        fs::write(&p, "processes: {a: {command: 'echo'}}").unwrap();
+
+        let paths = resolve_config_paths(&[p.clone()], dir.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn exit_mode_deserialization() {
+        let yaml = r#"
+exit_mode: exit_on_failure
+processes:
+  a:
+    command: "echo"
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.exit_mode, ExitMode::ExitOnFailure);
+    }
+}

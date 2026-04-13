@@ -1,0 +1,23 @@
+environment:
+  GLOBAL_ENV: "This is a global environment variable"
+
+processes:
+  env_example:
+    command: |
+      echo "Global environment: $GLOBAL_ENV"
+      echo "Process name: $PC_PROC_NAME"
+      echo "Replica number: $PC_REPLICA_NUM"
+    environment:
+      LOCAL_ENV: "This is a local environment variable"
+      EXAMPLE_PATH: "/path/to/example"
+    
+  env_consumer:
+    command: |
+      echo "Process environment variables:"
+      echo "- LOCAL_ENV: $LOCAL_ENV"
+      echo "- EXAMPLE_PATH: $EXAMPLE_PATH"
+    environment:
+      LOCAL_ENV: "This is the consumer's environment variable"
+    depends_on:
+      env_example:
+        condition: process_completed_successfully

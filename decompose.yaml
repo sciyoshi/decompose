@@ -1,0 +1,20 @@
+processes:
+  process1:
+    description: This process will sleep for 2 seconds
+    command: "sleep 1 && echo 'Process 1 completed'"
+    
+  process2:
+    description: This process will sleep for 3 seconds
+    command: "sleep 60 && echo 'Process 2 completed'"
+    depends_on:
+      process1:
+        condition: process_completed_successfully
+        
+  process3:
+    description: This process runs after both process1 and process2
+    command: "echo 'All processes completed!'"
+    depends_on:
+      process1:
+        condition: process_completed_successfully
+      process2:
+        condition: process_completed_successfully
