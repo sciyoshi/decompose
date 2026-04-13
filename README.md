@@ -8,6 +8,47 @@
 No image builds. No container cold starts. No bridge-network translation overhead.  
 Just your real processes, fast, with a familiar compose-like interface.
 
+## Installing
+
+### From crates.io
+
+```bash
+cargo install decompose
+```
+
+### Prebuilt binaries
+
+Download a tarball for your platform from the [latest release](https://github.com/sciyoshi/decompose/releases/latest), extract it, and put `decompose` on your `$PATH`. Builds are published for:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+### With Nix
+
+Run without installing:
+
+```bash
+nix run github:sciyoshi/decompose -- up
+```
+
+Or install into your profile:
+
+```bash
+nix profile install github:sciyoshi/decompose
+```
+
+The flake also exposes a `devShell` for contributors — `nix develop` drops you into a shell with `cargo`, `rustc`, `rustfmt`, and `clippy` pinned.
+
+### From source
+
+```bash
+git clone https://github.com/sciyoshi/decompose
+cd decompose
+cargo install --path .
+```
+
 ## Why this is better for day-to-day coding
 
 - **Native performance**: run directly on host processes and filesystems.
