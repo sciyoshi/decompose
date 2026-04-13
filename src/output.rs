@@ -57,19 +57,52 @@ pub fn print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    use super::env_truthy;
+
+    // These tests mutate process-global env vars so they must run serially.
+    // Each test uses a unique var name to avoid cross-contamination.
+
     #[test]
-    fn env_truthy_parses_common_values() {
-        assert!(env_truthy_from("TRUE"));
-        assert!(env_truthy_from("1"));
-        assert!(env_truthy_from("yes"));
-        assert!(!env_truthy_from("false"));
-        assert!(!env_truthy_from("0"));
+    fn env_truthy_recognizes_truthy_values() {
+        for (i, value) in ["1", "true", "TRUE", "Yes", "on"].iter().enumerate() {
+            let key = format!("_DECOMPOSE_ENV_TRUTHY_TEST_POS_{i}");
+            // SAFETY: single-threaded test, unique key per iteration.
+            unsafe {
+                std::env::set_var(&key, value);
+            }
+            assert!(
+                env_truthy(&key),
+                "expected {value:?} to be truthy"
+            );
+            unsafe {
+                std::env::remove_var(&key);
+            }
+        }
     }
 
-    fn env_truthy_from(input: &str) -> bool {
-        matches!(
-            input.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
+    #[test]
+    fn env_truthy_rejects_falsy_values() {
+        for (i, value) in ["0", "false", "no", "", "random"].iter().enumerate() {
+            let key = format!("_DECOMPOSE_ENV_TRUTHY_TEST_NEG_{i}");
+            unsafe {
+                std::env::set_var(&key, value);
+            }
+            assert!(
+                !env_truthy(&key),
+                "expected {value:?} to be falsy"
+            );
+            unsafe {
+                std::env::remove_var(&key);
+            }
+        }
+    }
+
+    #[test]
+    fn env_truthy_returns_false_when_unset() {
+        let key = "_DECOMPOSE_ENV_TRUTHY_TEST_UNSET";
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(!env_truthy(key));
     }
 }

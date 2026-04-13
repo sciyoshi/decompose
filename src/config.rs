@@ -184,6 +184,71 @@ pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
         }
     }
 
+    detect_dependency_cycles(cfg)?;
+
+    Ok(())
+}
+
+/// Walk the `depends_on` graph with a DFS three-coloring. Returns an error
+/// describing the cycle if one is found.
+///
+/// Assumes all dependency names refer to existing processes (checked earlier
+/// in `validate_config`). A self-dependency `a -> a` is reported as the
+/// one-node cycle `a -> a`.
+fn detect_dependency_cycles(cfg: &ProjectConfig) -> Result<()> {
+    use std::collections::HashMap;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+
+    fn dfs(
+        node: &str,
+        cfg: &ProjectConfig,
+        color: &mut HashMap<String, Color>,
+        path: &mut Vec<String>,
+    ) -> Result<()> {
+        color.insert(node.to_string(), Color::Gray);
+        path.push(node.to_string());
+
+        if let Some(proc) = cfg.processes.get(node) {
+            for dep in proc.depends_on.keys() {
+                match color.get(dep).copied().unwrap_or(Color::White) {
+                    Color::Gray => {
+                        let cycle_start = path.iter().position(|n| n == dep).unwrap_or(0);
+                        let mut cycle: Vec<String> = path[cycle_start..].to_vec();
+                        cycle.push(dep.clone());
+                        bail!("dependency cycle detected: {}", cycle.join(" -> "));
+                    }
+                    Color::White => {
+                        dfs(dep, cfg, color, path)?;
+                    }
+                    Color::Black => {}
+                }
+            }
+        }
+
+        color.insert(node.to_string(), Color::Black);
+        path.pop();
+        Ok(())
+    }
+
+    let mut color: HashMap<String, Color> = cfg
+        .processes
+        .keys()
+        .map(|k| (k.clone(), Color::White))
+        .collect();
+
+    for start in cfg.processes.keys() {
+        if color.get(start).copied() == Some(Color::White) {
+            let mut path: Vec<String> = Vec::new();
+            dfs(start, cfg, &mut color, &mut path)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -645,16 +710,6 @@ pub fn build_process_instances(
     out
 }
 
-/// Resolve a single optional config path (backward compat).
-pub fn resolve_config_path(user_supplied: Option<PathBuf>, cwd: &Path) -> Result<PathBuf> {
-    let paths = match user_supplied {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    let mut resolved = resolve_config_paths(&paths, cwd)?;
-    Ok(resolved.remove(0))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -727,6 +782,100 @@ processes:
         let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
         let err = validate_config(&cfg).expect_err("must reject missing ready_log_line");
         assert!(err.to_string().contains("ready_log_line"));
+    }
+
+    #[test]
+    fn validate_rejects_self_dependency() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo hi"
+    depends_on:
+      a:
+        condition: process_started
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject self dependency");
+        assert!(
+            err.to_string().contains("dependency cycle detected"),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("a -> a"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_two_node_cycle() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo a"
+    depends_on:
+      b:
+        condition: process_started
+  b:
+    command: "echo b"
+    depends_on:
+      a:
+        condition: process_started
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject cycle");
+        assert!(
+            err.to_string().contains("dependency cycle detected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_transitive_cycle() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo a"
+    depends_on:
+      b:
+        condition: process_started
+  b:
+    command: "echo b"
+    depends_on:
+      c:
+        condition: process_started
+  c:
+    command: "echo c"
+    depends_on:
+      a:
+        condition: process_started
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject transitive cycle");
+        assert!(
+            err.to_string().contains("dependency cycle detected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_dag() {
+        // a -> b -> c, and a -> c directly. Not a cycle.
+        let yaml = r#"
+processes:
+  a:
+    command: "echo a"
+    depends_on:
+      b:
+        condition: process_started
+      c:
+        condition: process_started
+  b:
+    command: "echo b"
+    depends_on:
+      c:
+        condition: process_started
+  c:
+    command: "echo c"
+"#;
+        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        validate_config(&cfg).expect("dag should validate");
     }
 
     #[test]

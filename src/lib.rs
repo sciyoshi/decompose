@@ -22,7 +22,7 @@ use tokio::time::sleep;
 use crate::cli::{
     Cli, Commands, GlobalArgs, LogsArgs, PortsCommand, ProcessCommand, ServiceArgs, UpArgs,
 };
-use crate::config::resolve_config_paths;
+use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{PortsRequest, Request, Response, send_request};
 use crate::output::{OutputMode, print_json};
@@ -75,6 +75,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if let Ok(Response::Pong { pid, .. }) = send_request(&paths, Request::Ping).await {
         daemon_pid = Some(pid);
     } else {
+        // Pre-flight: validate the merged config before spawning the daemon,
+        // so users see errors like dependency cycles directly instead of a
+        // generic "daemon did not become ready" timeout.
+        load_and_merge_configs(&config_files)
+            .context("config validation failed before starting daemon")?;
+
         spawn_daemon_process(
             &cwd,
             &config_files,

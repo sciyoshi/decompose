@@ -42,10 +42,11 @@ relearning.
 
 ## 3. Correctness and robustness
 
-- [ ] **3a. Dependency cycle detection.** `validate_config` should detect
-  cycles in `depends_on` with a DFS and return a clear error. Currently a
-  cycle makes both processes hang forever in `Pending` with no diagnosis.
-  **Severity: high — silent hang.**
+- [x] **3a. Dependency cycle detection.** `validate_config` now runs a
+  three-color DFS over `depends_on` and reports the cycle path
+  (e.g. `a -> b -> a`). `run_up` does a pre-flight `load_and_merge_configs`
+  call so the error is surfaced at the CLI immediately instead of
+  manifesting as a generic "daemon did not become ready" timeout.
 - [ ] **3b. Stale daemon cleanup.** On `up`, if the pid file exists but the
   process isn't alive, clean up stale socket/pid files and spawn fresh.
 - [ ] **3c. IPC timeout.** Wrap `send_request` in `tokio::time::timeout`. A
@@ -83,8 +84,7 @@ relearning.
   initial spawn/restart).
 - [ ] **5b. Extract log-tailing helper in lib.rs.** `stream_daemon_logs` and
   `stream_filtered_logs` share the same file-tailing logic.
-- [ ] **5c. Remove dead code.** `resolve_config_path` (singular) in
-  `config.rs` appears unused.
+- [x] **5c. Remove dead code.** `resolve_config_path` (singular) removed.
 - [ ] **5d. Fix scale-down replica cleanup.** `handle_client` signals excess
   replicas to stop but never removes them from the process map.
 
@@ -105,5 +105,5 @@ relearning.
 - [ ] **7d. JSON output snapshot tests** for `ps` output stability.
 - [ ] **7e. Session isolation integration tests** — two `--session` values
   should not interfere.
-- [ ] **7f. Fix `output.rs` `env_truthy` test** — currently reimplements the
-  function inline instead of testing the real code path.
+- [x] **7f. Fix `output.rs` `env_truthy` test.** Now calls the real
+  `env_truthy` function against actual env vars with unique keys per case.
