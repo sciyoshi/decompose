@@ -23,7 +23,13 @@ pub enum Commands {
     Attach(GlobalArgs),
     /// View process logs.
     Logs(LogsArgs),
-    /// Process management operations.
+    /// Start one or more previously-stopped services. With no args, starts all.
+    Start(ServiceArgs),
+    /// Stop one or more services. With no args, stops all.
+    Stop(ServiceArgs),
+    /// Restart one or more services. With no args, restarts all.
+    Restart(ServiceArgs),
+    /// Process management operations (scale, etc.).
     Process {
         #[command(flatten)]
         global: GlobalArgs,
@@ -61,28 +67,24 @@ pub struct GlobalArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
-    /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
-    #[arg(short = 'f', long = "file")]
-    pub config_files: Vec<PathBuf>,
-    /// Session/project name override for instance identity.
-    #[arg(long = "session", alias = "project-name", env = "DECOMPOSE_SESSION")]
-    pub session: Option<String>,
-    /// Additional .env files to load.
-    #[arg(short = 'e', long = "env-file")]
-    pub env_files: Vec<PathBuf>,
-    /// Disable automatic .env file loading.
-    #[arg(long = "disable-dotenv")]
-    pub disable_dotenv: bool,
+    #[command(flatten)]
+    pub global: GlobalArgs,
     /// Start and return immediately.
     #[arg(short = 'd', long = "detach")]
     pub detach: bool,
     /// Do not start dependency processes automatically.
     #[arg(long = "no-deps")]
     pub no_deps: bool,
-    #[command(flatten)]
-    pub output: OutputArgs,
     /// Start only these processes (and their dependencies, unless --no-deps).
     pub processes: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServiceArgs {
+    #[command(flatten)]
+    pub global: GlobalArgs,
+    /// Service(s) to operate on. If none, the operation applies to all services.
+    pub services: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -107,21 +109,6 @@ pub enum ProcessCommand {
         process: String,
         /// Number of replicas.
         replicas: u16,
-    },
-    /// Stop a running process.
-    Stop {
-        /// Process name to stop.
-        process: String,
-    },
-    /// Start a stopped or pending process.
-    Start {
-        /// Process name to start.
-        process: String,
-    },
-    /// Restart a process (stop then start).
-    Restart {
-        /// Process name to restart.
-        process: String,
     },
 }
 

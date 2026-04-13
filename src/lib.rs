@@ -19,7 +19,9 @@ use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use crate::cli::{Cli, Commands, GlobalArgs, LogsArgs, PortsCommand, ProcessCommand, UpArgs};
+use crate::cli::{
+    Cli, Commands, GlobalArgs, LogsArgs, PortsCommand, ProcessCommand, ServiceArgs, UpArgs,
+};
 use crate::config::resolve_config_paths;
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{PortsRequest, Request, Response, send_request};
@@ -35,14 +37,24 @@ pub async fn run_cli() -> Result<()> {
         Commands::Ps(args) => run_ps(args).await,
         Commands::Attach(args) => run_attach(args).await,
         Commands::Logs(args) => run_logs(args).await,
+        Commands::Start(args) => run_service_command(args, ServiceOp::Start).await,
+        Commands::Stop(args) => run_service_command(args, ServiceOp::Stop).await,
+        Commands::Restart(args) => run_service_command(args, ServiceOp::Restart).await,
         Commands::Process { global, command } => run_process(global, command).await,
         Commands::Ports { global, command } => run_ports(global, command).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ServiceOp {
+    Start,
+    Stop,
+    Restart,
+}
+
 async fn run_up(args: UpArgs) -> Result<()> {
-    let output_mode = args.output.resolve();
+    let output_mode = args.global.output.resolve();
     let attached = !args.detach;
     let mut got_ctrl_c = false;
     let ctrl_c_task = if attached {
@@ -53,9 +65,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None
     };
     let cwd = env::current_dir().context("failed to read current directory")?;
-    let config_files = resolve_config_paths(&args.config_files, &cwd)?;
+    let config_files = resolve_config_paths(&args.global.config_files, &cwd)?;
     let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
-    let instance = build_instance_id(args.session.as_deref(), &config_dir, &config_files);
+    let instance = build_instance_id(args.global.session.as_deref(), &config_dir, &config_files);
     let paths = runtime_paths_for(&instance)?;
     let mut daemon_pid = None;
     let mut state = "already_running";
@@ -68,8 +80,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
             &config_files,
             &instance,
             &paths,
-            &args.env_files,
-            args.disable_dotenv,
+            &args.global.env_files,
+            args.global.disable_dotenv,
             &args.processes,
             args.no_deps,
         )?;
@@ -124,8 +136,16 @@ async fn run_up(args: UpArgs) -> Result<()> {
 
 async fn run_down(args: GlobalArgs) -> Result<()> {
     let (_, _, paths) = runtime_context(&args.config_files, args.session.as_deref()).await?;
-    let response = send_request(&paths, Request::Down).await?;
     let output_mode = args.output.resolve();
+
+    let response = match send_request(&paths, Request::Down).await {
+        Ok(response) => response,
+        Err(err) if is_no_daemon_error(&err, &paths) => {
+            emit_message(output_mode, "ok", "no running environment");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     match response {
         Response::Ack { message } => {
@@ -172,7 +192,7 @@ async fn run_attach(args: GlobalArgs) -> Result<()> {
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
-        _ => bail!("no running daemon found"),
+        _ => bail!("no running environment for this project — start one with `decompose up`"),
     };
 
     emit_attach(output_mode);
@@ -201,7 +221,7 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
-        _ => bail!("no running daemon found"),
+        _ => bail!("no running environment for this project — start one with `decompose up`"),
     };
 
     if args.follow {
@@ -229,6 +249,16 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
             }
             None => filtered,
         };
+        if output.is_empty() {
+            if args.processes.is_empty() {
+                eprintln!("(no log output yet)");
+            } else {
+                eprintln!(
+                    "(no log output for: {}. Check `decompose ps` for available services.)",
+                    args.processes.join(", ")
+                );
+            }
+        }
         for line in output {
             println!("{line}");
         }
@@ -243,9 +273,34 @@ async fn run_process(args: GlobalArgs, command: ProcessCommand) -> Result<()> {
 
     let request = match command {
         ProcessCommand::Scale { process, replicas } => Request::Scale { process, replicas },
-        ProcessCommand::Stop { process } => Request::Stop { process },
-        ProcessCommand::Start { process } => Request::Start { process },
-        ProcessCommand::Restart { process } => Request::Restart { process },
+    };
+
+    let response = send_request(&paths, request).await?;
+
+    match response {
+        Response::Ack { message } => emit_message(output_mode, "ok", &message),
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected response from daemon"),
+    }
+
+    Ok(())
+}
+
+async fn run_service_command(args: ServiceArgs, op: ServiceOp) -> Result<()> {
+    let (_, _, paths) =
+        runtime_context(&args.global.config_files, args.global.session.as_deref()).await?;
+    let output_mode = args.global.output.resolve();
+
+    let request = match op {
+        ServiceOp::Start => Request::Start {
+            services: args.services.clone(),
+        },
+        ServiceOp::Stop => Request::Stop {
+            services: args.services.clone(),
+        },
+        ServiceOp::Restart => Request::Restart {
+            services: args.services.clone(),
+        },
     };
 
     let response = send_request(&paths, request).await?;
@@ -337,7 +392,14 @@ fn filter_log_lines(lines: &[&str], processes: &[String]) -> Vec<String> {
 
 fn emit_up_status(mode: OutputMode, status: &str, pid: u32) {
     match mode {
-        OutputMode::Table => println!("decompose {status} pid={pid}"),
+        OutputMode::Table => {
+            let human = match status {
+                "started" => "started",
+                "already_running" => "already running",
+                other => other,
+            };
+            println!("decompose {human} (pid {pid})");
+        }
         OutputMode::Json => print_json(&json!({
             "status": status,
             "pid": pid

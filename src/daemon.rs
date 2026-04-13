@@ -750,6 +750,50 @@ fn build_shell_command(command: &str) -> TokioCommand {
     }
 }
 
+/// Resolve a list of service names (base names or replica-qualified names)
+/// into the set of runtime instance names in the daemon's process map.
+///
+/// If `services` is empty, returns all runtime names (sorted).
+/// If any service name doesn't match at least one runtime, returns Err with
+/// the list of unknown names.
+fn resolve_services(
+    state: &DaemonState,
+    services: &[String],
+) -> std::result::Result<Vec<String>, Vec<String>> {
+    if services.is_empty() {
+        return Ok(state.processes.keys().cloned().collect());
+    }
+
+    let mut unknown = Vec::new();
+    let mut matched = std::collections::BTreeSet::new();
+    for svc in services {
+        let mut found = false;
+        for (name, runtime) in &state.processes {
+            if runtime.spec.base_name == *svc || runtime.spec.name == *svc {
+                matched.insert(name.clone());
+                found = true;
+            }
+        }
+        if !found {
+            unknown.push(svc.clone());
+        }
+    }
+
+    if unknown.is_empty() {
+        Ok(matched.into_iter().collect())
+    } else {
+        Err(unknown)
+    }
+}
+
+fn describe_services(services: &[String]) -> String {
+    if services.is_empty() {
+        "all services".to_string()
+    } else {
+        services.join(", ")
+    }
+}
+
 async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -896,142 +940,107 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 }
             }
         }
-        Request::Stop { process } => {
+        Request::Stop { services } => {
             let guard = state.lock().await;
-            let matching: Vec<String> = guard
-                .processes
-                .keys()
-                .filter(|k| {
-                    guard
-                        .processes
-                        .get(*k)
-                        .map(|r| r.spec.base_name == process || r.spec.name == process)
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect();
-            if matching.is_empty() {
-                Response::Error {
-                    message: format!("process {process} not found"),
-                }
-            } else {
-                for name in &matching {
-                    if let Some(tx) = guard.controllers.get(name) {
-                        let _ = tx.send(true);
-                    }
-                }
-                Response::Ack {
-                    message: format!("stopping {process}"),
-                }
-            }
-        }
-        Request::Start { process } => {
-            let to_start: Vec<String> = {
-                let guard = state.lock().await;
-                guard
-                    .processes
-                    .iter()
-                    .filter(|(_, r)| {
-                        (r.spec.base_name == process || r.spec.name == process)
-                            && r.status.is_terminal()
-                    })
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            };
-            if to_start.is_empty() {
-                let guard = state.lock().await;
-                let exists = guard
-                    .processes
-                    .values()
-                    .any(|r| r.spec.base_name == process || r.spec.name == process);
-                if exists {
-                    Response::Ack {
-                        message: format!("{process} is already running"),
-                    }
-                } else {
-                    Response::Error {
-                        message: format!("process {process} not found"),
-                    }
-                }
-            } else {
-                // Reset processes to Pending so supervisor picks them up
-                {
-                    let mut guard = state.lock().await;
-                    for name in &to_start {
-                        if let Some(runtime) = guard.processes.get_mut(name) {
-                            runtime.status = ProcessStatus::Pending;
-                            runtime.log_ready = false;
-                            runtime.healthy = false;
-                        }
-                    }
-                }
-                Response::Ack {
-                    message: format!("starting {process}"),
-                }
-            }
-        }
-        Request::Restart { process } => {
-            let matching: Vec<String> = {
-                let guard = state.lock().await;
-                guard
-                    .processes
-                    .iter()
-                    .filter(|(_, r)| r.spec.base_name == process || r.spec.name == process)
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            };
-            if matching.is_empty() {
-                Response::Error {
-                    message: format!("process {process} not found"),
-                }
-            } else {
-                // Stop running instances
-                {
-                    let guard = state.lock().await;
-                    for name in &matching {
+            match resolve_services(&guard, &services) {
+                Err(unknown) => Response::Error {
+                    message: format!("unknown service(s): {}", unknown.join(", ")),
+                },
+                Ok(names) => {
+                    for name in &names {
                         if let Some(tx) = guard.controllers.get(name) {
                             let _ = tx.send(true);
                         }
                     }
-                }
-                // Spawn a task to wait for stop then reset to Pending
-                let state_clone = state.clone();
-                let matching_clone = matching.clone();
-                tokio::spawn(async move {
-                    // Wait for processes to reach terminal state
-                    for _ in 0..200 {
-                        let all_stopped = {
-                            let guard = state_clone.lock().await;
-                            matching_clone.iter().all(|name| {
-                                guard
-                                    .processes
-                                    .get(name)
-                                    .map(|r| r.status.is_terminal())
-                                    .unwrap_or(true)
-                            })
-                        };
-                        if all_stopped {
-                            break;
-                        }
-                        sleep(Duration::from_millis(50)).await;
+                    Response::Ack {
+                        message: format!("stopping {}", describe_services(&services)),
                     }
-                    // Reset to Pending so supervisor restarts them
-                    let mut guard = state_clone.lock().await;
-                    for name in &matching_clone {
-                        if let Some(runtime) = guard.processes.get_mut(name) {
-                            runtime.status = ProcessStatus::Pending;
-                            runtime.log_ready = false;
-                            runtime.healthy = false;
-                        }
-                    }
-                });
-                Response::Ack {
-                    message: format!("restarting {process}"),
                 }
             }
         }
-        Request::Ports { .. } => Response::Ack {
-            message: "ports subsystem is not implemented yet in this rewrite".to_string(),
+        Request::Start { services } => {
+            let mut guard = state.lock().await;
+            match resolve_services(&guard, &services) {
+                Err(unknown) => Response::Error {
+                    message: format!("unknown service(s): {}", unknown.join(", ")),
+                },
+                Ok(names) => {
+                    let mut started = 0;
+                    for name in &names {
+                        if let Some(runtime) = guard.processes.get_mut(name) {
+                            if runtime.status.is_terminal() {
+                                runtime.status = ProcessStatus::Pending;
+                                runtime.log_ready = false;
+                                runtime.healthy = false;
+                                started += 1;
+                            }
+                        }
+                    }
+                    if started == 0 {
+                        Response::Ack {
+                            message: format!(
+                                "{} already running",
+                                describe_services(&services)
+                            ),
+                        }
+                    } else {
+                        Response::Ack {
+                            message: format!("starting {}", describe_services(&services)),
+                        }
+                    }
+                }
+            }
+        }
+        Request::Restart { services } => {
+            let guard = state.lock().await;
+            match resolve_services(&guard, &services) {
+                Err(unknown) => Response::Error {
+                    message: format!("unknown service(s): {}", unknown.join(", ")),
+                },
+                Ok(names) => {
+                    for name in &names {
+                        if let Some(tx) = guard.controllers.get(name) {
+                            let _ = tx.send(true);
+                        }
+                    }
+                    drop(guard);
+                    // Spawn a task to wait for stop then reset to Pending
+                    let state_clone = state.clone();
+                    let names_clone = names.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..200 {
+                            let all_stopped = {
+                                let guard = state_clone.lock().await;
+                                names_clone.iter().all(|name| {
+                                    guard
+                                        .processes
+                                        .get(name)
+                                        .map(|r| r.status.is_terminal())
+                                        .unwrap_or(true)
+                                })
+                            };
+                            if all_stopped {
+                                break;
+                            }
+                            sleep(Duration::from_millis(50)).await;
+                        }
+                        let mut guard = state_clone.lock().await;
+                        for name in &names_clone {
+                            if let Some(runtime) = guard.processes.get_mut(name) {
+                                runtime.status = ProcessStatus::Pending;
+                                runtime.log_ready = false;
+                                runtime.healthy = false;
+                            }
+                        }
+                    });
+                    Response::Ack {
+                        message: format!("restarting {}", describe_services(&services)),
+                    }
+                }
+            }
+        }
+        Request::Ports { .. } => Response::Error {
+            message: "the `ports` subsystem is not implemented yet".to_string(),
         },
     };
 

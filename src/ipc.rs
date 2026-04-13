@@ -18,9 +18,12 @@ pub enum Request {
     Down,
     Ports { command: PortsRequest },
     Scale { process: String, replicas: u16 },
-    Stop { process: String },
-    Start { process: String },
-    Restart { process: String },
+    /// Stop the listed services. Empty list = stop all.
+    Stop { services: Vec<String> },
+    /// Start the listed services. Empty list = start all.
+    Start { services: Vec<String> },
+    /// Restart the listed services. Empty list = restart all.
+    Restart { services: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

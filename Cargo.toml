@@ -7,15 +7,15 @@ description = "A simple and flexible scheduler and orchestrator to manage non-co
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "*"
-clap = { version = "*", features = ["derive", "env"] }
-interprocess = { version = "*", features = ["tokio"] }
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-serde_yaml = "*"
-regex = "*"
-sha2 = "*"
-tokio = { version = "*", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+interprocess = { version = "2", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+regex = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
-tempfile = "*"
+tempfile = "3"

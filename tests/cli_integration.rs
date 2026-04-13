@@ -244,6 +244,112 @@ fn ctrl_c_detaches_and_daemon_keeps_running() {
 }
 
 #[test]
+fn top_level_stop_start_restart_target_services() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // Use two long-lived processes so we can target individually.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["up", "-f", &cfg, "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Top-level stop with a specific service.
+    let stop = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["stop", "-f", &cfg, "--json", "alpha"],
+        &[],
+        &[],
+    );
+    assert_success(&stop, "stop alpha");
+    let stop_json: Value = serde_json::from_slice(&stop.stdout).expect("stop json");
+    assert_eq!(stop_json.get("status").and_then(Value::as_str), Some("ok"));
+
+    // Top-level stop with no args stops all remaining services.
+    let stop_all = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["stop", "-f", &cfg, "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&stop_all, "stop all");
+
+    // Unknown service name returns a non-zero exit with a clear error.
+    let bad = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["stop", "-f", &cfg, "--json", "no-such-service"],
+        &[],
+        &[],
+    );
+    assert!(!bad.status.success(), "unknown service should fail");
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("unknown service"),
+        "error should mention 'unknown service', got: {stderr}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["down", "-f", &cfg, "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn down_when_not_running_exits_zero() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["down", "-f", &cfg, "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down when nothing is running");
+    let parsed: Value = serde_json::from_slice(&down.stdout).expect("down json");
+    assert_eq!(parsed.get("status").and_then(Value::as_str), Some("ok"));
+}
+
+#[test]
 fn ps_when_not_running_is_empty_not_error() {
     let (_root, project, runtime, state, config) = setup_project();
     let home = project.parent().expect("parent").join("home");
