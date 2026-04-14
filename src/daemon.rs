@@ -195,7 +195,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
         let mut request_shutdown = false;
 
         {
-            let guard = state.lock().await;
+            let mut guard = state.lock().await;
             let snapshot = guard.processes.clone();
 
             // Check exit mode triggers
@@ -217,6 +217,12 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
                     for tx in guard.controllers.values() {
                         let _ = tx.send(true);
                     }
+                    // Pending processes have no controller — stop them directly
+                    for runtime in guard.processes.values_mut() {
+                        if matches!(runtime.status, ProcessStatus::Pending) {
+                            runtime.status = ProcessStatus::Stopped;
+                        }
+                    }
                     request_shutdown = true;
                 } else {
                     for (name, proc_runtime) in &snapshot {
@@ -236,12 +242,24 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
                         for tx in guard.controllers.values() {
                             let _ = tx.send(true);
                         }
+                        // Pending processes have no controller — stop them directly
+                        for runtime in guard.processes.values_mut() {
+                            if matches!(runtime.status, ProcessStatus::Pending) {
+                                runtime.status = ProcessStatus::Stopped;
+                            }
+                        }
                     }
                 }
             } else {
                 request_shutdown = true;
                 for tx in guard.controllers.values() {
                     let _ = tx.send(true);
+                }
+                // Pending processes have no controller — stop them directly
+                for runtime in guard.processes.values_mut() {
+                    if matches!(runtime.status, ProcessStatus::Pending) {
+                        runtime.status = ProcessStatus::Stopped;
+                    }
                 }
             }
         }
@@ -852,6 +870,12 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             for tx in guard.controllers.values() {
                 let _ = tx.send(true);
             }
+            // Pending processes have no controller — stop them directly
+            for runtime in guard.processes.values_mut() {
+                if matches!(runtime.status, ProcessStatus::Pending) {
+                    runtime.status = ProcessStatus::Stopped;
+                }
+            }
             Response::Ack {
                 message: "shutdown requested".to_string(),
             }
@@ -941,13 +965,22 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             }
         }
         Request::Stop { services } => {
-            let guard = state.lock().await;
+            let mut guard = state.lock().await;
             match resolve_services(&guard, &services) {
                 Err(unknown) => Response::Error {
                     message: format!("unknown service(s): {}", unknown.join(", ")),
                 },
                 Ok(names) => {
                     for name in &names {
+                        // Processes in Pending state have no controller yet —
+                        // transition them directly to Stopped.
+                        if let Some(runtime) = guard.processes.get(name) {
+                            if matches!(runtime.status, ProcessStatus::Pending) {
+                                guard.processes.get_mut(name).unwrap().status =
+                                    ProcessStatus::Stopped;
+                                continue;
+                            }
+                        }
                         if let Some(tx) = guard.controllers.get(name) {
                             let _ = tx.send(true);
                         }
