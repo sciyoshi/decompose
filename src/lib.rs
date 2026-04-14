@@ -19,12 +19,10 @@ use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use crate::cli::{
-    Cli, Commands, GlobalArgs, LogsArgs, PortsCommand, ProcessCommand, ServiceArgs, UpArgs,
-};
+use crate::cli::{Cli, Commands, GlobalArgs, LogsArgs, ServiceArgs, UpArgs};
 use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
-use crate::ipc::{PortsRequest, Request, Response, send_request};
+use crate::ipc::{Request, Response, send_request};
 use crate::output::{OutputMode, print_json};
 use crate::paths::{build_instance_id, runtime_paths_for};
 
@@ -40,8 +38,6 @@ pub async fn run_cli() -> Result<()> {
         Commands::Start(args) => run_service_command(args, ServiceOp::Start).await,
         Commands::Stop(args) => run_service_command(args, ServiceOp::Stop).await,
         Commands::Restart(args) => run_service_command(args, ServiceOp::Restart).await,
-        Commands::Process { global, command } => run_process(global, command).await,
-        Commands::Ports { global, command } => run_ports(global, command).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }
@@ -82,8 +78,23 @@ async fn run_up(args: UpArgs) -> Result<()> {
         // Pre-flight: validate the merged config before spawning the daemon,
         // so users see errors like dependency cycles directly instead of a
         // generic "daemon did not become ready" timeout.
-        load_and_merge_configs(&config_files)
+        let preflight = load_and_merge_configs(&config_files)
             .context("config validation failed before starting daemon")?;
+
+        // Validate requested process names exist in config.
+        if !args.processes.is_empty() {
+            let known: std::collections::HashSet<&str> =
+                preflight.processes.keys().map(|k| k.as_str()).collect();
+            let unknown: Vec<&str> = args
+                .processes
+                .iter()
+                .filter(|p| !known.contains(p.as_str()))
+                .map(|p| p.as_str())
+                .collect();
+            if !unknown.is_empty() {
+                bail!("unknown service(s): {}", unknown.join(", "));
+            }
+        }
 
         spawn_daemon_process(
             &cwd,
@@ -274,25 +285,6 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_process(args: GlobalArgs, command: ProcessCommand) -> Result<()> {
-    let (_, _, paths) = runtime_context(&args.config_files, args.session.as_deref()).await?;
-    let output_mode = args.output.resolve();
-
-    let request = match command {
-        ProcessCommand::Scale { process, replicas } => Request::Scale { process, replicas },
-    };
-
-    let response = send_request(&paths, request).await?;
-
-    match response {
-        Response::Ack { message } => emit_message(output_mode, "ok", &message),
-        Response::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected response from daemon"),
-    }
-
-    Ok(())
-}
-
 async fn run_service_command(args: ServiceArgs, op: ServiceOp) -> Result<()> {
     let (_, _, paths) =
         runtime_context(&args.global.config_files, args.global.session.as_deref()).await?;
@@ -310,35 +302,13 @@ async fn run_service_command(args: ServiceArgs, op: ServiceOp) -> Result<()> {
         },
     };
 
-    let response = send_request(&paths, request).await?;
-
-    match response {
-        Response::Ack { message } => emit_message(output_mode, "ok", &message),
-        Response::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected response from daemon"),
-    }
-
-    Ok(())
-}
-
-async fn run_ports(args: GlobalArgs, command: PortsCommand) -> Result<()> {
-    let (_, _, paths) = runtime_context(&args.config_files, args.session.as_deref()).await?;
-    let output_mode = args.output.resolve();
-    let response = send_request(
-        &paths,
-        Request::Ports {
-            command: match command {
-                PortsCommand::List => PortsRequest::List,
-                PortsCommand::Free => PortsRequest::Free,
-                PortsCommand::Release { service_name } => PortsRequest::Release { service_name },
-                PortsCommand::Reserve { port, service_name } => {
-                    PortsRequest::Reserve { port, service_name }
-                }
-                PortsCommand::Inspect { service_name } => PortsRequest::Inspect { service_name },
-            },
-        },
-    )
-    .await?;
+    let response = match send_request(&paths, request).await {
+        Ok(response) => response,
+        Err(err) if is_no_daemon_error(&err, &paths) => {
+            bail!("no running environment for this project — start one with `decompose up`");
+        }
+        Err(err) => return Err(err),
+    };
 
     match response {
         Response::Ack { message } => emit_message(output_mode, "ok", &message),
@@ -504,10 +474,20 @@ fn is_no_daemon_error(err: &anyhow::Error, paths: &crate::model::RuntimePaths) -
     if !paths.socket.exists() {
         return true;
     }
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("connection refused")
-        || msg.contains("no such file or directory")
-        || msg.contains("not found")
+    // Walk the full anyhow error chain — the root cause (e.g. "Connection
+    // refused") is typically nested inside a context like "failed to connect
+    // to /path/to/socket".
+    for cause in err.chain() {
+        let msg = cause.to_string().to_ascii_lowercase();
+        if msg.contains("connection refused")
+            || msg.contains("no such file or directory")
+            || msg.contains("not found")
+            || msg.contains("timed out")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn stream_daemon_logs(
