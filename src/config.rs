@@ -449,10 +449,10 @@ pub fn parse_dotenv_str(data: &str) -> Result<BTreeMap<String, String>> {
 }
 
 fn strip_quotes(s: &str) -> String {
-    if s.len() >= 2 {
-        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-            return s[1..s.len() - 1].to_string();
-        }
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        return s[1..s.len() - 1].to_string();
     }
     s.to_string()
 }
@@ -1342,7 +1342,7 @@ processes:
         let p = dir.path().join("custom.yaml");
         fs::write(&p, "processes: {a: {command: 'echo'}}").unwrap();
 
-        let paths = resolve_config_paths(&[p.clone()], dir.path()).unwrap();
+        let paths = resolve_config_paths(std::slice::from_ref(&p), dir.path()).unwrap();
         assert_eq!(paths.len(), 1);
     }
 

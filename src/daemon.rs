@@ -41,6 +41,7 @@ struct DaemonState {
 
 type SharedState = Arc<Mutex<DaemonState>>;
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_daemon_process(
     cwd: &Path,
     config_files: &[std::path::PathBuf],
