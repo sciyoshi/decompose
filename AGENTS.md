@@ -110,7 +110,9 @@ chore(deps): bump tokio to 1.44
 
 ## Secrets required
 
-- `CARGO_REGISTRY_TOKEN` — crates.io API token, set in GitHub repository secrets.
+- `CARGO_REGISTRY_TOKEN` — crates.io API token. Trusted publishing is
+  configured, so this can be a short-lived OIDC-exchanged token or a
+  manual API token set in GitHub repository secrets.
 - `GITHUB_TOKEN` — provided automatically by GitHub Actions.
 
 ## When using Claude / AI assistants
