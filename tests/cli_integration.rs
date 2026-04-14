@@ -91,7 +91,10 @@ fn cli_supports_json_and_table_modes() {
     );
     assert_success(&up, "up --json");
     let up_json: Value = serde_json::from_slice(&up.stdout).expect("up json");
-    assert_eq!(up_json.get("status").and_then(Value::as_str), Some("started"));
+    assert_eq!(
+        up_json.get("status").and_then(Value::as_str),
+        Some("started")
+    );
 
     let ps_json = run_cmd(
         &project,
@@ -174,7 +177,8 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
         &["CI", "LLM"],
     );
     assert_success(&ps_default_json, "default json ps");
-    let parsed: Value = serde_json::from_slice(&ps_default_json.stdout).expect("default json output");
+    let parsed: Value =
+        serde_json::from_slice(&ps_default_json.stdout).expect("default json output");
     assert!(parsed.get("processes").and_then(Value::as_array).is_some());
 
     let down = run_cmd(

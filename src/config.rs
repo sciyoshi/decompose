@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::model::{
-    DependencyCondition, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime,
-    ProcessStatus, RestartPolicy,
+    DependencyCondition, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime, ProcessStatus,
+    RestartPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,9 +44,9 @@ impl<'de> Deserialize<'de> for EnvVars {
             RawEnv::Map(m) => env.extend(m),
             RawEnv::List(entries) => {
                 for entry in entries {
-                    let (k, v) = entry
-                        .split_once('=')
-                        .ok_or_else(|| serde::de::Error::custom("invalid env entry, expected KEY=VALUE"))?;
+                    let (k, v) = entry.split_once('=').ok_or_else(|| {
+                        serde::de::Error::custom("invalid env entry, expected KEY=VALUE")
+                    })?;
                     env.insert(k.to_string(), v.to_string());
                 }
             }
@@ -400,7 +400,12 @@ pub fn resolve_config_paths(user_supplied: &[PathBuf], cwd: &Path) -> Result<Vec
 }
 
 pub fn discover_config(cwd: &Path) -> Result<PathBuf> {
-    const CANDIDATES: [&str; 4] = ["compose.yml", "compose.yaml", "decompose.yml", "decompose.yaml"];
+    const CANDIDATES: [&str; 4] = [
+        "compose.yml",
+        "compose.yaml",
+        "decompose.yml",
+        "decompose.yaml",
+    ];
     for name in CANDIDATES {
         let candidate = cwd.join(name);
         if candidate.exists() {
@@ -445,9 +450,7 @@ pub fn parse_dotenv_str(data: &str) -> Result<BTreeMap<String, String>> {
 
 fn strip_quotes(s: &str) -> String {
     if s.len() >= 2 {
-        if (s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\''))
-        {
+        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
             return s[1..s.len() - 1].to_string();
         }
     }
@@ -680,10 +683,7 @@ pub fn build_process_instances(
                     .as_ref()
                     .map(|s| s.timeout_seconds)
                     .unwrap_or(10),
-                shutdown_command: proc_cfg
-                    .shutdown
-                    .as_ref()
-                    .and_then(|s| s.command.clone()),
+                shutdown_command: proc_cfg.shutdown.as_ref().and_then(|s| s.command.clone()),
                 readiness_probe: proc_cfg.readiness_probe.clone(),
                 liveness_probe: proc_cfg.liveness_probe.clone(),
                 disabled,
@@ -800,7 +800,10 @@ processes:
             err.to_string().contains("dependency cycle detected"),
             "unexpected error: {err}"
         );
-        assert!(err.to_string().contains("a -> a"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("a -> a"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -960,9 +963,21 @@ processes:
     fn discover_config_uses_documented_priority() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
-        fs::write(root.join("decompose.yaml"), "processes: {a: {command: 'echo'}}").expect("write");
-        fs::write(root.join("compose.yaml"), "processes: {a: {command: 'echo'}}").expect("write");
-        fs::write(root.join("compose.yml"), "processes: {a: {command: 'echo'}}").expect("write");
+        fs::write(
+            root.join("decompose.yaml"),
+            "processes: {a: {command: 'echo'}}",
+        )
+        .expect("write");
+        fs::write(
+            root.join("compose.yaml"),
+            "processes: {a: {command: 'echo'}}",
+        )
+        .expect("write");
+        fs::write(
+            root.join("compose.yml"),
+            "processes: {a: {command: 'echo'}}",
+        )
+        .expect("write");
 
         let chosen = discover_config(root).expect("discover");
         assert_eq!(chosen, root.join("compose.yml"));
@@ -1052,21 +1067,29 @@ processes:
         let base_path = dir.path().join("base.yaml");
         let overlay_path = dir.path().join("overlay.yaml");
 
-        fs::write(&base_path, r#"
+        fs::write(
+            &base_path,
+            r#"
 processes:
   api:
     command: "echo base"
     environment:
       PORT: "3000"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-        fs::write(&overlay_path, r#"
+        fs::write(
+            &overlay_path,
+            r#"
 processes:
   api:
     command: "echo overlay"
     environment:
       PORT: "8080"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let cfg = load_and_merge_configs(&[base_path, overlay_path]).unwrap();
         let api = cfg.processes.get("api").unwrap();
@@ -1194,9 +1217,18 @@ processes:
 
         let out = build_process_instances(&cfg, cwd, &dotenv);
         let api = out.get("api").unwrap();
-        assert_eq!(api.spec.environment.get("GLOBAL"), Some(&"from_config".to_string()));
-        assert_eq!(api.spec.environment.get("DOTONLY"), Some(&"dotenv_val".to_string()));
-        assert_eq!(api.spec.environment.get("LOCAL"), Some(&"from_process".to_string()));
+        assert_eq!(
+            api.spec.environment.get("GLOBAL"),
+            Some(&"from_config".to_string())
+        );
+        assert_eq!(
+            api.spec.environment.get("DOTONLY"),
+            Some(&"dotenv_val".to_string())
+        );
+        assert_eq!(
+            api.spec.environment.get("LOCAL"),
+            Some(&"from_process".to_string())
+        );
     }
 
     #[test]
@@ -1235,7 +1267,10 @@ processes:
     #[test]
     fn interpolate_undefined_becomes_empty() {
         let vars = BTreeMap::new();
-        assert_eq!(interpolate_vars("hello ${UNDEF} world", &vars), "hello  world");
+        assert_eq!(
+            interpolate_vars("hello ${UNDEF} world", &vars),
+            "hello  world"
+        );
     }
 
     #[test]
@@ -1290,7 +1325,11 @@ processes:
     #[test]
     fn resolve_config_paths_empty_uses_discovery() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("decompose.yaml"), "processes: {a: {command: 'echo'}}").unwrap();
+        fs::write(
+            dir.path().join("decompose.yaml"),
+            "processes: {a: {command: 'echo'}}",
+        )
+        .unwrap();
 
         let paths = resolve_config_paths(&[], dir.path()).unwrap();
         assert_eq!(paths.len(), 1);

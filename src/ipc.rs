@@ -16,14 +16,25 @@ pub enum Request {
     Ping,
     Ps,
     Down,
-    Ports { command: PortsRequest },
-    Scale { process: String, replicas: u16 },
+    Ports {
+        command: PortsRequest,
+    },
+    Scale {
+        process: String,
+        replicas: u16,
+    },
     /// Stop the listed services. Empty list = stop all.
-    Stop { services: Vec<String> },
+    Stop {
+        services: Vec<String>,
+    },
     /// Start the listed services. Empty list = start all.
-    Start { services: Vec<String> },
+    Start {
+        services: Vec<String>,
+    },
     /// Restart the listed services. Empty list = restart all.
-    Restart { services: Vec<String> },
+    Restart {
+        services: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,9 +42,16 @@ pub enum Request {
 pub enum PortsRequest {
     List,
     Free,
-    Release { service_name: Option<String> },
-    Reserve { port: u16, service_name: Option<String> },
-    Inspect { service_name: String },
+    Release {
+        service_name: Option<String>,
+    },
+    Reserve {
+        port: u16,
+        service_name: Option<String>,
+    },
+    Inspect {
+        service_name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

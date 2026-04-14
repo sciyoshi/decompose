@@ -193,11 +193,8 @@ mod tests {
 
     #[test]
     fn socket_root_falls_back_to_xdg_state_then_home_local() {
-        let state_root = socket_root_with_env(
-            Path::new("/home/u"),
-            None,
-            Some(OsStr::new("/state/home")),
-        );
+        let state_root =
+            socket_root_with_env(Path::new("/home/u"), None, Some(OsStr::new("/state/home")));
         assert_eq!(state_root, Path::new("/state/home").join("decompose"));
 
         let home_root = socket_root_with_env(Path::new("/home/u"), None, None);

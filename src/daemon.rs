@@ -4,14 +4,14 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use interprocess::local_socket::ListenerOptions;
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::traits::tokio::Listener as _;
-use interprocess::local_socket::ListenerOptions;
 use regex::Regex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -61,7 +61,12 @@ pub fn spawn_daemon_process(
         .write(true)
         .truncate(true)
         .open(&paths.daemon_log)
-        .with_context(|| format!("failed to open daemon log at {}", paths.daemon_log.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to open daemon log at {}",
+                paths.daemon_log.display()
+            )
+        })?;
     let log_err = log_file.try_clone()?;
 
     let mut cmd = std::process::Command::new(exe);
@@ -200,9 +205,9 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
                         matches!(p.status, ProcessStatus::Exited { code } if code != 0)
                             || matches!(p.status, ProcessStatus::FailedToStart { .. })
                     }),
-                    ExitMode::ExitOnEnd => snapshot.values().any(|p| {
-                        matches!(p.status, ProcessStatus::Exited { .. })
-                    }),
+                    ExitMode::ExitOnEnd => snapshot
+                        .values()
+                        .any(|p| matches!(p.status, ProcessStatus::Exited { .. })),
                 };
                 if triggered {
                     drop(guard);
@@ -276,18 +281,15 @@ pub(crate) fn dependencies_met(
         }
 
         let satisfied = match cond {
-            DependencyCondition::ProcessStarted => {
-                dep_instances.iter().all(|p| p.started_once)
-            }
-            DependencyCondition::ProcessHealthy => {
-                dep_instances.iter().all(|p| p.healthy)
-            }
-            DependencyCondition::ProcessLogReady => {
-                dep_instances.iter().all(|p| p.log_ready)
-            }
-            DependencyCondition::ProcessCompleted => dep_instances
-                .iter()
-                .all(|p| matches!(p.status, ProcessStatus::Exited { .. } | ProcessStatus::Stopped)),
+            DependencyCondition::ProcessStarted => dep_instances.iter().all(|p| p.started_once),
+            DependencyCondition::ProcessHealthy => dep_instances.iter().all(|p| p.healthy),
+            DependencyCondition::ProcessLogReady => dep_instances.iter().all(|p| p.log_ready),
+            DependencyCondition::ProcessCompleted => dep_instances.iter().all(|p| {
+                matches!(
+                    p.status,
+                    ProcessStatus::Exited { .. } | ProcessStatus::Stopped
+                )
+            }),
             DependencyCondition::ProcessCompletedSuccessfully => dep_instances
                 .iter()
                 .all(|p| matches!(p.status, ProcessStatus::Exited { code: 0 })),
@@ -519,8 +521,9 @@ async fn start_process(name: String, state: SharedState) {
                         // Re-attach stdout/stderr readers
                         let ready_pattern: Option<Regex> =
                             spec.ready_log_line.as_ref().map(|pattern| {
-                                Regex::new(pattern)
-                                    .unwrap_or_else(|_| Regex::new(&regex::escape(pattern)).unwrap())
+                                Regex::new(pattern).unwrap_or_else(|_| {
+                                    Regex::new(&regex::escape(pattern)).unwrap()
+                                })
                             });
                         let log_ready_flag = Arc::new(AtomicBool::new(false));
 
@@ -603,8 +606,7 @@ async fn shutdown_child(
     // Step 1: Run optional shutdown command
     if let Some(ref cmd_str) = spec.shutdown_command {
         let mut cmd = build_shell_command(cmd_str);
-        cmd.current_dir(&spec.working_dir)
-            .envs(&spec.environment);
+        cmd.current_dir(&spec.working_dir).envs(&spec.environment);
         let _ = cmd.output().await;
     }
 
@@ -713,10 +715,7 @@ async fn run_single_check(
 
     if let Some(ref http) = probe.http_get {
         let timeout = Duration::from_secs(probe.timeout_seconds);
-        let url = format!(
-            "{}://{}:{}{}",
-            http.scheme, http.host, http.port, http.path
-        );
+        let url = format!("{}://{}:{}{}", http.scheme, http.host, http.port, http.path);
         // Use a simple TCP connect + HTTP request via shell command
         let check_cmd = format!("curl -sf -o /dev/null -w '%{{http_code}}' '{url}'");
         let mut cmd = TokioCommand::new("bash");
@@ -978,10 +977,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                     }
                     if started == 0 {
                         Response::Ack {
-                            message: format!(
-                                "{} already running",
-                                describe_services(&services)
-                            ),
+                            message: format!("{} already running", describe_services(&services)),
                         }
                     } else {
                         Response::Ack {
@@ -1057,7 +1053,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::model::{DependencyCondition, ProcessInstanceSpec, ProcessRuntime, ProcessStatus, RestartPolicy};
+    use crate::model::{
+        DependencyCondition, ProcessInstanceSpec, ProcessRuntime, ProcessStatus, RestartPolicy,
+    };
 
     fn runtime_with(base: &str, status: ProcessStatus, started_once: bool) -> ProcessRuntime {
         ProcessRuntime {
@@ -1092,24 +1090,18 @@ mod tests {
     #[test]
     fn dependencies_require_all_replicas_to_satisfy_condition() {
         let mut snapshot = BTreeMap::new();
-        snapshot.insert(
-            "db[1]".to_string(),
-            {
-                let mut r = runtime_with("db", ProcessStatus::Exited { code: 0 }, true);
-                r.spec.name = "db[1]".to_string();
-                r.spec.replica = 1;
-                r
-            },
-        );
-        snapshot.insert(
-            "db[2]".to_string(),
-            {
-                let mut r = runtime_with("db", ProcessStatus::Exited { code: 1 }, true);
-                r.spec.name = "db[2]".to_string();
-                r.spec.replica = 2;
-                r
-            },
-        );
+        snapshot.insert("db[1]".to_string(), {
+            let mut r = runtime_with("db", ProcessStatus::Exited { code: 0 }, true);
+            r.spec.name = "db[1]".to_string();
+            r.spec.replica = 1;
+            r
+        });
+        snapshot.insert("db[2]".to_string(), {
+            let mut r = runtime_with("db", ProcessStatus::Exited { code: 1 }, true);
+            r.spec.name = "db[2]".to_string();
+            r.spec.replica = 2;
+            r
+        });
 
         let mut candidate = runtime_with("api", ProcessStatus::Pending, false);
         candidate.spec.depends_on.insert(

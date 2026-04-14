@@ -116,9 +116,16 @@ pub enum ProcessCommand {
 pub enum PortsCommand {
     List,
     Free,
-    Release { service_name: Option<String> },
-    Reserve { port: u16, service_name: Option<String> },
-    Inspect { service_name: String },
+    Release {
+        service_name: Option<String>,
+    },
+    Reserve {
+        port: u16,
+        service_name: Option<String>,
+    },
+    Inspect {
+        service_name: String,
+    },
 }
 
 #[derive(Args, Debug, Clone)]

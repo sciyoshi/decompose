@@ -219,11 +219,8 @@ async fn run_attach(args: GlobalArgs) -> Result<()> {
 }
 
 async fn run_logs(args: LogsArgs) -> Result<()> {
-    let (_, _, paths) = runtime_context(
-        &args.global.config_files,
-        args.global.session.as_deref(),
-    )
-    .await?;
+    let (_, _, paths) =
+        runtime_context(&args.global.config_files, args.global.session.as_deref()).await?;
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
@@ -351,7 +348,11 @@ async fn run_ports(args: GlobalArgs, command: PortsCommand) -> Result<()> {
 async fn runtime_context(
     config_files_arg: &[PathBuf],
     session: Option<&str>,
-) -> Result<(std::path::PathBuf, Vec<std::path::PathBuf>, crate::model::RuntimePaths)> {
+) -> Result<(
+    std::path::PathBuf,
+    Vec<std::path::PathBuf>,
+    crate::model::RuntimePaths,
+)> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config_files = resolve_config_paths(config_files_arg, &cwd)?;
     let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
@@ -573,9 +574,7 @@ async fn stream_filtered_logs(
                         snapshots
                             .iter()
                             .filter(|s| s.base == *p || s.name == *p)
-                            .all(|s| {
-                                s.state == "exited" || s.state == "failed"
-                            })
+                            .all(|s| s.state == "exited" || s.state == "failed")
                     });
                     if all_exited {
                         break;

@@ -70,10 +70,7 @@ mod tests {
             unsafe {
                 std::env::set_var(&key, value);
             }
-            assert!(
-                env_truthy(&key),
-                "expected {value:?} to be truthy"
-            );
+            assert!(env_truthy(&key), "expected {value:?} to be truthy");
             unsafe {
                 std::env::remove_var(&key);
             }
@@ -87,10 +84,7 @@ mod tests {
             unsafe {
                 std::env::set_var(&key, value);
             }
-            assert!(
-                !env_truthy(&key),
-                "expected {value:?} to be falsy"
-            );
+            assert!(!env_truthy(&key), "expected {value:?} to be falsy");
             unsafe {
                 std::env::remove_var(&key);
             }
