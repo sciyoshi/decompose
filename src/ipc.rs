@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use interprocess::local_socket::tokio::Stream;
@@ -74,7 +75,17 @@ pub enum Response {
     },
 }
 
+/// Default timeout for a single IPC round-trip.  Local sockets are fast;
+/// if the daemon hasn't responded in 5 seconds it's almost certainly hung.
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn send_request(paths: &RuntimePaths, request: Request) -> Result<Response> {
+    tokio::time::timeout(IPC_TIMEOUT, send_request_inner(paths, request))
+        .await
+        .context("IPC request timed out — daemon may be unresponsive")?
+}
+
+async fn send_request_inner(paths: &RuntimePaths, request: Request) -> Result<Response> {
     let socket_name = to_socket_name(&paths.socket)?;
     let stream = Stream::connect(socket_name)
         .await
