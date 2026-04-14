@@ -29,20 +29,6 @@ pub enum Commands {
     Stop(ServiceArgs),
     /// Restart one or more services. With no args, restarts all.
     Restart(ServiceArgs),
-    /// Process management operations (scale, etc.).
-    Process {
-        #[command(flatten)]
-        global: GlobalArgs,
-        #[command(subcommand)]
-        command: ProcessCommand,
-    },
-    /// Port-related operations (not implemented in this rewrite yet).
-    Ports {
-        #[command(flatten)]
-        global: GlobalArgs,
-        #[command(subcommand)]
-        command: PortsCommand,
-    },
     #[command(hide = true)]
     Daemon(DaemonArgs),
 }
@@ -50,7 +36,7 @@ pub enum Commands {
 #[derive(Args, Debug, Clone)]
 pub struct GlobalArgs {
     /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
-    #[arg(short = 'f', long = "file")]
+    #[arg(long = "file")]
     pub config_files: Vec<PathBuf>,
     /// Session/project name override for instance identity.
     #[arg(long = "session", alias = "project-name", env = "DECOMPOSE_SESSION")]
@@ -92,40 +78,13 @@ pub struct LogsArgs {
     #[command(flatten)]
     pub global: GlobalArgs,
     /// Follow log output.
-    #[arg(long = "follow")]
+    #[arg(short = 'f', long = "follow")]
     pub follow: bool,
     /// Number of lines to show from end of log.
     #[arg(short = 'n', long = "tail")]
     pub tail: Option<usize>,
     /// Filter logs to specific process(es).
     pub processes: Vec<String>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum ProcessCommand {
-    /// Scale a process to a given number of replicas.
-    Scale {
-        /// Process name to scale.
-        process: String,
-        /// Number of replicas.
-        replicas: u16,
-    },
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum PortsCommand {
-    List,
-    Free,
-    Release {
-        service_name: Option<String>,
-    },
-    Reserve {
-        port: u16,
-        service_name: Option<String>,
-    },
-    Inspect {
-        service_name: String,
-    },
 }
 
 #[derive(Args, Debug, Clone)]

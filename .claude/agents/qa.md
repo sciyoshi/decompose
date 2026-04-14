@@ -54,8 +54,7 @@ Dependencies:
 
 Process operations:
 - Individual `process stop`, `process start`, `process restart` (note: currently nested under `process` subcommand — this is a known divergence from docker compose which has them top-level)
-- `process scale <name> <N>`
-- Replicas with `PC_REPLICA_NUM` injection
+- Replicas
 
 Output modes:
 - `--json` parses as valid JSON
@@ -72,8 +71,7 @@ Edge cases:
 
 These are already on the improvement roadmap in TASKS.md:
 
-- `start`/`stop`/`restart` are under `process <cmd> <name>` instead of top-level and only take one name.
-- `logs` uses `--follow` long form; no `-f` short form.
+- `logs -f` now works as `--follow` (matching docker compose). `--file` lost its `-f` short form.
 - No `config`, `kill`, `ls` commands yet.
 - `http_get` health checks shell out to `curl` (fails silently if curl is missing).
 

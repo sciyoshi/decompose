@@ -634,11 +634,11 @@ async fn shutdown_child(
     if let Some(pid) = child.id() {
         #[cfg(unix)]
         {
-            let _ = TokioCommand::new("kill")
-                .arg(format!("-{signal}"))
-                .arg(pid.to_string())
-                .output()
-                .await;
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+            if let Ok(sig) = Signal::try_from(signal) {
+                let _ = signal::kill(Pid::from_raw(pid as i32), sig);
+            }
         }
         #[cfg(not(unix))]
         {
@@ -734,25 +734,46 @@ async fn run_single_check(
 
     if let Some(ref http) = probe.http_get {
         let timeout = Duration::from_secs(probe.timeout_seconds);
-        let url = format!("{}://{}:{}{}", http.scheme, http.host, http.port, http.path);
-        // Use a simple TCP connect + HTTP request via shell command
-        let check_cmd = format!("curl -sf -o /dev/null -w '%{{http_code}}' '{url}'");
-        let mut cmd = TokioCommand::new("bash");
-        cmd.arg("-c")
-            .arg(&check_cmd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let code = String::from_utf8_lossy(&output.stdout);
-                let status: u16 = code.trim().parse().unwrap_or(0);
-                return (200..400).contains(&status);
-            }
-            _ => return false,
-        }
+        return tokio::time::timeout(timeout, http_get_check(http))
+            .await
+            .unwrap_or(false);
     }
 
     false
+}
+
+async fn http_get_check(http: &crate::model::HttpCheck) -> bool {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpStream;
+
+    let addr = format!("{}:{}", http.host, http.port);
+    let mut stream = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
+        http.path, http.host, http.port
+    );
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return false;
+    }
+
+    let mut buf = vec![0u8; 1024];
+    let n = match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return false,
+    };
+
+    // Parse status code from "HTTP/1.x NNN ..."
+    let response = String::from_utf8_lossy(&buf[..n]);
+    let status: u16 = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (200..400).contains(&status)
 }
 
 fn build_shell_command(command: &str) -> TokioCommand {
@@ -880,90 +901,6 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 message: "shutdown requested".to_string(),
             }
         }
-        Request::Scale { process, replicas } => {
-            let mut guard = state.lock().await;
-            // Count current replicas for this base name
-            let current: Vec<String> = guard
-                .processes
-                .keys()
-                .filter(|k| {
-                    guard
-                        .processes
-                        .get(*k)
-                        .map(|r| r.spec.base_name == process)
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect();
-            let current_count = current.len() as u16;
-
-            if replicas == current_count {
-                Response::Ack {
-                    message: format!("{process} already at {replicas} replicas"),
-                }
-            } else if replicas > current_count {
-                // Scale up: add new replicas as Pending
-                let template = current
-                    .first()
-                    .and_then(|k| guard.processes.get(k))
-                    .map(|r| r.spec.clone());
-                if let Some(template) = template {
-                    for idx in (current_count + 1)..=replicas {
-                        let instance_name = if replicas > 1 {
-                            format!("{process}[{idx}]")
-                        } else {
-                            process.clone()
-                        };
-                        let mut spec = template.clone();
-                        spec.name = instance_name.clone();
-                        spec.replica = idx;
-                        spec.environment
-                            .insert("PC_REPLICA_NUM".to_string(), idx.to_string());
-                        guard.processes.insert(
-                            instance_name,
-                            ProcessRuntime {
-                                spec,
-                                status: ProcessStatus::Pending,
-                                started_once: false,
-                                log_ready: false,
-                                restart_count: 0,
-                                healthy: false,
-                            },
-                        );
-                    }
-                    Response::Ack {
-                        message: format!("scaled {process} to {replicas} replicas"),
-                    }
-                } else {
-                    Response::Error {
-                        message: format!("process {process} not found"),
-                    }
-                }
-            } else {
-                // Scale down: stop excess replicas
-                let to_stop: Vec<String> = current
-                    .into_iter()
-                    .rev()
-                    .take((current_count - replicas) as usize)
-                    .collect();
-                for name in &to_stop {
-                    if let Some(tx) = guard.controllers.get(name) {
-                        let _ = tx.send(true);
-                    }
-                }
-                // Mark stopped ones for removal after they finish
-                for name in &to_stop {
-                    if let Some(runtime) = guard.processes.get_mut(name) {
-                        if runtime.status.is_terminal() {
-                            // Already stopped, remove immediately
-                        }
-                    }
-                }
-                Response::Ack {
-                    message: format!("scaling {process} down to {replicas} replicas"),
-                }
-            }
-        }
         Request::Stop { services } => {
             let mut guard = state.lock().await;
             match resolve_services(&guard, &services) {
@@ -1069,9 +1006,6 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 }
             }
         }
-        Request::Ports { .. } => Response::Error {
-            message: "the `ports` subsystem is not implemented yet".to_string(),
-        },
     };
 
     let payload = serde_json::to_string(&response)?;

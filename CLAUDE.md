@@ -102,7 +102,6 @@ processes:
 3. Global `environment` block
 4. Per-process `env_file` entries
 5. Per-process `environment` block
-6. Injected: `PC_PROC_NAME`, `PC_REPLICA_NUM`
 
 ### Variable interpolation
 

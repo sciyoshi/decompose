@@ -1,4 +1,4 @@
 processes:
   worker:
-    command: "echo 'Worker $PC_REPLICA_NUM starting' && sleep 2 && echo 'Worker $PC_REPLICA_NUM completed'"
+    command: "echo 'Worker starting' && sleep 2 && echo 'Worker completed'"
     replicas: 3

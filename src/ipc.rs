@@ -17,13 +17,6 @@ pub enum Request {
     Ping,
     Ps,
     Down,
-    Ports {
-        command: PortsRequest,
-    },
-    Scale {
-        process: String,
-        replicas: u16,
-    },
     /// Stop the listed services. Empty list = stop all.
     Stop {
         services: Vec<String>,
@@ -35,23 +28,6 @@ pub enum Request {
     /// Restart the listed services. Empty list = restart all.
     Restart {
         services: Vec<String>,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum PortsRequest {
-    List,
-    Free,
-    Release {
-        service_name: Option<String>,
-    },
-    Reserve {
-        port: u16,
-        service_name: Option<String>,
-    },
-    Inspect {
-        service_name: String,
     },
 }
 
@@ -115,47 +91,4 @@ pub fn to_socket_name(path: &Path) -> Result<interprocess::local_socket::Name<'s
         .map_err(|_| anyhow!("socket path contains invalid UTF-8: {}", path.display()))?;
     utf.to_fs_name::<GenericFilePath>()
         .context("failed to create local socket name")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_serialization_round_trips() {
-        let req = Request::Ports {
-            command: PortsRequest::Reserve {
-                port: 5050,
-                service_name: Some("api".to_string()),
-            },
-        };
-        let encoded = serde_json::to_string(&req).expect("serialize request");
-        let decoded: Request = serde_json::from_str(&encoded).expect("deserialize request");
-        match decoded {
-            Request::Ports {
-                command: PortsRequest::Reserve { port, service_name },
-            } => {
-                assert_eq!(port, 5050);
-                assert_eq!(service_name.as_deref(), Some("api"));
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn scale_request_round_trips() {
-        let req = Request::Scale {
-            process: "api".to_string(),
-            replicas: 3,
-        };
-        let encoded = serde_json::to_string(&req).expect("serialize");
-        let decoded: Request = serde_json::from_str(&encoded).expect("deserialize");
-        match decoded {
-            Request::Scale { process, replicas } => {
-                assert_eq!(process, "api");
-                assert_eq!(replicas, 3);
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
 }

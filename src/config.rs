@@ -139,7 +139,7 @@ pub struct ProcessDependency {
 pub fn load_config(path: &Path) -> Result<ProjectConfig> {
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    let cfg: ProjectConfig = serde_yaml::from_str(&data).context("invalid yaml")?;
+    let cfg: ProjectConfig = serde_yaml_ng::from_str(&data).context("invalid yaml")?;
     validate_config(&cfg)?;
     Ok(cfg)
 }
@@ -647,8 +647,6 @@ pub fn build_process_instances(
             }
 
             env.extend(proc_cfg.environment.0.clone());
-            env.insert("PC_PROC_NAME".to_string(), base_name.clone());
-            env.insert("PC_REPLICA_NUM".to_string(), replica.to_string());
 
             let working_dir = match &proc_cfg.working_dir {
                 Some(d) if d.is_absolute() => d.clone(),
@@ -732,7 +730,7 @@ environment:
   A: "1"
   B: "2"
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         assert_eq!(cfg.environment.0.get("A"), Some(&"1".to_string()));
         assert_eq!(cfg.environment.0.get("B"), Some(&"2".to_string()));
     }
@@ -747,7 +745,7 @@ environment:
   - A=1
   - B=2
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         assert_eq!(cfg.environment.0.get("A"), Some(&"1".to_string()));
         assert_eq!(cfg.environment.0.get("B"), Some(&"2".to_string()));
     }
@@ -762,7 +760,7 @@ processes:
       missing:
         condition: process_started
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         let err = validate_config(&cfg).expect_err("must reject missing dep");
         assert!(err.to_string().contains("depends on unknown process"));
     }
@@ -779,7 +777,7 @@ processes:
   b:
     command: "echo"
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         let err = validate_config(&cfg).expect_err("must reject missing ready_log_line");
         assert!(err.to_string().contains("ready_log_line"));
     }
@@ -794,7 +792,7 @@ processes:
       a:
         condition: process_started
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         let err = validate_config(&cfg).expect_err("must reject self dependency");
         assert!(
             err.to_string().contains("dependency cycle detected"),
@@ -821,7 +819,7 @@ processes:
       a:
         condition: process_started
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         let err = validate_config(&cfg).expect_err("must reject cycle");
         assert!(
             err.to_string().contains("dependency cycle detected"),
@@ -849,7 +847,7 @@ processes:
       a:
         condition: process_started
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         let err = validate_config(&cfg).expect_err("must reject transitive cycle");
         assert!(
             err.to_string().contains("dependency cycle detected"),
@@ -877,7 +875,7 @@ processes:
   c:
     command: "echo c"
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         validate_config(&cfg).expect("dag should validate");
     }
 
@@ -894,7 +892,7 @@ processes:
     command: "echo ready"
     ready_log_line: "ready"
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         validate_config(&cfg).expect("should be valid");
     }
 
@@ -910,7 +908,7 @@ processes:
     environment:
       LOCAL: l
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         validate_config(&cfg).expect("valid config");
         let cwd = Path::new("/tmp");
         let dotenv = BTreeMap::new();
@@ -918,17 +916,9 @@ processes:
 
         assert_eq!(out.len(), 2);
         let first = out.get("api[1]").expect("first replica");
-        let second = out.get("api[2]").expect("second replica");
+        assert!(out.contains_key("api[2]"), "second replica");
         assert_eq!(first.spec.environment.get("GLOBAL"), Some(&"g".to_string()));
         assert_eq!(first.spec.environment.get("LOCAL"), Some(&"l".to_string()));
-        assert_eq!(
-            first.spec.environment.get("PC_REPLICA_NUM"),
-            Some(&"1".to_string())
-        );
-        assert_eq!(
-            second.spec.environment.get("PC_REPLICA_NUM"),
-            Some(&"2".to_string())
-        );
     }
 
     #[test]
@@ -945,7 +935,7 @@ processes:
       timeout_seconds: 30
       command: "cleanup.sh"
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).expect("parse config");
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         let cwd = Path::new("/tmp");
         let dotenv = BTreeMap::new();
         let out = build_process_instances(&cfg, cwd, &dotenv);
@@ -1002,8 +992,8 @@ processes:
     environment:
       B: "2"
 "#;
-        let base: ProjectConfig = serde_yaml::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml::from_str(overlay_yaml).unwrap();
+        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
         let merged = merge_configs(base, overlay);
 
         let api = merged.processes.get("api").unwrap();
@@ -1026,8 +1016,8 @@ processes:
   worker:
     command: "echo worker"
 "#;
-        let base: ProjectConfig = serde_yaml::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml::from_str(overlay_yaml).unwrap();
+        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
         let merged = merge_configs(base, overlay);
 
         assert!(merged.processes.contains_key("api"));
@@ -1052,8 +1042,8 @@ processes:
   x:
     command: "echo"
 "#;
-        let base: ProjectConfig = serde_yaml::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml::from_str(overlay_yaml).unwrap();
+        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
         let merged = merge_configs(base, overlay);
 
         assert_eq!(merged.environment.0.get("A"), Some(&"1".to_string()));
@@ -1111,7 +1101,7 @@ processes:
   worker:
     command: "echo worker"
 "#;
-        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         filter_process_subset(&mut cfg, &["api".to_string()], true).unwrap();
         assert!(cfg.processes.contains_key("api"));
         assert!(cfg.processes.contains_key("db"));
@@ -1132,7 +1122,7 @@ processes:
   worker:
     command: "echo worker"
 "#;
-        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         filter_process_subset(&mut cfg, &["api".to_string()], false).unwrap();
         assert!(cfg.processes.contains_key("api"));
         assert!(!cfg.processes.contains_key("db"));
@@ -1147,7 +1137,7 @@ processes:
   api:
     command: "echo"
 "#;
-        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let err = filter_process_subset(&mut cfg, &["nope".to_string()], true).unwrap_err();
         assert!(err.to_string().contains("unknown process"));
     }
@@ -1209,7 +1199,7 @@ processes:
     environment:
       LOCAL: from_process
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cwd = Path::new("/tmp");
         let mut dotenv = BTreeMap::new();
         dotenv.insert("GLOBAL".to_string(), "from_dotenv".to_string());
@@ -1297,7 +1287,7 @@ processes:
     command: "run --version ${VERSION}"
     description: "API v${VERSION}"
 "#;
-        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         apply_interpolation(&mut cfg);
 
         let api = cfg.processes.get("api").unwrap();
@@ -1315,7 +1305,7 @@ processes:
   api:
     command: "run --version ${VERSION}"
 "#;
-        let mut cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         apply_interpolation(&mut cfg);
 
         let api = cfg.processes.get("api").unwrap();
@@ -1354,7 +1344,7 @@ processes:
   a:
     command: "echo"
 "#;
-        let cfg: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.exit_mode, ExitMode::ExitOnFailure);
     }
 }

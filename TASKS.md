@@ -37,8 +37,8 @@ relearning.
 
 - [x] **2a. Pin dependency versions in Cargo.toml.** All deps now use real
   semver constraints (`1`, `4`, `0.9`, etc.).
-- [ ] **2b. Migrate off deprecated serde_yaml.** Candidates: `serde_yml` (fork)
-  or `yaml-rust2`. `serde_yml` is the lowest-friction drop-in.
+- [x] **2b. Migrate off deprecated serde_yaml.** Replaced with `serde_yaml_ng`
+  0.10 (maintained fork, drop-in API).
 
 ## 3. Correctness and robustness
 
@@ -53,8 +53,8 @@ relearning.
 - [x] **3c. IPC timeout.** `send_request` is now wrapped in a 5-second
   `tokio::time::timeout`. A hung daemon produces a clear error instead of
   blocking the CLI forever.
-- [ ] **3d. Use libc (or nix crate) for signal sending.** Currently shells out
-  to `kill -N <pid>`; more fragile than a direct syscall.
+- [x] **3d. Use nix crate for signal sending.** Replaced `kill -N <pid>`
+  shell-out with `nix::sys::signal::kill`.
 - [x] **3e. Use `-c` instead of `-lc` for shell commands.** `build_shell_command`
   now uses `sh -c` (matching docker compose) instead of `bash -lc`. Default
   shell changed from `bash` to `sh`; users can override via `COMPOSE_SHELL`.
@@ -67,8 +67,7 @@ relearning.
   "already_running" (enum-looking).
 - [x] **4c. Actionable `attach`/`logs` error when no environment.** Suggests
   `decompose up` to start one.
-- [x] **4d. Ports command returns Error instead of Ack.** Stubbed `ports *`
-  subcommands previously exited 0 with a misleading "ok" status.
+- [x] **4d. Ports subcommand removed.** Was a stub; removed entirely.
 - [x] **4e. `logs` with no output hints why.** Prints a stderr note when the
   log file is empty or the service filter matched nothing.
 - [ ] **4f. Top-level intro text.** Bare `decompose` should print a short
@@ -93,11 +92,9 @@ relearning.
 
 ## 6. Native HTTP health checks
 
-- [ ] **6. Replace `curl` shell-out** in `http_get` probes with either:
-  - `reqwest` (minimal features: rustls-tls, no default features), or
-  - a raw TCP connect + minimal HTTP/1.1 request with tokio.
-  The `reqwest` approach is simpler and more correct. Currently fails
-  silently if `curl` isn't on PATH.
+- [x] **6. Replace `curl` shell-out** in `http_get` probes with a raw TCP
+  connect + minimal HTTP/1.1 request via tokio. No external dependencies
+  needed; no longer fails when `curl` isn't on PATH.
 
 ## 7. Test coverage
 

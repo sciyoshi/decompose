@@ -5,8 +5,6 @@ processes:
   env_example:
     command: |
       echo "Global environment: $GLOBAL_ENV"
-      echo "Process name: $PC_PROC_NAME"
-      echo "Replica number: $PC_REPLICA_NUM"
     environment:
       LOCAL_ENV: "This is a local environment variable"
       EXAMPLE_PATH: "/path/to/example"

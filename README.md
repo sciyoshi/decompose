@@ -82,10 +82,7 @@ Nix pins the toolchain and dependencies; `decompose` orchestrates native process
 decompose up [-f FILE] [-d|--detach] [--json|--table]
 decompose down [-f FILE] [--json|--table]
 decompose ps [-f FILE] [--json|--table]
-decompose ports <list|free|release|reserve|inspect> [--json|--table]
 ```
-
-`ports` commands are stubbed right now and will be completed in a later pass.
 
 ## Output modes
 
