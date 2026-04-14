@@ -743,9 +743,9 @@ fn build_shell_command(command: &str) -> TokioCommand {
         cmd.arg("/C").arg(command);
         cmd
     } else {
-        let shell = env::var("COMPOSE_SHELL").unwrap_or_else(|_| "bash".to_string());
+        let shell = env::var("COMPOSE_SHELL").unwrap_or_else(|_| "sh".to_string());
         let mut cmd = TokioCommand::new(shell);
-        cmd.arg("-lc").arg(command);
+        cmd.arg("-c").arg(command);
         cmd
     }
 }
