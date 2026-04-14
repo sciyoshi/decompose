@@ -47,14 +47,17 @@ relearning.
   (e.g. `a -> b -> a`). `run_up` does a pre-flight `load_and_merge_configs`
   call so the error is surfaced at the CLI immediately instead of
   manifesting as a generic "daemon did not become ready" timeout.
-- [ ] **3b. Stale daemon cleanup.** On `up`, if the pid file exists but the
-  process isn't alive, clean up stale socket/pid files and spawn fresh.
-- [ ] **3c. IPC timeout.** Wrap `send_request` in `tokio::time::timeout`. A
-  hung daemon currently blocks the CLI forever with no workaround.
+- [x] **3b. Stale daemon cleanup.** `run_up` now removes orphaned socket/pid
+  files before spawning a fresh daemon when the existing socket fails to
+  respond to a Ping. Belt-and-suspenders with the daemon's own cleanup.
+- [x] **3c. IPC timeout.** `send_request` is now wrapped in a 5-second
+  `tokio::time::timeout`. A hung daemon produces a clear error instead of
+  blocking the CLI forever.
 - [ ] **3d. Use libc (or nix crate) for signal sending.** Currently shells out
   to `kill -N <pid>`; more fragile than a direct syscall.
-- [ ] **3e. Use `-c` instead of `-lc` for shell commands.** Avoids sourcing
-  user login profile files in every spawned process; matches docker compose.
+- [x] **3e. Use `-c` instead of `-lc` for shell commands.** `build_shell_command`
+  now uses `sh -c` (matching docker compose) instead of `bash -lc`. Default
+  shell changed from `bash` to `sh`; users can override via `COMPOSE_SHELL`.
 
 ## 4. UX polish (from baseline QA)
 

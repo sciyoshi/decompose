@@ -75,6 +75,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     if let Ok(Response::Pong { pid, .. }) = send_request(&paths, Request::Ping).await {
         daemon_pid = Some(pid);
     } else {
+        // Clean up stale socket/pid from a previously killed daemon so the
+        // new daemon can bind the socket without interference.
+        cleanup_stale_files(&paths);
+
         // Pre-flight: validate the merged config before spawning the daemon,
         // so users see errors like dependency cycles directly instead of a
         // generic "daemon did not become ready" timeout.
@@ -474,6 +478,17 @@ fn emit_detach(mode: OutputMode) {
             "status": "detached"
         })),
     }
+}
+
+/// Remove stale socket and PID files left behind by a killed daemon.
+///
+/// Called when a Ping to the existing socket failed, meaning the daemon is
+/// dead.  Cleaning up here (in addition to the daemon's own startup cleanup)
+/// avoids races where the new daemon's `remove_file` is beaten by a concurrent
+/// `up` invocation.
+fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
+    let _ = std::fs::remove_file(&paths.socket);
+    let _ = std::fs::remove_file(&paths.pid);
 }
 
 async fn wait_for_daemon_stop(paths: &crate::model::RuntimePaths) {
