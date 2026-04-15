@@ -22,9 +22,11 @@ Goal: broad compatibility with `docker compose` commands. The main commands
 should feel familiar to Docker Compose users.
 
 ```
-decompose up [-f FILE...] [-d] [--no-deps] [SERVICE...]
-decompose down [-f FILE...]
-decompose ps [-f FILE...]
+decompose [--file FILE...] [--session NAME] [-e ENV_FILE...] [--disable-dotenv] <command>
+
+decompose up [-d] [--no-deps] [SERVICE...]
+decompose down
+decompose ps
 decompose logs [-f] [-n N] [SERVICE...]
 decompose start [SERVICE...]
 decompose stop [SERVICE...]
@@ -33,6 +35,9 @@ decompose kill [SERVICE...]
 decompose config
 decompose ls
 ```
+
+Global flags (`--file`, `--session`, `-e/--env-file`, `--disable-dotenv`)
+appear before the subcommand, matching `docker compose -f FILE <cmd>` shape.
 
 Output modes: `--json`, `--table`, or auto-detect (TTY/CI/LLM -> table,
 otherwise JSON).

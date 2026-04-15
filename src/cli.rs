@@ -7,6 +7,23 @@ use crate::output::OutputArgs;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Cli {
+    /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
+    #[arg(long = "file", global = true)]
+    pub config_files: Vec<PathBuf>,
+    /// Session/project name override for instance identity.
+    #[arg(
+        long = "session",
+        alias = "project-name",
+        env = "DECOMPOSE_SESSION",
+        global = true
+    )]
+    pub session: Option<String>,
+    /// Additional .env files to load.
+    #[arg(short = 'e', long = "env-file", global = true)]
+    pub env_files: Vec<PathBuf>,
+    /// Disable automatic .env file loading.
+    #[arg(long = "disable-dotenv", global = true)]
+    pub disable_dotenv: bool,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -16,11 +33,11 @@ pub enum Commands {
     /// Start the environment.
     Up(UpArgs),
     /// Stop the environment daemon and its managed processes.
-    Down(GlobalArgs),
+    Down(OutputOnlyArgs),
     /// Show process status.
-    Ps(GlobalArgs),
+    Ps(OutputOnlyArgs),
     /// Reattach to a running environment's logs.
-    Attach(GlobalArgs),
+    Attach(OutputOnlyArgs),
     /// View process logs.
     Logs(LogsArgs),
     /// Start one or more previously-stopped services. With no args, starts all.
@@ -34,19 +51,7 @@ pub enum Commands {
 }
 
 #[derive(Args, Debug, Clone)]
-pub struct GlobalArgs {
-    /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
-    #[arg(long = "file")]
-    pub config_files: Vec<PathBuf>,
-    /// Session/project name override for instance identity.
-    #[arg(long = "session", alias = "project-name", env = "DECOMPOSE_SESSION")]
-    pub session: Option<String>,
-    /// Additional .env files to load.
-    #[arg(short = 'e', long = "env-file")]
-    pub env_files: Vec<PathBuf>,
-    /// Disable automatic .env file loading.
-    #[arg(long = "disable-dotenv")]
-    pub disable_dotenv: bool,
+pub struct OutputOnlyArgs {
     #[command(flatten)]
     pub output: OutputArgs,
 }
@@ -54,7 +59,7 @@ pub struct GlobalArgs {
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
     #[command(flatten)]
-    pub global: GlobalArgs,
+    pub output: OutputArgs,
     /// Start and return immediately.
     #[arg(short = 'd', long = "detach")]
     pub detach: bool,
@@ -68,15 +73,13 @@ pub struct UpArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ServiceArgs {
     #[command(flatten)]
-    pub global: GlobalArgs,
+    pub output: OutputArgs,
     /// Service(s) to operate on. If none, the operation applies to all services.
     pub services: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct LogsArgs {
-    #[command(flatten)]
-    pub global: GlobalArgs,
     /// Follow log output.
     #[arg(short = 'f', long = "follow")]
     pub follow: bool,

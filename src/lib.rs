@@ -19,25 +19,41 @@ use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use crate::cli::{Cli, Commands, GlobalArgs, LogsArgs, ServiceArgs, UpArgs};
+use crate::cli::{Cli, Commands, LogsArgs, ServiceArgs, UpArgs};
 use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{OutputMode, print_json};
 use crate::paths::{build_instance_id, runtime_paths_for};
 
+/// Global config flags that live on the top-level `Cli` struct.
+#[derive(Debug, Clone)]
+pub struct GlobalConfig {
+    pub config_files: Vec<PathBuf>,
+    pub session: Option<String>,
+    pub env_files: Vec<PathBuf>,
+    pub disable_dotenv: bool,
+}
+
 pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
+    let global = GlobalConfig {
+        config_files: cli.config_files,
+        session: cli.session,
+        env_files: cli.env_files,
+        disable_dotenv: cli.disable_dotenv,
+    };
+
     match cli.command {
-        Commands::Up(args) => run_up(args).await,
-        Commands::Down(args) => run_down(args).await,
-        Commands::Ps(args) => run_ps(args).await,
-        Commands::Attach(args) => run_attach(args).await,
-        Commands::Logs(args) => run_logs(args).await,
-        Commands::Start(args) => run_service_command(args, ServiceOp::Start).await,
-        Commands::Stop(args) => run_service_command(args, ServiceOp::Stop).await,
-        Commands::Restart(args) => run_service_command(args, ServiceOp::Restart).await,
+        Commands::Up(args) => run_up(global, args).await,
+        Commands::Down(args) => run_down(global, args.output.resolve()).await,
+        Commands::Ps(args) => run_ps(global, args.output.resolve()).await,
+        Commands::Attach(args) => run_attach(global, args.output.resolve()).await,
+        Commands::Logs(args) => run_logs(global, args).await,
+        Commands::Start(args) => run_service_command(global, args, ServiceOp::Start).await,
+        Commands::Stop(args) => run_service_command(global, args, ServiceOp::Stop).await,
+        Commands::Restart(args) => run_service_command(global, args, ServiceOp::Restart).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }
@@ -49,8 +65,8 @@ enum ServiceOp {
     Restart,
 }
 
-async fn run_up(args: UpArgs) -> Result<()> {
-    let output_mode = args.global.output.resolve();
+async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
+    let output_mode = args.output.resolve();
     let attached = !args.detach;
     let mut got_ctrl_c = false;
     let ctrl_c_task = if attached {
@@ -61,9 +77,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         None
     };
     let cwd = env::current_dir().context("failed to read current directory")?;
-    let config_files = resolve_config_paths(&args.global.config_files, &cwd)?;
+    let config_files = resolve_config_paths(&global.config_files, &cwd)?;
     let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
-    let instance = build_instance_id(args.global.session.as_deref(), &config_dir, &config_files);
+    let instance = build_instance_id(global.session.as_deref(), &config_dir, &config_files);
     let paths = runtime_paths_for(&instance)?;
     let mut daemon_pid = None;
     let mut state = "already_running";
@@ -101,8 +117,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
             &config_files,
             &instance,
             &paths,
-            &args.global.env_files,
-            args.global.disable_dotenv,
+            &global.env_files,
+            global.disable_dotenv,
             &args.processes,
             args.no_deps,
         )?;
@@ -155,9 +171,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_down(args: GlobalArgs) -> Result<()> {
-    let (_, _, paths) = runtime_context(&args.config_files, args.session.as_deref()).await?;
-    let output_mode = args.output.resolve();
+async fn run_down(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
     let response = match send_request(&paths, Request::Down).await {
         Ok(response) => response,
@@ -180,9 +195,8 @@ async fn run_down(args: GlobalArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_ps(args: GlobalArgs) -> Result<()> {
-    let (_, _, paths) = runtime_context(&args.config_files, args.session.as_deref()).await?;
-    let output_mode = args.output.resolve();
+async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
     let response = match send_request(&paths, Request::Ps).await {
         Ok(response) => response,
         Err(err) if is_no_daemon_error(&err, &paths) => {
@@ -207,9 +221,8 @@ async fn run_ps(args: GlobalArgs) -> Result<()> {
     }
 }
 
-async fn run_attach(args: GlobalArgs) -> Result<()> {
-    let (_, _, paths) = runtime_context(&args.config_files, args.session.as_deref()).await?;
-    let output_mode = args.output.resolve();
+async fn run_attach(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
@@ -233,9 +246,8 @@ async fn run_attach(args: GlobalArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_logs(args: LogsArgs) -> Result<()> {
-    let (_, _, paths) =
-        runtime_context(&args.global.config_files, args.global.session.as_deref()).await?;
+async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
@@ -285,10 +297,9 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_service_command(args: ServiceArgs, op: ServiceOp) -> Result<()> {
-    let (_, _, paths) =
-        runtime_context(&args.global.config_files, args.global.session.as_deref()).await?;
-    let output_mode = args.global.output.resolve();
+async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: ServiceOp) -> Result<()> {
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let output_mode = args.output.resolve();
 
     let request = match op {
         ServiceOp::Start => Request::Start {

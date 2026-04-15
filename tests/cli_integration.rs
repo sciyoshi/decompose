@@ -85,7 +85,7 @@ fn cli_supports_json_and_table_modes() {
         &runtime,
         &state,
         &home,
-        &["up", "--file", &cfg, "--detach", "--json"],
+        &["--file", &cfg, "up", "--detach", "--json"],
         &[],
         &[],
     );
@@ -101,7 +101,7 @@ fn cli_supports_json_and_table_modes() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg, "--json"],
+        &["--file", &cfg, "ps", "--json"],
         &[],
         &[],
     );
@@ -114,7 +114,7 @@ fn cli_supports_json_and_table_modes() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg, "--table"],
+        &["--file", &cfg, "ps", "--table"],
         &[],
         &[],
     );
@@ -128,7 +128,7 @@ fn cli_supports_json_and_table_modes() {
         &runtime,
         &state,
         &home,
-        &["down", "--file", &cfg, "--json"],
+        &["--file", &cfg, "down", "--json"],
         &[],
         &[],
     );
@@ -148,7 +148,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
         &runtime,
         &state,
         &home,
-        &["up", "--file", &cfg, "--detach", "--json"],
+        &["--file", &cfg, "up", "--detach", "--json"],
         &[],
         &[],
     );
@@ -159,7 +159,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg],
+        &["--file", &cfg, "ps"],
         &[("CI", "true")],
         &["LLM"],
     );
@@ -172,7 +172,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg],
+        &["--file", &cfg, "ps"],
         &[],
         &["CI", "LLM"],
     );
@@ -186,7 +186,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
         &runtime,
         &state,
         &home,
-        &["down", "--file", &cfg, "--json"],
+        &["--file", &cfg, "down", "--json"],
         &[],
         &[],
     );
@@ -204,9 +204,9 @@ fn ctrl_c_detaches_and_daemon_keeps_running() {
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
         .env("HOME", &home)
-        .arg("up")
         .arg("--file")
         .arg(&cfg)
+        .arg("up")
         .arg("--table")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -229,7 +229,7 @@ fn ctrl_c_detaches_and_daemon_keeps_running() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg, "--json"],
+        &["--file", &cfg, "ps", "--json"],
         &[],
         &[],
     );
@@ -240,7 +240,7 @@ fn ctrl_c_detaches_and_daemon_keeps_running() {
         &runtime,
         &state,
         &home,
-        &["down", "--file", &cfg, "--json"],
+        &["--file", &cfg, "down", "--json"],
         &[],
         &[],
     );
@@ -272,7 +272,7 @@ processes:
         &runtime,
         &state,
         &home,
-        &["up", "--file", &cfg, "--detach", "--json"],
+        &["--file", &cfg, "up", "--detach", "--json"],
         &[],
         &[],
     );
@@ -284,7 +284,7 @@ processes:
         &runtime,
         &state,
         &home,
-        &["stop", "--file", &cfg, "--json", "alpha"],
+        &["--file", &cfg, "stop", "--json", "alpha"],
         &[],
         &[],
     );
@@ -298,7 +298,7 @@ processes:
         &runtime,
         &state,
         &home,
-        &["stop", "--file", &cfg, "--json"],
+        &["--file", &cfg, "stop", "--json"],
         &[],
         &[],
     );
@@ -310,7 +310,7 @@ processes:
         &runtime,
         &state,
         &home,
-        &["stop", "--file", &cfg, "--json", "no-such-service"],
+        &["--file", &cfg, "stop", "--json", "no-such-service"],
         &[],
         &[],
     );
@@ -326,7 +326,7 @@ processes:
         &runtime,
         &state,
         &home,
-        &["down", "--file", &cfg, "--json"],
+        &["--file", &cfg, "down", "--json"],
         &[],
         &[],
     );
@@ -344,7 +344,7 @@ fn down_when_not_running_exits_zero() {
         &runtime,
         &state,
         &home,
-        &["down", "--file", &cfg, "--json"],
+        &["--file", &cfg, "down", "--json"],
         &[],
         &[],
     );
@@ -364,7 +364,7 @@ fn ps_when_not_running_is_empty_not_error() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg, "--json"],
+        &["--file", &cfg, "ps", "--json"],
         &[],
         &[],
     );
@@ -384,7 +384,7 @@ fn ps_when_not_running_is_empty_not_error() {
         &runtime,
         &state,
         &home,
-        &["ps", "--file", &cfg, "--table"],
+        &["--file", &cfg, "ps", "--table"],
         &[],
         &[],
     );
