@@ -1035,3 +1035,258 @@ processes:
         elapsed
     );
 }
+#[test]
+fn two_sessions_coexist_independently() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // Write a config with two distinct processes so we can identify them.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  sleeper:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Start session alpha.
+    let up_a = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "alpha", "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up_a, "up --session alpha");
+
+    // Start session beta.
+    let up_b = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "beta", "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up_b, "up --session beta");
+
+    // Verify ps for alpha shows running processes.
+    let ps_a = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "alpha", "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_a, "ps --session alpha");
+    let ps_a_json: Value = serde_json::from_slice(&ps_a.stdout).expect("ps alpha json");
+    let procs_a = ps_a_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("alpha processes array");
+    assert!(!procs_a.is_empty(), "alpha session should have processes");
+
+    // Verify ps for beta shows running processes.
+    let ps_b = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "beta", "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_b, "ps --session beta");
+    let ps_b_json: Value = serde_json::from_slice(&ps_b.stdout).expect("ps beta json");
+    let procs_b = ps_b_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("beta processes array");
+    assert!(!procs_b.is_empty(), "beta session should have processes");
+
+    // Stop session alpha; beta should keep running.
+    let down_a = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "alpha", "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down_a, "down --session alpha");
+
+    // Verify beta is still running after alpha is stopped.
+    let ps_b2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "beta", "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_b2, "ps --session beta after alpha down");
+    let ps_b2_json: Value = serde_json::from_slice(&ps_b2.stdout).expect("ps beta json 2");
+    let procs_b2 = ps_b2_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("beta processes array 2");
+    assert!(
+        !procs_b2.is_empty(),
+        "beta session should still have processes after alpha is stopped"
+    );
+
+    // Clean up beta.
+    let down_b = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "beta", "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down_b, "down --session beta");
+}
+
+#[test]
+fn session_isolation_from_default() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  sleeper:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Start a named session.
+    let up_foo = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "foo", "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up_foo, "up --session foo");
+
+    // The default session (no --session flag) should show nothing running.
+    let ps_default = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_default, "ps default session");
+    let ps_def_json: Value = serde_json::from_slice(&ps_default.stdout).expect("ps default json");
+    assert_eq!(
+        ps_def_json.get("running").and_then(Value::as_bool),
+        Some(false),
+        "default session should not be running when only named session is up"
+    );
+    let procs_def = ps_def_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("default processes array");
+    assert!(
+        procs_def.is_empty(),
+        "default session should have no processes"
+    );
+
+    // Now start the default session too.
+    let up_default = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up_default, "up default session");
+
+    // Both sessions should be independently running.
+    let ps_foo = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "foo", "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_foo, "ps --session foo");
+    let ps_foo_json: Value = serde_json::from_slice(&ps_foo.stdout).expect("ps foo json");
+    let procs_foo = ps_foo_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("foo processes array");
+    assert!(
+        !procs_foo.is_empty(),
+        "foo session should have running processes"
+    );
+
+    let ps_def2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_def2, "ps default session after both up");
+    let ps_def2_json: Value = serde_json::from_slice(&ps_def2.stdout).expect("ps default json 2");
+    let procs_def2 = ps_def2_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("default processes array 2");
+    assert!(
+        !procs_def2.is_empty(),
+        "default session should have running processes"
+    );
+
+    // Clean up both sessions.
+    let down_foo = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "--session", "foo", "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down_foo, "down --session foo");
+
+    let down_default = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down_default, "down default session");
+}
