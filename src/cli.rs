@@ -5,7 +5,21 @@ use clap::{Args, Parser, Subcommand};
 use crate::output::OutputArgs;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about,
+    after_help = "\
+Quick start:
+  decompose up          Start all services and attach
+  decompose up -d       Start detached
+  decompose ps          Show running processes
+  decompose logs -f     Follow logs
+  decompose down        Stop everything
+
+Config files: compose.yml, compose.yaml, decompose.yml, decompose.yaml
+Docs: https://github.com/sciyoshi/decompose"
+)]
 pub struct Cli {
     /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
     #[arg(long = "file", global = true)]
