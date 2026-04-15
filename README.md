@@ -16,14 +16,25 @@ Just your real processes, fast, with a familiar compose-like interface.
 cargo install decompose
 ```
 
+Requires Rust 1.85 or later. If you don't have Rust installed, grab it from [rustup.rs](https://rustup.rs/).
+
 ### Prebuilt binaries
 
 Download a tarball for your platform from the [latest release](https://github.com/sciyoshi/decompose/releases/latest), extract it, and put `decompose` on your `$PATH`. Builds are published for:
 
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
+| Target | OS | Arch |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | Linux | x86_64 |
+| `aarch64-unknown-linux-gnu` | Linux | ARM64 |
+| `x86_64-apple-darwin` | macOS | Intel |
+| `aarch64-apple-darwin` | macOS | Apple Silicon |
+
+Quick install example (macOS Apple Silicon):
+
+```bash
+curl -sL https://github.com/sciyoshi/decompose/releases/latest/download/decompose-aarch64-apple-darwin.tar.gz \
+  | tar xz -C /usr/local/bin
+```
 
 ### With Nix
 
@@ -39,6 +50,12 @@ Or install into your profile:
 nix profile install github:sciyoshi/decompose
 ```
 
+You can also add it as a flake input in your own `flake.nix`:
+
+```nix
+inputs.decompose.url = "github:sciyoshi/decompose";
+```
+
 The flake also exposes a `devShell` for contributors — `nix develop` drops you into a shell with `cargo`, `rustc`, `rustfmt`, and `clippy` pinned.
 
 ### From source
@@ -46,8 +63,10 @@ The flake also exposes a `devShell` for contributors — `nix develop` drops you
 ```bash
 git clone https://github.com/sciyoshi/decompose
 cd decompose
-cargo install --path .
+cargo build --release
 ```
+
+The binary will be at `target/release/decompose`. You can also use `cargo install --path .` to install it directly into your Cargo bin directory.
 
 ## Why this is better for day-to-day coding
 
