@@ -585,15 +585,76 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
         }
         OutputMode::Table => {
             let has_replicas = processes.iter().any(|p| p.replica > 1 || p.name != p.base);
+
+            // Build per-row display values for HEALTH and RESTARTS.
+            let health_vals: Vec<&str> = processes
+                .iter()
+                .map(|p| if p.healthy { "healthy" } else { "-" })
+                .collect();
+            let restart_vals: Vec<String> = processes
+                .iter()
+                .map(|p| {
+                    if p.restart_count == 0 {
+                        "-".to_string()
+                    } else {
+                        p.restart_count.to_string()
+                    }
+                })
+                .collect();
+
+            // Compute dynamic column widths (minimum = header length).
+            let w_name = processes
+                .iter()
+                .map(|p| p.name.len())
+                .max()
+                .unwrap_or(0)
+                .max("NAME".len());
+            let w_status = processes
+                .iter()
+                .map(|p| p.status.len())
+                .max()
+                .unwrap_or(0)
+                .max("STATUS".len());
+            let w_health = health_vals
+                .iter()
+                .map(|v| v.len())
+                .max()
+                .unwrap_or(0)
+                .max("HEALTH".len());
+            let w_restarts = restart_vals
+                .iter()
+                .map(|v| v.len())
+                .max()
+                .unwrap_or(0)
+                .max("RESTARTS".len());
+
             if has_replicas {
-                println!("NAME                     STATUS               BASE");
-                for p in processes {
-                    println!("{:<24} {:<20} {}", p.name, p.status, p.base);
+                let w_base = processes
+                    .iter()
+                    .map(|p| p.base.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max("BASE".len());
+                println!(
+                    "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
+                    "NAME", "STATUS", "HEALTH", "RESTARTS", "BASE",
+                );
+                for (i, p) in processes.iter().enumerate() {
+                    println!(
+                        "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
+                        p.name, p.status, health_vals[i], restart_vals[i], p.base,
+                    );
                 }
             } else {
-                println!("NAME                     STATUS");
-                for p in processes {
-                    println!("{:<24} {}", p.name, p.status);
+                println!(
+                    "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
+                    "NAME", "STATUS", "HEALTH", "RESTARTS",
+                );
+                for (i, p) in processes.iter().enumerate() {
+                    println!(
+                        "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
+                        p.name, p.status, health_vals[i], restart_vals[i],
+                    );
                 }
             }
         }
