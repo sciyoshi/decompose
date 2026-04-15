@@ -98,6 +98,9 @@ pub struct UpArgs {
     /// Do not start dependency processes automatically.
     #[arg(long = "no-deps")]
     pub no_deps: bool,
+    /// Remove processes not defined in the current config.
+    #[arg(long = "remove-orphans")]
+    pub remove_orphans: bool,
     /// Start only these processes (and their dependencies, unless --no-deps).
     pub processes: Vec<String>,
 }

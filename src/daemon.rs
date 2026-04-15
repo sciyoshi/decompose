@@ -1049,6 +1049,65 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 }
             }
         }
+        Request::RemoveOrphans { keep } => {
+            let mut guard = state.lock().await;
+            let keep_set: std::collections::HashSet<&str> =
+                keep.iter().map(|s| s.as_str()).collect();
+            let orphans: Vec<String> = guard
+                .processes
+                .keys()
+                .filter(|name| {
+                    let base = guard.processes[name.as_str()].spec.base_name.as_str();
+                    !keep_set.contains(base)
+                })
+                .cloned()
+                .collect();
+            for name in &orphans {
+                if let Some(runtime) = guard.processes.get(name) {
+                    if matches!(runtime.status, ProcessStatus::Pending) {
+                        guard.processes.get_mut(name).unwrap().status = ProcessStatus::Stopped;
+                        continue;
+                    }
+                }
+                if let Some(tx) = guard.controllers.get(name) {
+                    let _ = tx.send(true);
+                }
+            }
+            // Spawn a task to wait for orphans to stop then remove them
+            if !orphans.is_empty() {
+                let state_clone = state.clone();
+                let orphans_clone = orphans.clone();
+                tokio::spawn(async move {
+                    for _ in 0..200 {
+                        let all_stopped = {
+                            let guard = state_clone.lock().await;
+                            orphans_clone.iter().all(|name| {
+                                guard
+                                    .processes
+                                    .get(name)
+                                    .map(|r| r.status.is_terminal())
+                                    .unwrap_or(true)
+                            })
+                        };
+                        if all_stopped {
+                            break;
+                        }
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                    let mut guard = state_clone.lock().await;
+                    for name in &orphans_clone {
+                        guard.processes.remove(name);
+                        guard.controllers.remove(name);
+                    }
+                });
+            }
+            let msg = if orphans.is_empty() {
+                "no orphan processes found".to_string()
+            } else {
+                format!("removing orphan(s): {}", orphans.join(", "))
+            };
+            Response::Ack { message: msg }
+        }
     };
 
     let payload = serde_json::to_string(&response)?;

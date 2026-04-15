@@ -148,6 +148,20 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         );
     };
 
+    if args.remove_orphans {
+        let config = load_and_merge_configs(&config_files)
+            .context("failed to load config for orphan removal")?;
+        let keep: Vec<String> = config.processes.keys().cloned().collect();
+        match send_request(&paths, Request::RemoveOrphans { keep }).await {
+            Ok(Response::Ack { message }) if !message.contains("no orphan") => {
+                emit_message(output_mode, "ok", &message);
+            }
+            Ok(Response::Error { message }) => bail!("{message}"),
+            Err(e) => bail!("failed to remove orphans: {e}"),
+            _ => {}
+        }
+    }
+
     emit_up_status(output_mode, state, pid);
     if !attached {
         if args.wait {

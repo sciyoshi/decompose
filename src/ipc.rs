@@ -36,6 +36,10 @@ pub enum Request {
         services: Vec<String>,
         signal: i32,
     },
+    /// Remove processes not in the keep list.
+    RemoveOrphans {
+        keep: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
