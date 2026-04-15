@@ -400,7 +400,7 @@ async fn start_process(name: String, state: SharedState) {
 
     // Spawn health check probes
     if let Some(ref probe) = spec.readiness_probe {
-        tokio::spawn(run_health_probe(
+        tokio::spawn(run_readiness_probe(
             name.clone(),
             probe.clone(),
             state.clone(),
@@ -409,7 +409,7 @@ async fn start_process(name: String, state: SharedState) {
         ));
     }
     if let Some(ref probe) = spec.liveness_probe {
-        tokio::spawn(run_health_probe(
+        tokio::spawn(run_liveness_probe(
             name.clone(),
             probe.clone(),
             state.clone(),
@@ -524,6 +524,7 @@ async fn start_process(name: String, state: SharedState) {
                             if let Some(runtime) = guard.processes.get_mut(&name) {
                                 runtime.status = ProcessStatus::Running { pid };
                                 runtime.log_ready = false;
+                                runtime.healthy = false;
                             }
                         }
 
@@ -658,8 +659,10 @@ async fn shutdown_child(
     }
 }
 
-/// Run a health check probe periodically. Sets `healthy` flag on the process runtime.
-async fn run_health_probe(
+/// Run a readiness probe periodically. Sets the `healthy` flag on the process
+/// runtime when the probe succeeds (and clears it when the failure threshold
+/// is reached).
+async fn run_readiness_probe(
     name: String,
     probe: HealthProbe,
     state: SharedState,
@@ -706,6 +709,75 @@ async fn run_health_probe(
                 if let Some(runtime) = guard.processes.get_mut(&name) {
                     runtime.healthy = false;
                 }
+            }
+        }
+
+        sleep(Duration::from_secs(probe.period_seconds)).await;
+    }
+}
+
+/// Run a liveness probe periodically. When the failure threshold is reached,
+/// the process is killed so that the restart policy can re-launch it.
+async fn run_liveness_probe(
+    name: String,
+    probe: HealthProbe,
+    state: SharedState,
+    working_dir: std::path::PathBuf,
+    environment: BTreeMap<String, String>,
+) {
+    // Initial delay
+    if probe.initial_delay_seconds > 0 {
+        sleep(Duration::from_secs(probe.initial_delay_seconds)).await;
+    }
+
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        // Check if process is still running
+        {
+            let guard = state.lock().await;
+            if let Some(runtime) = guard.processes.get(&name) {
+                if runtime.status.is_terminal() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let success = run_single_check(&probe, &working_dir, &environment).await;
+
+        if success {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures += 1;
+            if consecutive_failures >= probe.failure_threshold {
+                // Kill the process so the restart policy can re-launch it.
+                let guard = state.lock().await;
+                if let Some(runtime) = guard.processes.get(&name) {
+                    if let ProcessStatus::Running { pid } = runtime.status {
+                        #[cfg(unix)]
+                        {
+                            use nix::sys::signal::{self, Signal};
+                            use nix::unistd::Pid;
+                            let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = pid; // suppress unused warning
+                        }
+                    }
+                }
+                drop(guard);
+
+                // Reset counter — the restart policy will re-launch the
+                // process and the probe will re-evaluate from scratch.
+                consecutive_failures = 0;
+
+                // Wait for the process to actually restart before probing
+                // again so we don't immediately kill the new instance.
+                sleep(Duration::from_secs(probe.period_seconds)).await;
+                continue;
             }
         }
 
