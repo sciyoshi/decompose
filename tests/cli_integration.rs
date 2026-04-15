@@ -2033,3 +2033,511 @@ processes:
     );
     assert_success(&down, "down");
 }
+
+#[test]
+fn exec_readiness_probe_flips_healthy_flag() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // The marker file starts absent; the probe checks for it.
+    let marker = project.join("healthy_marker");
+    let marker_str = marker.to_string_lossy().to_string();
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        format!(
+            r#"
+processes:
+  web:
+    command: "sleep 60"
+    readiness_probe:
+      exec:
+        command: "test -f {marker_str}"
+      period_seconds: 1
+      timeout_seconds: 2
+      success_threshold: 1
+      failure_threshold: 1
+"#
+        ),
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait for a couple of probe periods — healthy should still be false
+    thread::sleep(Duration::from_secs(3));
+
+    let ps1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps1, "ps before marker");
+    let ps1_json: Value = serde_json::from_slice(&ps1.stdout).expect("ps json");
+    let web1 = ps1_json["processes"]
+        .as_array()
+        .expect("processes array")
+        .iter()
+        .find(|p| p["name"].as_str() == Some("web"))
+        .expect("web process");
+    assert_eq!(
+        web1["healthy"].as_bool(),
+        Some(false),
+        "healthy should be false before marker exists"
+    );
+    assert_eq!(
+        web1["has_readiness_probe"].as_bool(),
+        Some(true),
+        "has_readiness_probe should be true"
+    );
+
+    // Create the marker file so the probe succeeds
+    fs::write(&marker, "ok").expect("write marker");
+
+    // Wait for probe to detect it
+    thread::sleep(Duration::from_secs(3));
+
+    let ps2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps2, "ps after marker");
+    let ps2_json: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    let web2 = ps2_json["processes"]
+        .as_array()
+        .expect("processes array")
+        .iter()
+        .find(|p| p["name"].as_str() == Some("web"))
+        .expect("web process");
+    assert_eq!(
+        web2["healthy"].as_bool(),
+        Some(true),
+        "healthy should be true after marker is created"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn http_get_readiness_probe_flips_healthy_flag() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // Use a simple HTTP server via Python
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  server:
+    command: "python3 -m http.server 18931"
+    readiness_probe:
+      http_get:
+        host: "127.0.0.1"
+        port: 18931
+        path: "/"
+      period_seconds: 1
+      timeout_seconds: 2
+      success_threshold: 1
+      failure_threshold: 1
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait for server to start and probe to detect it
+    thread::sleep(Duration::from_secs(5));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let server = ps_json["processes"]
+        .as_array()
+        .expect("processes array")
+        .iter()
+        .find(|p| p["name"].as_str() == Some("server"))
+        .expect("server process");
+    assert_eq!(
+        server["healthy"].as_bool(),
+        Some(true),
+        "healthy should be true after HTTP server starts responding"
+    );
+    assert_eq!(
+        server["has_readiness_probe"].as_bool(),
+        Some(true),
+        "has_readiness_probe should be true"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn depends_on_process_healthy_gates_dependent_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let marker = project.join("ready_marker");
+    let marker_str = marker.to_string_lossy().to_string();
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        format!(
+            r#"
+processes:
+  backend:
+    command: "sleep 60"
+    readiness_probe:
+      exec:
+        command: "test -f {marker_str}"
+      period_seconds: 1
+      timeout_seconds: 2
+      success_threshold: 1
+      failure_threshold: 1
+  frontend:
+    command: "sleep 60"
+    depends_on:
+      backend:
+        condition: process_healthy
+"#
+        ),
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait a bit — frontend should be pending since backend isn't healthy yet
+    thread::sleep(Duration::from_secs(3));
+
+    let ps1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps1, "ps before marker");
+    let ps1_json: Value = serde_json::from_slice(&ps1.stdout).expect("ps json");
+    let procs1 = ps1_json["processes"].as_array().expect("processes array");
+    let frontend1 = procs1
+        .iter()
+        .find(|p| p["name"].as_str() == Some("frontend"))
+        .expect("frontend process");
+    assert_eq!(
+        frontend1["state"].as_str(),
+        Some("pending"),
+        "frontend should be pending while backend is unhealthy"
+    );
+
+    // Now create the marker to make backend healthy
+    fs::write(&marker, "ok").expect("write marker");
+
+    // Wait for probe + supervisor cycle
+    thread::sleep(Duration::from_secs(4));
+
+    let ps2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps2, "ps after marker");
+    let ps2_json: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    let procs2 = ps2_json["processes"].as_array().expect("processes array");
+    let frontend2 = procs2
+        .iter()
+        .find(|p| p["name"].as_str() == Some("frontend"))
+        .expect("frontend process");
+    assert_eq!(
+        frontend2["state"].as_str(),
+        Some("running"),
+        "frontend should be running after backend becomes healthy"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn liveness_probe_kills_process_on_failure() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // The liveness probe always fails (test -f on a file that never exists).
+    // With restart_policy: on_failure and failure_threshold: 2, the liveness
+    // probe should kill the process after 2 consecutive failures, causing a
+    // restart.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  victim:
+    command: "sleep 120"
+    restart_policy: on_failure
+    backoff_seconds: 1
+    liveness_probe:
+      exec:
+        command: "false"
+      period_seconds: 1
+      timeout_seconds: 2
+      failure_threshold: 2
+      initial_delay_seconds: 1
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait for initial_delay (1s) + 2 probe failures (2s) + restart backoff (1s) + buffer
+    thread::sleep(Duration::from_secs(7));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let victim = ps_json["processes"]
+        .as_array()
+        .expect("processes array")
+        .iter()
+        .find(|p| p["name"].as_str() == Some("victim"))
+        .expect("victim process");
+    let restart_count = victim["restart_count"].as_u64().unwrap_or(0);
+    assert!(
+        restart_count >= 1,
+        "liveness probe should have killed the process causing a restart, got restart_count={restart_count}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn healthy_resets_on_process_restart() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let marker = project.join("health_marker");
+    let marker_str = marker.to_string_lossy().to_string();
+
+    // Long-running process with a readiness probe. We create a marker so the
+    // probe succeeds, verify healthy=true, then remove the marker and trigger
+    // a restart via `decompose restart`. After restart, healthy should reset
+    // to false and stay false since the marker is gone.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        format!(
+            r#"
+processes:
+  svc:
+    command: "sleep 60"
+    readiness_probe:
+      exec:
+        command: "test -f {marker_str}"
+      period_seconds: 1
+      timeout_seconds: 2
+      success_threshold: 1
+      failure_threshold: 1
+"#
+        ),
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Create marker so probe succeeds immediately
+    fs::write(&marker, "ok").expect("write marker");
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait for probe to detect marker
+    thread::sleep(Duration::from_secs(3));
+
+    let ps1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps1, "ps before restart");
+    let ps1_json: Value = serde_json::from_slice(&ps1.stdout).expect("ps json");
+    let svc1 = ps1_json["processes"]
+        .as_array()
+        .expect("processes array")
+        .iter()
+        .find(|p| p["name"].as_str() == Some("svc"))
+        .expect("svc process");
+    assert_eq!(
+        svc1["healthy"].as_bool(),
+        Some(true),
+        "healthy should be true before restart"
+    );
+
+    // Remove marker and trigger a restart
+    fs::remove_file(&marker).expect("remove marker");
+
+    let restart = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "restart", "svc", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&restart, "restart");
+
+    // Wait for stop + re-spawn + probe to fail
+    thread::sleep(Duration::from_secs(4));
+
+    let ps2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps2, "ps after restart without marker");
+    let ps2_json: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    let svc2 = ps2_json["processes"]
+        .as_array()
+        .expect("processes array")
+        .iter()
+        .find(|p| p["name"].as_str() == Some("svc"))
+        .expect("svc process");
+    assert_eq!(
+        svc2["healthy"].as_bool(),
+        Some(false),
+        "healthy should be false after restart when marker is gone"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
