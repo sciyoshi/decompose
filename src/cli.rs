@@ -47,7 +47,7 @@ pub enum Commands {
     /// Start the environment.
     Up(UpArgs),
     /// Stop the environment daemon and its managed processes.
-    Down(OutputOnlyArgs),
+    Down(DownArgs),
     /// Show process status.
     Ps(OutputOnlyArgs),
     /// Reattach to a running environment's logs.
@@ -74,6 +74,15 @@ pub enum Commands {
 pub struct OutputOnlyArgs {
     #[command(flatten)]
     pub output: OutputArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DownArgs {
+    #[command(flatten)]
+    pub output: OutputArgs,
+    /// Override shutdown timeout in seconds for all processes.
+    #[arg(short = 't', long = "timeout")]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]

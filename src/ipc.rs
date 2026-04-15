@@ -16,7 +16,9 @@ use crate::model::{ProcessSnapshot, RuntimePaths};
 pub enum Request {
     Ping,
     Ps,
-    Down,
+    Down {
+        timeout_seconds: Option<u64>,
+    },
     /// Stop the listed services. Empty list = stop all.
     Stop {
         services: Vec<String>,

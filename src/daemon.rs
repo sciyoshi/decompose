@@ -37,6 +37,8 @@ struct DaemonState {
     controllers: BTreeMap<String, watch::Sender<bool>>,
     shutdown_requested: bool,
     exit_mode: ExitMode,
+    /// CLI-level override for shutdown timeout (from `down --timeout`).
+    shutdown_timeout_override: Option<u64>,
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
@@ -155,6 +157,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         controllers: BTreeMap::new(),
         shutdown_requested: false,
         exit_mode,
+        shutdown_timeout_override: None,
     }));
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -449,7 +452,11 @@ async fn start_process(name: String, state: SharedState) {
                 let final_status = tokio::select! {
                     _ = kill_rx.changed() => {
                         if *kill_rx.borrow() {
-                            shutdown_child(&mut child, &spec).await;
+                            let timeout_override = {
+                                let guard = state.lock().await;
+                                guard.shutdown_timeout_override
+                            };
+                            shutdown_child(&mut child, &spec, timeout_override).await;
                             ProcessStatus::Stopped
                         } else {
                             ProcessStatus::Stopped
@@ -621,6 +628,7 @@ async fn start_process(name: String, state: SharedState) {
 async fn shutdown_child(
     child: &mut tokio::process::Child,
     spec: &crate::model::ProcessInstanceSpec,
+    timeout_override: Option<u64>,
 ) {
     // Step 1: Run optional shutdown command
     if let Some(ref cmd_str) = spec.shutdown_command {
@@ -648,7 +656,7 @@ async fn shutdown_child(
     }
 
     // Step 3: Wait with timeout
-    let timeout = Duration::from_secs(spec.shutdown_timeout_seconds);
+    let timeout = Duration::from_secs(timeout_override.unwrap_or(spec.shutdown_timeout_seconds));
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(_) => {}
         Err(_) => {
@@ -885,9 +893,10 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 processes,
             }
         }
-        Request::Down => {
+        Request::Down { timeout_seconds } => {
             let mut guard = state.lock().await;
             guard.shutdown_requested = true;
+            guard.shutdown_timeout_override = timeout_seconds;
             for tx in guard.controllers.values() {
                 let _ = tx.send(true);
             }

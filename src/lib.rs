@@ -47,7 +47,7 @@ pub async fn run_cli() -> Result<()> {
 
     match cli.command {
         Commands::Up(args) => run_up(global, args).await,
-        Commands::Down(args) => run_down(global, args.output.resolve()).await,
+        Commands::Down(args) => run_down(global, args.output.resolve(), args.timeout).await,
         Commands::Ps(args) => run_ps(global, args.output.resolve()).await,
         Commands::Attach(args) => run_attach(global, args.output.resolve()).await,
         Commands::Logs(args) => run_logs(global, args).await,
@@ -174,10 +174,21 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_down(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
+async fn run_down(
+    global: GlobalConfig,
+    output_mode: OutputMode,
+    timeout: Option<u64>,
+) -> Result<()> {
     let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
-    let response = match send_request(&paths, Request::Down).await {
+    let response = match send_request(
+        &paths,
+        Request::Down {
+            timeout_seconds: timeout,
+        },
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) if is_no_daemon_error(&err, &paths) => {
             emit_message(output_mode, "ok", "no running environment");

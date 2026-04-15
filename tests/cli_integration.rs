@@ -807,3 +807,37 @@ processes:
     );
     assert_success(&down, "down after valid DAG");
 }
+
+#[test]
+fn down_with_timeout_flag() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the daemon a moment to start processes.
+    thread::sleep(Duration::from_millis(500));
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--timeout", "1", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down --timeout 1");
+    let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
+    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+}
