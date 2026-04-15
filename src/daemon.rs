@@ -397,51 +397,7 @@ async fn start_process(name: String, state: SharedState) {
         ));
     }
 
-    let log_ready_flag = Arc::new(AtomicBool::new(false));
-
-    if let Some(stdout) = child.stdout.take() {
-        let proc_name = name.clone();
-        let pattern = ready_pattern.clone();
-        let flag = log_ready_flag.clone();
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                println!("[{proc_name}] {line}");
-                if let Some(ref re) = pattern {
-                    if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
-                        flag.store(true, Ordering::Relaxed);
-                        let mut guard = state_clone.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&proc_name) {
-                            runtime.log_ready = true;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    if let Some(stderr) = child.stderr.take() {
-        let proc_name = name.clone();
-        let pattern = ready_pattern;
-        let flag = log_ready_flag;
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{proc_name}] {line}");
-                if let Some(ref re) = pattern {
-                    if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
-                        flag.store(true, Ordering::Relaxed);
-                        let mut guard = state_clone.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&proc_name) {
-                            runtime.log_ready = true;
-                        }
-                    }
-                }
-            }
-        });
-    }
+    attach_output_readers(&mut child, &name, ready_pattern, state.clone());
 
     let (kill_tx, mut kill_rx) = watch::channel(false);
     {
@@ -557,55 +513,7 @@ async fn start_process(name: String, state: SharedState) {
                                     Regex::new(&regex::escape(pattern)).unwrap()
                                 })
                             });
-                        let log_ready_flag = Arc::new(AtomicBool::new(false));
-
-                        if let Some(stdout) = child.stdout.take() {
-                            let proc_name = name.clone();
-                            let pattern = ready_pattern.clone();
-                            let flag = log_ready_flag.clone();
-                            let state_clone = state.clone();
-                            tokio::spawn(async move {
-                                let mut lines = BufReader::new(stdout).lines();
-                                while let Ok(Some(line)) = lines.next_line().await {
-                                    println!("[{proc_name}] {line}");
-                                    if let Some(ref re) = pattern {
-                                        if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
-                                            flag.store(true, Ordering::Relaxed);
-                                            let mut guard = state_clone.lock().await;
-                                            if let Some(runtime) =
-                                                guard.processes.get_mut(&proc_name)
-                                            {
-                                                runtime.log_ready = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
-
-                        if let Some(stderr) = child.stderr.take() {
-                            let proc_name = name.clone();
-                            let pattern = ready_pattern;
-                            let flag = log_ready_flag;
-                            let state_clone = state.clone();
-                            tokio::spawn(async move {
-                                let mut lines = BufReader::new(stderr).lines();
-                                while let Ok(Some(line)) = lines.next_line().await {
-                                    eprintln!("[{proc_name}] {line}");
-                                    if let Some(ref re) = pattern {
-                                        if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
-                                            flag.store(true, Ordering::Relaxed);
-                                            let mut guard = state_clone.lock().await;
-                                            if let Some(runtime) =
-                                                guard.processes.get_mut(&proc_name)
-                                            {
-                                                runtime.log_ready = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
+                        attach_output_readers(&mut child, &name, ready_pattern, state.clone());
 
                         // Create new kill channel for this restart iteration
                         let (new_kill_tx, new_kill_rx) = watch::channel(false);
@@ -629,6 +537,62 @@ async fn start_process(name: String, state: SharedState) {
             }
         }
     });
+}
+
+/// Spawn tasks that read lines from the child's stdout and stderr pipes,
+/// printing them with a `[name]` prefix and optionally matching a
+/// `ready_log_line` regex to set the `log_ready` flag on the process runtime.
+fn attach_output_readers(
+    child: &mut tokio::process::Child,
+    name: &str,
+    ready_pattern: Option<Regex>,
+    state: SharedState,
+) {
+    let log_ready_flag = Arc::new(AtomicBool::new(false));
+
+    if let Some(stdout) = child.stdout.take() {
+        let proc_name = name.to_string();
+        let pattern = ready_pattern.clone();
+        let flag = log_ready_flag.clone();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                println!("[{proc_name}] {line}");
+                if let Some(ref re) = pattern {
+                    if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
+                        flag.store(true, Ordering::Relaxed);
+                        let mut guard = state_clone.lock().await;
+                        if let Some(runtime) = guard.processes.get_mut(&proc_name) {
+                            runtime.log_ready = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let proc_name = name.to_string();
+        let pattern = ready_pattern;
+        let flag = log_ready_flag;
+        let state_clone = state;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[{proc_name}] {line}");
+                if let Some(ref re) = pattern {
+                    if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
+                        flag.store(true, Ordering::Relaxed);
+                        let mut guard = state_clone.lock().await;
+                        if let Some(runtime) = guard.processes.get_mut(&proc_name) {
+                            runtime.log_ready = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 async fn shutdown_child(

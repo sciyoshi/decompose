@@ -784,6 +784,25 @@ fn is_no_daemon_error(err: &anyhow::Error, paths: &crate::model::RuntimePaths) -
     false
 }
 
+/// Read new bytes appended to `log_path` since `offset`, returning the updated
+/// offset.  Returns `None` when the file hasn't grown (or doesn't exist yet).
+async fn read_new_log_bytes(log_path: &std::path::Path, offset: &mut u64) -> Option<Vec<u8>> {
+    let meta = tokio::fs::metadata(log_path).await.ok()?;
+    let len = meta.len();
+    if len < *offset {
+        *offset = 0;
+    }
+    if len <= *offset {
+        return None;
+    }
+    let mut file = tokio::fs::File::open(log_path).await.ok()?;
+    file.seek(std::io::SeekFrom::Start(*offset)).await.ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await.ok()?;
+    *offset += buf.len() as u64;
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
 async fn stream_daemon_logs(
     log_path: std::path::PathBuf,
     mut stop_rx: watch::Receiver<bool>,
@@ -800,26 +819,10 @@ async fn stream_daemon_logs(
             break;
         }
 
-        if let Ok(meta) = tokio::fs::metadata(&log_path).await {
-            let len = meta.len();
-            if len < offset {
-                offset = 0;
-            }
-            if len > offset {
-                if let Ok(mut file) = tokio::fs::File::open(&log_path).await {
-                    if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
-                        let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).await.is_ok() {
-                            offset += buf.len() as u64;
-                            if !buf.is_empty() {
-                                let text = String::from_utf8_lossy(&buf);
-                                print!("{text}");
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(buf) = read_new_log_bytes(&log_path, &mut offset).await {
+            let text = String::from_utf8_lossy(&buf);
+            print!("{text}");
+            let _ = std::io::stdout().flush();
         }
 
         tokio::select! {
@@ -872,30 +875,14 @@ async fn stream_filtered_logs(
             }
         }
 
-        if let Ok(meta) = tokio::fs::metadata(&log_path).await {
-            let len = meta.len();
-            if len < offset {
-                offset = 0;
+        if let Some(buf) = read_new_log_bytes(&log_path, &mut offset).await {
+            let text = String::from_utf8_lossy(&buf);
+            let lines: Vec<&str> = text.lines().collect();
+            let filtered = filter_log_lines(&lines, &processes);
+            for line in filtered {
+                println!("{line}");
             }
-            if len > offset {
-                if let Ok(mut file) = tokio::fs::File::open(&log_path).await {
-                    if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
-                        let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).await.is_ok() {
-                            offset += buf.len() as u64;
-                            if !buf.is_empty() {
-                                let text = String::from_utf8_lossy(&buf);
-                                let lines: Vec<&str> = text.lines().collect();
-                                let filtered = filter_log_lines(&lines, &processes);
-                                for line in filtered {
-                                    println!("{line}");
-                                }
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                    }
-                }
-            }
+            let _ = std::io::stdout().flush();
         }
 
         tokio::select! {
