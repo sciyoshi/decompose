@@ -870,3 +870,168 @@ fn up_detach_wait_returns_when_services_running() {
     );
     assert_success(&down, "down");
 }
+
+#[test]
+fn shutdown_normal_sigterm_clean_exit() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  trapper:
+    command: "sh -c 'trap \"exit 0\" TERM; sleep 30'"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the process time to start and register the trap.
+    thread::sleep(Duration::from_millis(500));
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down after SIGTERM clean exit");
+    let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
+    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+}
+
+#[test]
+fn shutdown_timeout_escalation_to_sigkill() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // Process that ignores SIGTERM, so shutdown must escalate to SIGKILL.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  stubborn:
+    command: "sh -c 'trap \"\" TERM; sleep 30'"
+    shutdown:
+      timeout_seconds: 1
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the process time to start and register the trap.
+    thread::sleep(Duration::from_millis(500));
+
+    let start = std::time::Instant::now();
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--timeout", "1", "--json"],
+        &[],
+        &[],
+    );
+    let elapsed = start.elapsed();
+
+    assert_success(&down, "down after timeout escalation to SIGKILL");
+    let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
+    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+
+    // The process ignores SIGTERM so must wait for the 1-second timeout
+    // before SIGKILL. Verify it didn't take longer than 10 seconds (generous
+    // upper bound to avoid flakiness).
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "down should complete quickly after SIGKILL, took {:?}",
+        elapsed
+    );
+}
+
+#[test]
+fn shutdown_custom_signal() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // Process that traps SIGINT (signal 2) and exits cleanly, but ignores SIGTERM.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  custom_sig:
+    command: "sh -c 'trap \"exit 0\" INT; trap \"\" TERM; sleep 30'"
+    shutdown:
+      signal: 2
+      timeout_seconds: 5
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the process time to start and register the traps.
+    thread::sleep(Duration::from_millis(500));
+
+    let start = std::time::Instant::now();
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    let elapsed = start.elapsed();
+
+    assert_success(&down, "down with custom SIGINT shutdown signal");
+    let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
+    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+
+    // With the custom signal (SIGINT) handled, the process should exit promptly
+    // without needing the 5-second timeout escalation to SIGKILL.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "down should exit quickly via custom signal, took {:?}",
+        elapsed
+    );
+}
