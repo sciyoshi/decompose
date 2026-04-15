@@ -197,5 +197,6 @@ pub struct ProcessSnapshot {
     pub restart_count: u32,
     pub log_ready: bool,
     pub healthy: bool,
+    pub has_readiness_probe: bool,
     pub exit_code: Option<i32>,
 }

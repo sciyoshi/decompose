@@ -888,6 +888,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                         restart_count: proc_runtime.restart_count,
                         log_ready: proc_runtime.log_ready,
                         healthy: proc_runtime.healthy,
+                        has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),
                         exit_code,
                     }
                 })

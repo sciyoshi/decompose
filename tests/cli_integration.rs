@@ -841,3 +841,32 @@ fn down_with_timeout_flag() {
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
     assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
 }
+
+#[test]
+fn up_detach_wait_returns_when_services_running() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--wait", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up -d --wait");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}

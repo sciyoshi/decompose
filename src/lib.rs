@@ -150,6 +150,9 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
 
     emit_up_status(output_mode, state, pid);
     if !attached {
+        if args.wait {
+            wait_for_services_ready(&paths, output_mode).await?;
+        }
         return Ok(());
     }
     if got_ctrl_c {
@@ -620,6 +623,61 @@ fn emit_detach(mode: OutputMode) {
 fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
     let _ = std::fs::remove_file(&paths.socket);
     let _ = std::fs::remove_file(&paths.pid);
+}
+
+/// Poll the daemon until all non-disabled processes are started (or healthy,
+/// if a readiness probe is configured).  Times out after 5 minutes.
+async fn wait_for_services_ready(
+    paths: &crate::model::RuntimePaths,
+    output_mode: OutputMode,
+) -> Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    const TIMEOUT: Duration = Duration::from_secs(300);
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for services to become ready");
+        }
+
+        match send_request(paths, Request::Ps).await {
+            Ok(Response::Ps { processes, .. }) => {
+                let active: Vec<&crate::model::ProcessSnapshot> =
+                    processes.iter().filter(|p| p.state != "disabled").collect();
+
+                let all_ready = !active.is_empty()
+                    && active.iter().all(|p| {
+                        if p.state == "failed" {
+                            // Already failed — no point waiting.
+                            return true;
+                        }
+                        if p.has_readiness_probe {
+                            p.healthy
+                        } else {
+                            p.state == "running" || p.state == "exited"
+                        }
+                    });
+
+                if all_ready {
+                    let any_failed = active.iter().any(|p| p.state == "failed");
+                    if any_failed {
+                        emit_message(output_mode, "error", "services ready (some failed)");
+                    } else {
+                        emit_message(output_mode, "ok", "all services are ready");
+                    }
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // Daemon may have crashed.
+                bail!("lost connection to daemon while waiting for services");
+            }
+        }
+
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 async fn wait_for_daemon_stop(paths: &crate::model::RuntimePaths) {
