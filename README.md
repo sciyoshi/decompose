@@ -497,3 +497,166 @@ environment:
   - PORT=3000
   - DEBUG=true
 ```
+
+## Migrating from Docker Compose
+
+`decompose` is designed to feel familiar to Docker Compose users. If you already have a `docker-compose.yml`, most of it can be adapted with minimal changes.
+
+### What maps directly
+
+These fields work the same way (or very similarly) in both tools:
+
+| Docker Compose field | decompose equivalent | Notes |
+|---|---|---|
+| `command` | `command` | Runs as a native shell command instead of inside a container |
+| `environment` | `environment` | Map or list of `KEY=VALUE` entries |
+| `env_file` | `env_file` | Additional `.env` files to load |
+| `working_dir` | `working_dir` | Defaults to the config file directory |
+| `depends_on` | `depends_on` | Supports conditions: `process_started`, `process_completed`, `process_completed_successfully`, `process_healthy`, `process_log_ready` |
+| `healthcheck` | `readiness_probe` / `liveness_probe` | Similar concept, slightly different schema (see below) |
+| `restart` | `restart_policy` | Supports `no`, `on_failure`, `always` |
+| `deploy.replicas` | `replicas` | Directly on the process definition |
+| `stop_grace_period` | `shutdown.timeout_seconds` | Time to wait before SIGKILL |
+| `stop_signal` | `shutdown.signal` | Signal number (e.g., `15` for SIGTERM) |
+
+### What doesn't apply
+
+Since decompose runs native processes instead of containers, these Docker Compose fields have no equivalent and should be removed:
+
+- **`image`** -- Use `command` to run the process directly (e.g., `node server.js`, `python app.py`).
+- **`build`** -- No container image builds. If you need a build step, add it as a separate process with a dependency.
+- **`ports`** -- No port mapping needed; processes bind to host ports directly.
+- **`volumes`** -- No mount translation; processes access the host filesystem natively.
+- **`networks`** -- No container networking; processes communicate over localhost.
+- **`expose`**, **`links`**, **`extra_hosts`** -- Not applicable.
+- **`container_name`**, **`hostname`**, **`domainname`** -- Not applicable.
+- **`entrypoint`** -- Fold into `command`.
+- **`cap_add`**, **`cap_drop`**, **`privileged`**, **`security_opt`** -- Not applicable.
+
+### Config file naming
+
+decompose auto-discovers config files in this order:
+
+1. `compose.yml` (same filename Docker Compose uses)
+2. `compose.yaml`
+3. `decompose.yml`
+4. `decompose.yaml`
+
+You can keep your file named `compose.yml` and decompose will find it, or rename to `decompose.yml` to avoid ambiguity.
+
+### CLI command parity
+
+**Works the same:**
+
+| Command | Notes |
+|---|---|
+| `up [-d] [SERVICE...]` | Starts services; `-d` detaches |
+| `down` | Stops the environment |
+| `ps` | Shows process status |
+| `logs [-f] [-n N] [SERVICE...]` | View/follow logs |
+| `start [SERVICE...]` | Start stopped services |
+| `stop [SERVICE...]` | Stop running services |
+| `restart [SERVICE...]` | Restart services |
+
+**Not implemented** (container-specific or not applicable):
+
+`build`, `pull`, `push`, `create`, `run`, `exec`, `port`, `top`, `events`, `images`, `pause`, `unpause`, `kill`, `cp`, `wait`
+
+### Health check conversion
+
+Docker Compose:
+
+```yaml
+services:
+  web:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 1s
+      start_period: 5s
+      retries: 3
+```
+
+decompose:
+
+```yaml
+processes:
+  web:
+    command: "node server.js"
+    readiness_probe:
+      exec:
+        command: "curl -f http://localhost:8080/health"
+      period_seconds: 10
+      timeout_seconds: 1
+      initial_delay_seconds: 5
+      failure_threshold: 3
+```
+
+decompose also supports `http_get` probes as an alternative to `exec`:
+
+```yaml
+    readiness_probe:
+      http_get:
+        host: "127.0.0.1"
+        port: 8080
+        path: /health
+        scheme: http
+```
+
+### Quick conversion checklist
+
+1. **Rename or copy** your `docker-compose.yml` to `compose.yml` (or `decompose.yml`).
+2. **Remove the top-level `services:` key** and replace it with `processes:` (or keep `services:` -- decompose uses `processes:`).
+3. **Replace `image:` with `command:`** -- specify the shell command that starts each service (e.g., `python manage.py runserver`, `npm start`).
+4. **Remove `build:`**, `ports:`, `volumes:`, `networks:`, and any other container-specific fields.
+5. **Keep `environment:`, `env_file:`, `working_dir:`, and `depends_on:`** -- these work as-is.
+6. **Convert `healthcheck:` to `readiness_probe:`** using the schema shown above.
+7. **Convert `restart:` to `restart_policy:`** -- values `no`, `on-failure`/`on_failure`, and `always` are supported.
+8. **Convert `deploy.replicas:` to `replicas:`** at the process level.
+9. **Test** with `decompose config` to validate your converted file, then `decompose up`.
+
+### Before and after example
+
+Docker Compose:
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://localhost/mydb
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:16
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 5s
+
+volumes:
+  pgdata:
+```
+
+decompose:
+
+```yaml
+processes:
+  api:
+    command: "npm start"
+    environment:
+      DATABASE_URL: postgres://localhost/mydb
+    depends_on:
+      db:
+        condition: process_healthy
+  db:
+    command: "pg_ctl start -D /usr/local/var/postgresql@16 -l db.log"
+    readiness_probe:
+      exec:
+        command: "pg_isready"
+      period_seconds: 5
+```
