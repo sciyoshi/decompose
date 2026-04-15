@@ -21,7 +21,7 @@ use tokio::time::sleep;
 
 use crate::cli::DaemonArgs;
 use crate::config::{
-    apply_interpolation, build_process_instances, filter_process_subset, load_and_merge_configs,
+    apply_interpolation, build_process_instances, collect_process_subset, load_and_merge_configs,
     load_dotenv_files,
 };
 use crate::ipc::{Request, Response, to_socket_name};
@@ -136,13 +136,34 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
     let mut config = load_and_merge_configs(&args.config_files)?;
     apply_interpolation(&mut config);
 
-    // Phase A3: filter to subset if specified
-    if !args.processes.is_empty() {
-        filter_process_subset(&mut config, &args.processes, !args.no_deps)?;
-    }
+    // Determine which services were selected for launch. Non-selected ones
+    // stay in the daemon state as NotStarted so they can be addressed later
+    // by `start` or incremental `up`.
+    let selected: Option<std::collections::HashSet<String>> = if !args.processes.is_empty() {
+        Some(collect_process_subset(
+            &config,
+            &args.processes,
+            !args.no_deps,
+        )?)
+    } else {
+        None
+    };
 
     let exit_mode = config.exit_mode;
-    let process_map = build_process_instances(&config, &args.cwd, &dotenv);
+    let mut process_map = build_process_instances(&config, &args.cwd, &dotenv);
+
+    // Mark non-selected services as NotStarted instead of Pending so the
+    // supervisor won't auto-launch them.
+    if let Some(ref selected) = selected {
+        for (name, runtime) in process_map.iter_mut() {
+            if !selected.contains(&runtime.spec.base_name)
+                && !selected.contains(name)
+                && matches!(runtime.status, ProcessStatus::Pending)
+            {
+                runtime.status = ProcessStatus::NotStarted;
+            }
+        }
+    }
 
     fs::write(&paths.pid, std::process::id().to_string()).with_context(|| {
         format!(

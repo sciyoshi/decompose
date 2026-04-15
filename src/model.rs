@@ -122,10 +122,20 @@ fn default_path() -> String {
 
 #[derive(Debug, Clone)]
 pub enum ProcessStatus {
+    /// Defined in config but not yet selected for launch (e.g. not part of
+    /// the initial `up` subset). Will not be started by the supervisor until
+    /// explicitly requested via `start` or `up`.
+    NotStarted,
     Pending,
-    Running { pid: u32 },
-    Exited { code: i32 },
-    FailedToStart { reason: String },
+    Running {
+        pid: u32,
+    },
+    Exited {
+        code: i32,
+    },
+    FailedToStart {
+        reason: String,
+    },
     Stopped,
     Restarting,
     Disabled,
@@ -134,6 +144,7 @@ pub enum ProcessStatus {
 impl ProcessStatus {
     pub fn to_human(&self) -> String {
         match self {
+            ProcessStatus::NotStarted => "not_started".to_string(),
             ProcessStatus::Pending => "pending".to_string(),
             ProcessStatus::Running { pid } => format!("running(pid={pid})"),
             ProcessStatus::Exited { code } => format!("exited(code={code})"),
@@ -146,6 +157,7 @@ impl ProcessStatus {
 
     pub fn to_json_status(&self) -> &'static str {
         match self {
+            ProcessStatus::NotStarted => "not_started",
             ProcessStatus::Pending => "pending",
             ProcessStatus::Running { .. } => "running",
             ProcessStatus::Exited { code: 0 } => "exited",
@@ -160,7 +172,8 @@ impl ProcessStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            ProcessStatus::Exited { .. }
+            ProcessStatus::NotStarted
+                | ProcessStatus::Exited { .. }
                 | ProcessStatus::FailedToStart { .. }
                 | ProcessStatus::Stopped
                 | ProcessStatus::Disabled

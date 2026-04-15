@@ -323,11 +323,15 @@ pub fn merge_configs(base: ProjectConfig, overlay: ProjectConfig) -> ProjectConf
 // Process subset filtering (Phase A3)
 // ---------------------------------------------------------------------------
 
-pub fn filter_process_subset(
-    cfg: &mut ProjectConfig,
+/// Compute the set of process names that should be selected for launch,
+/// expanding to include transitive dependencies when `include_deps` is true.
+/// Does NOT mutate the config — the caller decides how to handle non-selected
+/// services.
+pub fn collect_process_subset(
+    cfg: &ProjectConfig,
     names: &[String],
     include_deps: bool,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
     for name in names {
         if !cfg.processes.contains_key(name) {
             bail!("unknown process `{name}`");
@@ -351,6 +355,16 @@ pub fn filter_process_subset(
     } else {
         names.iter().cloned().collect()
     };
+
+    Ok(keep)
+}
+
+pub fn filter_process_subset(
+    cfg: &mut ProjectConfig,
+    names: &[String],
+    include_deps: bool,
+) -> Result<()> {
+    let keep = collect_process_subset(cfg, names, include_deps)?;
 
     cfg.processes.retain(|name, _| keep.contains(name));
 

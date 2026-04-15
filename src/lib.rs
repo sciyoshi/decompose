@@ -718,8 +718,10 @@ async fn wait_for_services_ready(
 
         match send_request(paths, Request::Ps).await {
             Ok(Response::Ps { processes, .. }) => {
-                let active: Vec<&crate::model::ProcessSnapshot> =
-                    processes.iter().filter(|p| p.state != "disabled").collect();
+                let active: Vec<&crate::model::ProcessSnapshot> = processes
+                    .iter()
+                    .filter(|p| p.state != "disabled" && p.state != "not_started")
+                    .collect();
 
                 let all_ready = !active.is_empty()
                     && active.iter().all(|p| {
