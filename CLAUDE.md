@@ -128,6 +128,42 @@ src/
   paths.rs     XDG path management, instance ID generation
 ```
 
+## Build, test, lint
+
+All of these must pass before committing:
+
+```bash
+cargo build --locked --all-targets
+cargo test --locked --all-targets
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+## Testing patterns
+
+Integration tests live in `tests/cli_integration.rs` and spawn the compiled
+binary end-to-end. Each test creates an isolated temp dir and sets
+`XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, and `HOME` to prevent collisions with
+real environments. Every test that calls `up` must call `down` before exiting.
+
+Use the existing `setup_project()` and `run_cmd()` helpers when adding tests.
+
+## Adding new CLI commands
+
+1. Add variant to `Commands` enum in `cli.rs` with a doc comment (becomes
+   help text). Re-use `GlobalArgs` or `ServiceArgs` where applicable.
+2. Add the handler function in `lib.rs`.
+3. Wire the match arm in `run_cli()` in `lib.rs`.
+4. If the command talks to the daemon, add the request/response variants to
+   `ipc.rs` and the handler in `daemon.rs`.
+5. Add an integration test in `tests/cli_integration.rs`.
+
+## Commit messages
+
+**Conventional Commits required.** See `AGENTS.md` for the full spec.
+Quick reference: `feat(cli):`, `fix(daemon):`, `refactor(config):`,
+`test:`, `docs:`, `chore:`.
+
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker

@@ -4,6 +4,7 @@
 .decompose/
 .claude/*
 !.claude/agents/
+!.claude/skills/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
