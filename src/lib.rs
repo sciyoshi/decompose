@@ -24,7 +24,7 @@ use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{OutputMode, print_json};
-use crate::paths::{build_instance_id, runtime_paths_for};
+use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
 
 /// Global config flags that live on the top-level `Cli` struct.
 #[derive(Debug, Clone)]
@@ -56,6 +56,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Restart(args) => run_service_command(global, args, ServiceOp::Restart).await,
         Commands::Config(args) => run_config(global, args.output.resolve()).await,
         Commands::Kill(args) => run_kill(global, args).await,
+        Commands::Ls(args) => run_ls(args.output.resolve()).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }
@@ -353,8 +354,7 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
 }
 
 async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
-    let (_, _, paths) =
-        runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
     let output_mode = args.output.resolve();
 
     let signal = parse_signal(&args.signal)?;
@@ -402,6 +402,70 @@ fn parse_signal(s: &str) -> Result<i32> {
         "STOP" => Ok(19),
         "CONT" => Ok(18),
         _ => bail!("unknown signal: {s}"),
+    }
+}
+
+async fn run_ls(output_mode: OutputMode) -> Result<()> {
+    let socket_dir = runtime_dir()?;
+
+    let mut environments = Vec::new();
+
+    if socket_dir.is_dir() {
+        let entries = std::fs::read_dir(&socket_dir).with_context(|| {
+            format!("failed to read runtime directory {}", socket_dir.display())
+        })?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let paths = runtime_paths_for(&name)?;
+            let status = match send_request(&paths, Request::Ping).await {
+                Ok(Response::Pong { .. }) => "running",
+                _ => "not responding",
+            };
+
+            environments.push((name, status));
+        }
+    }
+
+    environments.sort_by(|a, b| a.0.cmp(&b.0));
+    emit_ls(output_mode, &environments);
+    Ok(())
+}
+
+fn emit_ls(mode: OutputMode, environments: &[(String, &str)]) {
+    match mode {
+        OutputMode::Json => {
+            let envs: Vec<serde_json::Value> = environments
+                .iter()
+                .map(|(name, status)| {
+                    json!({
+                        "name": name,
+                        "status": status
+                    })
+                })
+                .collect();
+            print_json(&json!({ "environments": envs }));
+        }
+        OutputMode::Table => {
+            if environments.is_empty() {
+                println!("No running environments");
+            } else {
+                println!("NAME                             STATUS");
+                for (name, status) in environments {
+                    println!("{:<32} {status}", name);
+                }
+            }
+        }
     }
 }
 

@@ -44,6 +44,20 @@ pub fn build_instance_id(
     hex.chars().take(16).collect()
 }
 
+/// Return the base runtime directory where decompose sockets are stored.
+///
+/// Does **not** require an instance ID — useful for discovering all running
+/// instances by scanning the directory for `.sock` files.
+pub fn runtime_dir() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let dir = socket_root_with_env(
+        &home,
+        env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        env::var_os("XDG_STATE_HOME").as_deref(),
+    );
+    Ok(dir)
+}
+
 pub fn runtime_paths_for(instance: &str) -> Result<RuntimePaths> {
     let home = home_dir()?;
     let socket_root = socket_root_with_env(

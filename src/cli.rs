@@ -50,6 +50,8 @@ pub enum Commands {
     Config(OutputOnlyArgs),
     /// Send a signal to one or more services. With no args, targets all.
     Kill(KillArgs),
+    /// List running decompose environments.
+    Ls(OutputOnlyArgs),
     #[command(hide = true)]
     Daemon(DaemonArgs),
 }
