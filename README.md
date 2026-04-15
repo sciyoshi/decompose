@@ -97,10 +97,134 @@ Nix pins the toolchain and dependencies; `decompose` orchestrates native process
 
 ## Commands
 
+```
+decompose up [-d|--detach] [--no-deps] [SERVICE...]
+decompose down
+decompose ps
+decompose attach
+decompose logs [-f|--follow] [-n|--tail N] [SERVICE...]
+decompose start [SERVICE...]
+decompose stop [SERVICE...]
+decompose restart [SERVICE...]
+```
+
+Global flags (`--file`, `--session`, `-e`, `--disable-dotenv`, `--json`,
+`--table`) go **before** the subcommand:
+
 ```bash
-decompose up [-f FILE] [-d|--detach] [--json|--table]
-decompose down [-f FILE] [--json|--table]
-decompose ps [-f FILE] [--json|--table]
+decompose --file compose.yml --session myproject ps --json
+```
+
+## CLI usage examples
+
+### Basic lifecycle
+
+```bash
+# Start everything in the background
+decompose up -d
+
+# Check what is running
+decompose ps
+
+# Follow all logs
+decompose logs -f
+
+# Tear down the environment
+decompose down
+```
+
+### Starting specific services
+
+```bash
+# Start only the web and api services (dependencies are started automatically)
+decompose up -d web api
+
+# Start services without pulling in dependencies
+decompose up -d --no-deps web
+```
+
+### Managing individual services
+
+```bash
+# Stop a single service
+decompose stop worker
+
+# Start it back up
+decompose start worker
+
+# Restart one or more services
+decompose restart web api
+```
+
+### Viewing logs
+
+```bash
+# Stream logs from all services
+decompose logs -f
+
+# Show the last 100 lines from a specific service
+decompose logs -n 100 web
+
+# Follow logs for two services
+decompose logs -f api worker
+```
+
+### Multi-file configuration
+
+```bash
+# Merge a base config with development overrides
+decompose --file base.yml --file dev.yml up -d
+
+# Check status using the same file set
+decompose --file base.yml --file dev.yml ps
+```
+
+### Output modes
+
+```bash
+# Machine-readable JSON (useful in scripts and CI)
+decompose ps --json
+
+# Human-friendly table
+decompose ps --table
+
+# Pipe JSON into jq
+decompose ps --json | jq '.[] | select(.status == "running")'
+```
+
+### Session isolation
+
+```bash
+# Run two independent environments from the same directory
+decompose --session staging up -d
+decompose --session canary  up -d
+
+# Inspect each independently
+decompose --session staging ps
+decompose --session canary  ps
+
+# Tear down one without affecting the other
+decompose --session staging down
+```
+
+### Attaching to a running environment
+
+```bash
+# Start detached, then reattach from another terminal
+decompose up -d
+decompose attach
+
+# Ctrl-C detaches without stopping the daemon
+```
+
+### Environment files
+
+```bash
+# Load an extra env file
+decompose -e secrets.env up -d
+
+# Skip automatic .env loading
+decompose --disable-dotenv up -d
 ```
 
 ## Output modes
