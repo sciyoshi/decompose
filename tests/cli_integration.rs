@@ -1532,3 +1532,245 @@ processes:
     );
     assert_success(&down_default, "down default session");
 }
+#[test]
+fn ps_json_structure_has_all_expected_fields() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the daemon a moment to start the process.
+    thread::sleep(Duration::from_millis(500));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps --json");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json parse");
+
+    // Top-level must have "processes" array.
+    let processes = parsed
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("top-level 'processes' array");
+    assert!(!processes.is_empty(), "should have at least one process");
+
+    // Verify each process snapshot has the expected fields with correct types.
+    for proc in processes {
+        let obj = proc.as_object().expect("process should be an object");
+
+        // Required string fields.
+        assert!(
+            obj.get("name").and_then(Value::as_str).is_some(),
+            "process must have string 'name', got: {proc}"
+        );
+        assert!(
+            obj.get("state").and_then(Value::as_str).is_some(),
+            "process must have string 'state', got: {proc}"
+        );
+        assert!(
+            obj.get("status").and_then(Value::as_str).is_some(),
+            "process must have string 'status', got: {proc}"
+        );
+        assert!(
+            obj.get("base").and_then(Value::as_str).is_some(),
+            "process must have string 'base', got: {proc}"
+        );
+
+        // Required boolean fields.
+        assert!(
+            obj.get("healthy").and_then(Value::as_bool).is_some(),
+            "process must have bool 'healthy', got: {proc}"
+        );
+        assert!(
+            obj.get("log_ready").and_then(Value::as_bool).is_some(),
+            "process must have bool 'log_ready', got: {proc}"
+        );
+        assert!(
+            obj.get("has_readiness_probe")
+                .and_then(Value::as_bool)
+                .is_some(),
+            "process must have bool 'has_readiness_probe', got: {proc}"
+        );
+
+        // Required numeric fields.
+        assert!(
+            obj.get("restart_count").and_then(Value::as_u64).is_some(),
+            "process must have numeric 'restart_count', got: {proc}"
+        );
+        assert!(
+            obj.get("replica").and_then(Value::as_u64).is_some(),
+            "process must have numeric 'replica', got: {proc}"
+        );
+
+        // Optional nullable fields must be present (even if null).
+        assert!(
+            obj.contains_key("exit_code"),
+            "process must contain 'exit_code' key, got: {proc}"
+        );
+        assert!(
+            obj.contains_key("description"),
+            "process must contain 'description' key, got: {proc}"
+        );
+    }
+
+    // Verify the specific sleeper process values.
+    let sleeper = processes
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("sleeper"))
+        .expect("should have a 'sleeper' process");
+    assert_eq!(
+        sleeper.get("state").and_then(Value::as_str),
+        Some("running"),
+        "sleeper should be in running state"
+    );
+    assert_eq!(
+        sleeper.get("restart_count").and_then(Value::as_u64),
+        Some(0),
+        "sleeper restart_count should be 0"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn up_json_structure_has_status_and_pid() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up --json");
+    let parsed: Value = serde_json::from_slice(&up.stdout).expect("up json parse");
+
+    // Must have "status" string field.
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .expect("up response must have string 'status'");
+    assert_eq!(status, "started");
+
+    // Must have "pid" numeric field.
+    assert!(
+        parsed.get("pid").and_then(Value::as_u64).is_some(),
+        "up response must have numeric 'pid', got: {parsed}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn down_json_structure_has_status_ok() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    // Start the daemon first.
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down --json");
+    let parsed: Value = serde_json::from_slice(&down.stdout).expect("down json parse");
+
+    // Must have "status" string field with value "ok".
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .expect("down response must have string 'status'");
+    assert_eq!(status, "ok");
+}
+
+#[test]
+fn ps_empty_json_structure_has_running_false_and_empty_processes() {
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps --json when not running");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json parse");
+
+    // Must have "running" boolean field set to false.
+    let running = parsed
+        .get("running")
+        .and_then(Value::as_bool)
+        .expect("empty ps response must have bool 'running'");
+    assert!(!running, "running should be false when no daemon");
+
+    // Must have "processes" array that is empty.
+    let processes = parsed
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("empty ps response must have 'processes' array");
+    assert!(
+        processes.is_empty(),
+        "processes should be empty when no daemon"
+    );
+}
