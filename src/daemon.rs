@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -59,10 +60,9 @@ pub fn spawn_daemon_process(
         fs::create_dir_all(parent)?;
     }
 
-    let log_file = OpenOptions::new()
+    let mut log_file = OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&paths.daemon_log)
         .with_context(|| {
             format!(
@@ -70,6 +70,12 @@ pub fn spawn_daemon_process(
                 paths.daemon_log.display()
             )
         })?;
+    writeln!(
+        log_file,
+        "\n--- daemon started at {} ---",
+        humantime::format_rfc3339_seconds(std::time::SystemTime::now())
+    )
+    .ok();
     let log_err = log_file.try_clone()?;
 
     let mut cmd = std::process::Command::new(exe);
