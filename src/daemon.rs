@@ -958,6 +958,33 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 }
             }
         }
+        Request::Kill { services, signal } => {
+            let guard = state.lock().await;
+            match resolve_services(&guard, &services) {
+                Err(unknown) => Response::Error {
+                    message: format!("unknown service(s): {}", unknown.join(", ")),
+                },
+                Ok(names) => {
+                    for name in &names {
+                        if let Some(runtime) = guard.processes.get(name) {
+                            if let ProcessStatus::Running { pid } = runtime.status {
+                                #[cfg(unix)]
+                                {
+                                    use nix::sys::signal::{self, Signal};
+                                    use nix::unistd::Pid;
+                                    if let Ok(sig) = Signal::try_from(signal) {
+                                        let _ = signal::kill(Pid::from_raw(pid as i32), sig);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Response::Ack {
+                        message: format!("killed {}", describe_services(&services)),
+                    }
+                }
+            }
+        }
         Request::Restart { services } => {
             let guard = state.lock().await;
             match resolve_services(&guard, &services) {

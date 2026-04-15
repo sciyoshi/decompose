@@ -48,6 +48,8 @@ pub enum Commands {
     Restart(ServiceArgs),
     /// Validate and print the resolved configuration.
     Config(OutputOnlyArgs),
+    /// Send a signal to one or more services. With no args, targets all.
+    Kill(KillArgs),
     #[command(hide = true)]
     Daemon(DaemonArgs),
 }
@@ -90,6 +92,17 @@ pub struct LogsArgs {
     pub tail: Option<usize>,
     /// Filter logs to specific process(es).
     pub processes: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct KillArgs {
+    #[command(flatten)]
+    pub output: OutputArgs,
+    /// Signal to send (default: SIGKILL). Name (e.g. SIGTERM) or number (e.g. 15).
+    #[arg(short = 's', long = "signal", default_value = "SIGKILL")]
+    pub signal: String,
+    /// Service(s) to kill. If none, kills all services.
+    pub services: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]

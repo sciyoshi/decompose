@@ -354,6 +354,92 @@ fn down_when_not_running_exits_zero() {
 }
 
 #[test]
+fn kill_sends_signal_to_running_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  sleeper:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the process a moment to start
+    thread::sleep(Duration::from_millis(500));
+
+    // Kill the service (default SIGKILL)
+    let kill = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "kill", "--json", "sleeper"],
+        &[],
+        &[],
+    );
+    assert_success(&kill, "kill sleeper");
+    let kill_json: Value = serde_json::from_slice(&kill.stdout).expect("kill json");
+    assert_eq!(kill_json.get("status").and_then(Value::as_str), Some("ok"));
+
+    // Give time for the process to be reaped
+    thread::sleep(Duration::from_millis(500));
+
+    // Check that the process is no longer running
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after kill");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let processes = ps_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    let sleeper = processes
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("sleeper"))
+        .expect("sleeper process");
+    let state_str = sleeper.get("state").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        state_str == "exited" || state_str == "failed",
+        "expected exited or failed, got: {state_str}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
 fn ps_when_not_running_is_empty_not_error() {
     let (_root, project, runtime, state, config) = setup_project();
     let home = project.parent().expect("parent").join("home");

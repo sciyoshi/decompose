@@ -19,7 +19,7 @@ use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use crate::cli::{Cli, Commands, LogsArgs, ServiceArgs, UpArgs};
+use crate::cli::{Cli, Commands, KillArgs, LogsArgs, ServiceArgs, UpArgs};
 use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
@@ -55,6 +55,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Stop(args) => run_service_command(global, args, ServiceOp::Stop).await,
         Commands::Restart(args) => run_service_command(global, args, ServiceOp::Restart).await,
         Commands::Config(args) => run_config(global, args.output.resolve()).await,
+        Commands::Kill(args) => run_kill(global, args).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }
@@ -349,6 +350,59 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
     }
 
     Ok(())
+}
+
+async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
+    let (_, _, paths) =
+        runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let output_mode = args.output.resolve();
+
+    let signal = parse_signal(&args.signal)?;
+
+    let request = Request::Kill {
+        services: args.services.clone(),
+        signal,
+    };
+
+    let response = match send_request(&paths, request).await {
+        Ok(response) => response,
+        Err(err) if is_no_daemon_error(&err, &paths) => {
+            bail!("no running environment for this project — start one with `decompose up`");
+        }
+        Err(err) => return Err(err),
+    };
+
+    match response {
+        Response::Ack { message } => emit_message(output_mode, "ok", &message),
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected response from daemon"),
+    }
+
+    Ok(())
+}
+
+fn parse_signal(s: &str) -> Result<i32> {
+    // Try parsing as a number first
+    if let Ok(num) = s.parse::<i32>() {
+        return Ok(num);
+    }
+
+    // Strip optional "SIG" prefix and match by name
+    let name = s.to_ascii_uppercase();
+    let name = name.strip_prefix("SIG").unwrap_or(&name);
+
+    match name {
+        "KILL" => Ok(9),
+        "TERM" => Ok(15),
+        "INT" => Ok(2),
+        "HUP" => Ok(1),
+        "USR1" => Ok(10),
+        "USR2" => Ok(12),
+        "QUIT" => Ok(3),
+        "STOP" => Ok(19),
+        "CONT" => Ok(18),
+        _ => bail!("unknown signal: {s}"),
+    }
 }
 
 async fn runtime_context(

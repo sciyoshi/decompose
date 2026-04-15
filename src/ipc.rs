@@ -29,6 +29,11 @@ pub enum Request {
     Restart {
         services: Vec<String>,
     },
+    /// Send a signal to the listed services. Empty list = all.
+    Kill {
+        services: Vec<String>,
+        signal: i32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
