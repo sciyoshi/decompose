@@ -24,8 +24,8 @@ use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{
-    FooterInfo, OutputMode, print_footer, print_json, style_for_health, style_for_status, styled,
-    use_color,
+    FooterInfo, OutputMode, glyph_for_health, glyph_for_state, print_footer, print_json,
+    style_for_status, styled, use_color,
 };
 use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
 
@@ -629,11 +629,7 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
             let color = use_color();
             let has_replicas = processes.iter().any(|p| p.replica > 1 || p.name != p.base);
 
-            // Build per-row display values for HEALTH and RESTARTS.
-            let health_vals: Vec<&str> = processes
-                .iter()
-                .map(|p| if p.healthy { "healthy" } else { "-" })
-                .collect();
+            // Build per-row display values for RESTARTS.
             let restart_vals: Vec<String> = processes
                 .iter()
                 .map(|p| {
@@ -658,18 +654,17 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 .max()
                 .unwrap_or(0)
                 .max("STATUS".len());
-            let w_health = health_vals
-                .iter()
-                .map(|v| v.len())
-                .max()
-                .unwrap_or(0)
-                .max("HEALTH".len());
+            // HEALTH is a single glyph now (1 column wide).
+            let w_health = "HEALTH".len();
             let w_restarts = restart_vals
                 .iter()
                 .map(|v| v.len())
                 .max()
                 .unwrap_or(0)
                 .max("RESTARTS".len());
+
+            // Leading state-glyph column: 1 visible char, but we right-pad to 1.
+            let w_glyph = 1;
 
             if has_replicas {
                 let w_base = processes
@@ -679,34 +674,38 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     .unwrap_or(0)
                     .max("BASE".len());
                 println!(
-                    "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
-                    "NAME", "STATUS", "HEALTH", "RESTARTS", "BASE",
+                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
+                    "", "NAME", "STATUS", "HEALTH", "RESTARTS", "BASE",
                 );
                 for (i, p) in processes.iter().enumerate() {
+                    let (glyph, glyph_style) = glyph_for_state(&p.state, color);
                     let st = style_for_status(&p.state, color);
-                    let ht = style_for_health(health_vals[i], color);
+                    let (hg, hs) = glyph_for_health(p.has_readiness_probe, p.healthy, color);
                     println!(
-                        "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
+                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
+                        styled(glyph, glyph_style),
                         p.name,
                         styled(&p.status, st),
-                        styled(health_vals[i], ht),
+                        styled(hg, hs),
                         restart_vals[i],
                         p.base,
                     );
                 }
             } else {
                 println!(
-                    "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
-                    "NAME", "STATUS", "HEALTH", "RESTARTS",
+                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
+                    "", "NAME", "STATUS", "HEALTH", "RESTARTS",
                 );
                 for (i, p) in processes.iter().enumerate() {
+                    let (glyph, glyph_style) = glyph_for_state(&p.state, color);
                     let st = style_for_status(&p.state, color);
-                    let ht = style_for_health(health_vals[i], color);
+                    let (hg, hs) = glyph_for_health(p.has_readiness_probe, p.healthy, color);
                     println!(
-                        "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
+                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
+                        styled(glyph, glyph_style),
                         p.name,
                         styled(&p.status, st),
-                        styled(health_vals[i], ht),
+                        styled(hg, hs),
                         restart_vals[i],
                     );
                 }

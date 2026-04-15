@@ -163,7 +163,7 @@ impl ProcessStatus {
             ProcessStatus::Exited { code: 0 } => "exited",
             ProcessStatus::Exited { .. } => "failed",
             ProcessStatus::FailedToStart { .. } => "failed",
-            ProcessStatus::Stopped => "exited",
+            ProcessStatus::Stopped => "stopped",
             ProcessStatus::Restarting => "restarting",
             ProcessStatus::Disabled => "disabled",
         }

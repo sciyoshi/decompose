@@ -543,8 +543,8 @@ processes:
         .expect("sleeper process");
     let state_str = sleeper.get("state").and_then(Value::as_str).unwrap_or("");
     assert!(
-        state_str == "exited" || state_str == "failed",
-        "expected exited or failed, got: {state_str}"
+        state_str == "exited" || state_str == "failed" || state_str == "stopped",
+        "expected exited, failed, or stopped, got: {state_str}"
     );
 
     let down = run_cmd(

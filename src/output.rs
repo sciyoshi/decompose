@@ -99,13 +99,32 @@ pub fn style_for_status(status: &str, color: bool) -> Style {
     maybe(s, color)
 }
 
-/// Pick a style for a health column value.
-pub fn style_for_health(health: &str, color: bool) -> Style {
-    let s = match health {
-        "healthy" => GREEN,
-        _ => Style::new(),
+/// Single-char state glyph for a row, with the style it should be rendered in.
+///
+/// Used as a leading column in `ps` so each row has a quick visual indicator.
+pub fn glyph_for_state(state: &str, color: bool) -> (&'static str, Style) {
+    let (g, s) = match state {
+        "running" | "exited" => ("\u{2713}", GREEN), // ✓
+        "pending" | "starting" | "restarting" => ("\u{2026}", YELLOW), // …
+        "failed" | "failed_to_start" => ("\u{2717}", RED), // ✗
+        "stopped" | "disabled" | "not_started" => ("\u{2014}", DIM), // —
+        _ => ("\u{00b7}", Style::new()),             // ·
     };
-    maybe(s, color)
+    (g, maybe(s, color))
+}
+
+/// Renders the HEALTH column as a glyph plus style, given (has_probe, healthy).
+///
+/// - has probe + healthy   → ✓ green
+/// - has probe + failing   → ✗ red
+/// - no probe configured   → — dim
+pub fn glyph_for_health(has_probe: bool, healthy: bool, color: bool) -> (&'static str, Style) {
+    let (g, s) = match (has_probe, healthy) {
+        (true, true) => ("\u{2713}", GREEN), // ✓
+        (true, false) => ("\u{2717}", RED),  // ✗
+        (false, _) => ("\u{2014}", DIM),     // —
+    };
+    (g, maybe(s, color))
 }
 
 /// A small wrapper so we can write colored strings via `format!` / `write!`.
@@ -273,6 +292,37 @@ mod tests {
         assert_eq!(style_for_status("failed", true), RED);
         assert_eq!(style_for_status("disabled", true), DIM);
         assert_eq!(style_for_status("not_started", true), DIM);
+        assert_eq!(style_for_status("stopped", true), DIM);
+    }
+
+    #[test]
+    fn glyph_for_state_maps_correctly() {
+        assert_eq!(glyph_for_state("running", true), ("\u{2713}", GREEN));
+        assert_eq!(glyph_for_state("exited", true), ("\u{2713}", GREEN));
+        assert_eq!(glyph_for_state("pending", true), ("\u{2026}", YELLOW));
+        assert_eq!(glyph_for_state("starting", true), ("\u{2026}", YELLOW));
+        assert_eq!(glyph_for_state("failed", true), ("\u{2717}", RED));
+        assert_eq!(glyph_for_state("failed_to_start", true), ("\u{2717}", RED));
+        assert_eq!(glyph_for_state("stopped", true), ("\u{2014}", DIM));
+        assert_eq!(glyph_for_state("disabled", true), ("\u{2014}", DIM));
+        // color=false strips ansi style
+        assert_eq!(
+            glyph_for_state("running", false),
+            ("\u{2713}", Style::new())
+        );
+    }
+
+    #[test]
+    fn glyph_for_health_covers_all_cases() {
+        assert_eq!(glyph_for_health(true, true, true), ("\u{2713}", GREEN));
+        assert_eq!(glyph_for_health(true, false, true), ("\u{2717}", RED));
+        assert_eq!(glyph_for_health(false, false, true), ("\u{2014}", DIM));
+        assert_eq!(glyph_for_health(false, true, true), ("\u{2014}", DIM));
+        // color=false
+        assert_eq!(
+            glyph_for_health(true, true, false),
+            ("\u{2713}", Style::new())
+        );
     }
 
     #[test]
