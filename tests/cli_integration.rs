@@ -843,6 +843,248 @@ fn down_with_timeout_flag() {
 }
 
 #[test]
+fn restart_on_failure_increments_restart_count() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  failer:
+    command: "sh -c 'sleep 0.5; exit 1'"
+    restart_policy: on_failure
+    backoff_seconds: 1
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait long enough for at least one restart cycle:
+    // initial run (~0.5s) + backoff (1s) + second run (~0.5s) + buffer
+    thread::sleep(Duration::from_secs(4));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after restart");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let processes = ps_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    let failer = processes
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("failer"))
+        .expect("failer process");
+    let restart_count = failer
+        .get("restart_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        restart_count > 0,
+        "expected restart_count > 0 after failure, got: {restart_count}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn max_restarts_caps_restart_count() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  capped:
+    command: "sh -c 'sleep 0.3; exit 1'"
+    restart_policy: on_failure
+    backoff_seconds: 1
+    max_restarts: 2
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait for all restarts to exhaust:
+    // initial run (~0.3s) + backoff (1s) + restart 1 (~0.3s) + backoff (1s)
+    // + restart 2 (~0.3s) = ~2.9s, use generous buffer
+    thread::sleep(Duration::from_secs(6));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after max restarts exhausted");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let processes = ps_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    let capped = processes
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("capped"))
+        .expect("capped process");
+    let restart_count = capped
+        .get("restart_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(
+        restart_count <= 2,
+        "expected restart_count <= 2 (max_restarts cap), got: {restart_count}"
+    );
+    assert_eq!(
+        restart_count, 2,
+        "expected exactly 2 restarts before stopping"
+    );
+
+    // The process should be in a terminal state (failed) after exhausting restarts.
+    let state_str = capped.get("state").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(
+        state_str, "failed",
+        "expected process to be in 'failed' state after exhausting restarts, got: {state_str}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn no_restart_on_successful_exit() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  succeeder:
+    command: "sh -c 'sleep 0.3; exit 0'"
+    restart_policy: on_failure
+    backoff_seconds: 1
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Wait long enough for the process to exit and for any hypothetical
+    // restart to have happened.
+    thread::sleep(Duration::from_secs(3));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after successful exit");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let processes = ps_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    let succeeder = processes
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("succeeder"))
+        .expect("succeeder process");
+    let restart_count = succeeder
+        .get("restart_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert_eq!(
+        restart_count, 0,
+        "expected no restarts for a successfully exiting process with on_failure policy"
+    );
+
+    // Should be in exited state (exit code 0 -> "exited" in to_json_status).
+    let state_str = succeeder.get("state").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(
+        state_str, "exited",
+        "expected process to be in 'exited' state, got: {state_str}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
 fn up_detach_wait_returns_when_services_running() {
     let (_root, project, runtime, state, config) = setup_project();
     let home = project.parent().expect("parent").join("home");
