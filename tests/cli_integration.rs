@@ -622,3 +622,188 @@ fn ls_lists_running_environments() {
     );
     assert_success(&down, "down");
 }
+
+#[test]
+fn cycle_detection_simple_two_node_cycle() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  a:
+    command: "sleep 1"
+    depends_on:
+      b:
+        condition: process_started
+  b:
+    command: "sleep 1"
+    depends_on:
+      a:
+        condition: process_started
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert!(
+        !up.status.success(),
+        "up should fail with a dependency cycle"
+    );
+    let stderr = String::from_utf8_lossy(&up.stderr);
+    assert!(
+        stderr.contains("dependency cycle detected"),
+        "stderr should mention cycle, got: {stderr}"
+    );
+}
+
+#[test]
+fn cycle_detection_three_node_cycle() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  a:
+    command: "sleep 1"
+    depends_on:
+      b:
+        condition: process_started
+  b:
+    command: "sleep 1"
+    depends_on:
+      c:
+        condition: process_started
+  c:
+    command: "sleep 1"
+    depends_on:
+      a:
+        condition: process_started
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert!(
+        !up.status.success(),
+        "up should fail with a three-node dependency cycle"
+    );
+    let stderr = String::from_utf8_lossy(&up.stderr);
+    assert!(
+        stderr.contains("dependency cycle detected"),
+        "stderr should mention cycle, got: {stderr}"
+    );
+}
+
+#[test]
+fn cycle_detection_self_dependency() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  a:
+    command: "sleep 1"
+    depends_on:
+      a:
+        condition: process_started
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert!(
+        !up.status.success(),
+        "up should fail with a self-dependency cycle"
+    );
+    let stderr = String::from_utf8_lossy(&up.stderr);
+    assert!(
+        stderr.contains("dependency cycle detected"),
+        "stderr should mention cycle, got: {stderr}"
+    );
+}
+
+#[test]
+fn cycle_detection_valid_dag_succeeds() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  a:
+    command: "sleep 30"
+    depends_on:
+      b:
+        condition: process_started
+  b:
+    command: "sleep 30"
+    depends_on:
+      c:
+        condition: process_started
+  c:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up with valid DAG (no cycle)");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down after valid DAG");
+}
