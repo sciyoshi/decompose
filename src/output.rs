@@ -1,6 +1,8 @@
 use std::env;
+use std::fmt;
 use std::io::IsTerminal;
 
+use anstyle::{AnsiColor, Style};
 use clap::Args;
 use serde::Serialize;
 
@@ -55,9 +57,151 @@ pub fn print_json<T: Serialize>(value: &T) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Color / style helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when ANSI colors should be emitted to stdout.
+///
+/// Disabled when:
+/// - `NO_COLOR` env var is set (to any non-empty value)
+/// - stdout is not a TTY (and --table was not forced)
+pub fn use_color() -> bool {
+    if let Some(val) = env::var_os("NO_COLOR") {
+        if !val.is_empty() {
+            return false;
+        }
+    }
+    std::io::stdout().is_terminal()
+}
+
+/// Resolve a `Style` into the identity style when color is disabled.
+fn maybe(style: Style, color: bool) -> Style {
+    if color { style } else { Style::new() }
+}
+
+const GREEN: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Green)));
+const YELLOW: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Yellow)));
+const RED: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)));
+const DIM: Style = Style::new().dimmed();
+
+/// Pick a style for a process status string (the `state` field from `ProcessSnapshot`).
+pub fn style_for_status(status: &str, color: bool) -> Style {
+    let s = match status {
+        "running" => GREEN,
+        "exited" => GREEN,
+        "healthy" => GREEN,
+        "pending" | "starting" | "restarting" => YELLOW,
+        "failed" | "failed_to_start" => RED,
+        "disabled" | "not_started" | "stopped" => DIM,
+        _ => Style::new(),
+    };
+    maybe(s, color)
+}
+
+/// Pick a style for a health column value.
+pub fn style_for_health(health: &str, color: bool) -> Style {
+    let s = match health {
+        "healthy" => GREEN,
+        _ => Style::new(),
+    };
+    maybe(s, color)
+}
+
+/// A small wrapper so we can write colored strings via `format!` / `write!`.
+pub struct Styled<'a> {
+    pub style: Style,
+    pub text: &'a str,
+}
+
+impl fmt::Display for Styled<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `anstyle::Style` implements Display for the opening escape,
+        // and `Style::render_reset()` for the closing escape.
+        if self.style == Style::new() {
+            // Pad the text to the requested field width without ANSI
+            return f.pad(self.text);
+        }
+        // When padding is requested we need to pad the *visible* text only,
+        // then wrap the whole thing in ANSI codes.
+        let width = f.width().unwrap_or(0);
+        let padded = format!("{:<width$}", self.text, width = width);
+        write!(
+            f,
+            "{}{}{}",
+            self.style.render(),
+            padded,
+            self.style.render_reset()
+        )
+    }
+}
+
+/// Convenience: wrap text in a style.
+pub fn styled(text: &str, style: Style) -> Styled<'_> {
+    Styled { style, text }
+}
+
+/// Info about the footer to print after `up` completes.
+pub struct FooterInfo<'a> {
+    pub service_count: usize,
+    pub process_count: usize,
+    pub session_name: Option<&'a str>,
+    pub socket_path: &'a std::path::Path,
+    pub attached: bool,
+}
+
+/// Print the footer block after `up`.
+pub fn print_footer(info: &FooterInfo<'_>) {
+    let color = use_color();
+
+    // Line 1: "N services · M processes · session NAME          ctrl-c detaches"
+    let mut left = format!(
+        "{} {} · {} {}",
+        info.service_count,
+        if info.service_count == 1 {
+            "service"
+        } else {
+            "services"
+        },
+        info.process_count,
+        if info.process_count == 1 {
+            "process"
+        } else {
+            "processes"
+        },
+    );
+    if let Some(name) = info.session_name {
+        left.push_str(&format!(" · session {name}"));
+    }
+
+    if info.attached {
+        let hint = "ctrl-c detaches";
+        let dim_style = maybe(DIM, color);
+        println!("{left}    {}", styled(hint, dim_style),);
+    } else {
+        println!("{left}");
+    }
+
+    // Line 2: "daemon supervising · socket PATH"
+    let socket_display = shorten_socket_path(info.socket_path);
+    println!("daemon supervising · socket {socket_display}");
+}
+
+/// Replace the `$XDG_RUNTIME_DIR` prefix in a socket path with the literal
+/// env-var reference, keeping output portable.
+fn shorten_socket_path(path: &std::path::Path) -> String {
+    if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR") {
+        let xdg_path = std::path::Path::new(&xdg);
+        if let Ok(suffix) = path.strip_prefix(xdg_path) {
+            return format!("$XDG_RUNTIME_DIR/{}", suffix.display());
+        }
+    }
+    path.display().to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::env_truthy;
+    use super::*;
 
     // These tests mutate process-global env vars so they must run serially.
     // Each test uses a unique var name to avoid cross-contamination.
@@ -98,5 +242,71 @@ mod tests {
             std::env::remove_var(key);
         }
         assert!(!env_truthy(key));
+    }
+
+    #[test]
+    fn style_for_status_maps_correctly_without_color() {
+        // With color=false all styles should be the identity style.
+        for status in &[
+            "running",
+            "exited",
+            "pending",
+            "restarting",
+            "failed",
+            "disabled",
+            "not_started",
+        ] {
+            assert_eq!(
+                style_for_status(status, false),
+                Style::new(),
+                "color=false should always return plain style for {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn style_for_status_maps_correctly_with_color() {
+        assert_eq!(style_for_status("running", true), GREEN);
+        assert_eq!(style_for_status("exited", true), GREEN);
+        assert_eq!(style_for_status("pending", true), YELLOW);
+        assert_eq!(style_for_status("restarting", true), YELLOW);
+        assert_eq!(style_for_status("failed", true), RED);
+        assert_eq!(style_for_status("disabled", true), DIM);
+        assert_eq!(style_for_status("not_started", true), DIM);
+    }
+
+    #[test]
+    fn styled_display_plain_no_ansi() {
+        let s = styled("hello", Style::new());
+        assert_eq!(format!("{s}"), "hello");
+    }
+
+    #[test]
+    fn styled_display_with_width_pads() {
+        let s = styled("hi", Style::new());
+        assert_eq!(format!("{s:<10}"), "hi        ");
+    }
+
+    #[test]
+    fn shorten_socket_path_substitutes_xdg_prefix() {
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        }
+        let path = std::path::Path::new("/run/user/1000/decompose/abc.sock");
+        let result = shorten_socket_path(path);
+        assert_eq!(result, "$XDG_RUNTIME_DIR/decompose/abc.sock");
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
+
+    #[test]
+    fn shorten_socket_path_keeps_absolute_when_no_xdg() {
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let path = std::path::Path::new("/tmp/decompose/abc.sock");
+        let result = shorten_socket_path(path);
+        assert_eq!(result, "/tmp/decompose/abc.sock");
     }
 }

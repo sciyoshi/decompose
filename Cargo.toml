@@ -23,6 +23,7 @@ exclude = [
 ]
 
 [dependencies]
+anstyle = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"

@@ -23,7 +23,10 @@ use crate::cli::{Cli, Commands, KillArgs, LogsArgs, ServiceArgs, UpArgs};
 use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
-use crate::output::{OutputMode, print_json};
+use crate::output::{
+    FooterInfo, OutputMode, print_footer, print_json, style_for_health, style_for_status, styled,
+    use_color,
+};
 use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
 
 /// Global config flags that live on the top-level `Cli` struct.
@@ -178,6 +181,28 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     }
 
     emit_up_status(output_mode, state, pid);
+
+    // Print footer block (table mode only).
+    if output_mode == OutputMode::Table {
+        if let Ok(Response::Ps { processes, .. }) = send_request(&paths, Request::Ps).await {
+            let service_count = {
+                let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for p in &processes {
+                    bases.insert(&p.base);
+                }
+                bases.len()
+            };
+            let process_count = processes.len();
+            print_footer(&FooterInfo {
+                service_count,
+                process_count,
+                session_name: global.session.as_deref(),
+                socket_path: &paths.socket,
+                attached,
+            });
+        }
+    }
+
     if !attached {
         if args.wait {
             wait_for_services_ready(&paths, output_mode).await?;
@@ -567,12 +592,14 @@ fn filter_log_lines(lines: &[&str], processes: &[String]) -> Vec<String> {
 fn emit_up_status(mode: OutputMode, status: &str, pid: u32) {
     match mode {
         OutputMode::Table => {
-            let human = match status {
-                "started" => "started",
-                "already_running" => "already running",
-                other => other,
+            let color = use_color();
+            let green = style_for_status("running", color);
+            let (glyph, human) = match status {
+                "started" => ("\u{2713}", "decompose started"),
+                "already_running" => ("\u{2713}", "decompose already running"),
+                _ => ("*", "decompose"),
             };
-            println!("decompose {human} (pid {pid})");
+            println!("{} {human} \u{00b7} pid {pid}", styled(glyph, green),);
         }
         OutputMode::Json => print_json(&json!({
             "status": status,
@@ -599,6 +626,7 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
             }));
         }
         OutputMode::Table => {
+            let color = use_color();
             let has_replicas = processes.iter().any(|p| p.replica > 1 || p.name != p.base);
 
             // Build per-row display values for HEALTH and RESTARTS.
@@ -655,9 +683,15 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     "NAME", "STATUS", "HEALTH", "RESTARTS", "BASE",
                 );
                 for (i, p) in processes.iter().enumerate() {
+                    let st = style_for_status(&p.state, color);
+                    let ht = style_for_health(health_vals[i], color);
                     println!(
                         "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
-                        p.name, p.status, health_vals[i], restart_vals[i], p.base,
+                        p.name,
+                        styled(&p.status, st),
+                        styled(health_vals[i], ht),
+                        restart_vals[i],
+                        p.base,
                     );
                 }
             } else {
@@ -666,9 +700,14 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     "NAME", "STATUS", "HEALTH", "RESTARTS",
                 );
                 for (i, p) in processes.iter().enumerate() {
+                    let st = style_for_status(&p.state, color);
+                    let ht = style_for_health(health_vals[i], color);
                     println!(
                         "{:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
-                        p.name, p.status, health_vals[i], restart_vals[i],
+                        p.name,
+                        styled(&p.status, st),
+                        styled(health_vals[i], ht),
+                        restart_vals[i],
                     );
                 }
             }
