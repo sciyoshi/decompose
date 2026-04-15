@@ -392,3 +392,89 @@ fn ps_when_not_running_is_empty_not_error() {
     let table = String::from_utf8_lossy(&ps_table.stdout);
     assert!(table.contains("No processes running"));
 }
+
+#[test]
+fn config_prints_resolved_json() {
+    let root = tempdir().expect("tempdir");
+    let project = root.path().join("project");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&runtime).expect("create runtime");
+    fs::create_dir_all(&state).expect("create state");
+    fs::create_dir_all(&home).expect("create home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  web:
+    command: "node server.js"
+  worker:
+    command: "python worker.py"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Test --json output
+    let out = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "config", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&out, "config --json");
+    let parsed: Value = serde_json::from_slice(&out.stdout).expect("config json");
+    let procs = parsed.get("processes").expect("has processes field");
+    assert!(procs.get("web").is_some(), "contains web process");
+    assert!(procs.get("worker").is_some(), "contains worker process");
+
+    // Test default (YAML) output
+    let out_yaml = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "config", "--table"],
+        &[],
+        &[],
+    );
+    assert_success(&out_yaml, "config --table (yaml)");
+    let yaml_text = String::from_utf8_lossy(&out_yaml.stdout);
+    assert!(yaml_text.contains("web"), "yaml contains web");
+    assert!(yaml_text.contains("worker"), "yaml contains worker");
+}
+
+#[test]
+fn config_errors_on_invalid_yaml() {
+    let root = tempdir().expect("tempdir");
+    let project = root.path().join("project");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&runtime).expect("create runtime");
+    fs::create_dir_all(&state).expect("create state");
+    fs::create_dir_all(&home).expect("create home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(&cfg_path, "not: valid: yaml: [[[").expect("write bad config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let out = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "config", "--json"],
+        &[],
+        &[],
+    );
+    assert!(!out.status.success(), "config should fail on invalid yaml");
+}

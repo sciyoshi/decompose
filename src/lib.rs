@@ -54,6 +54,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Start(args) => run_service_command(global, args, ServiceOp::Start).await,
         Commands::Stop(args) => run_service_command(global, args, ServiceOp::Stop).await,
         Commands::Restart(args) => run_service_command(global, args, ServiceOp::Restart).await,
+        Commands::Config(args) => run_config(global, args.output.resolve()).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }
@@ -325,6 +326,26 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
         Response::Ack { message } => emit_message(output_mode, "ok", &message),
         Response::Error { message } => bail!("{message}"),
         _ => bail!("unexpected response from daemon"),
+    }
+
+    Ok(())
+}
+
+async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config_files = resolve_config_paths(&global.config_files, &cwd)?;
+    let cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
+
+    match output_mode {
+        OutputMode::Json => {
+            let json = serde_json::to_string_pretty(&cfg).context("failed to serialize config")?;
+            println!("{json}");
+        }
+        OutputMode::Table => {
+            let yaml =
+                serde_yaml_ng::to_string(&cfg).context("failed to serialize config as YAML")?;
+            print!("{yaml}");
+        }
     }
 
     Ok(())

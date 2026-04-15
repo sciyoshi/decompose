@@ -46,6 +46,8 @@ pub enum Commands {
     Stop(ServiceArgs),
     /// Restart one or more services. With no args, restarts all.
     Restart(ServiceArgs),
+    /// Validate and print the resolved configuration.
+    Config(OutputOnlyArgs),
     #[command(hide = true)]
     Daemon(DaemonArgs),
 }

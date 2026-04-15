@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{
     DependencyCondition, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime, ProcessStatus,
@@ -14,7 +14,7 @@ use crate::model::{
 // Environment variable container
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EnvVars(pub BTreeMap<String, String>);
 
 impl EnvVars {
@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for EnvVars {
 // Config structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProjectConfig {
     #[serde(default)]
     pub environment: EnvVars,
@@ -71,7 +71,7 @@ pub struct ProjectConfig {
     pub exit_mode: ExitMode,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProcessConfig {
     pub command: String,
     #[serde(default)]
@@ -108,7 +108,7 @@ fn default_replicas() -> u16 {
     1
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ShutdownConfig {
     #[serde(default = "default_signal")]
     pub signal: i32,
@@ -126,7 +126,7 @@ fn default_timeout() -> u64 {
     10
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProcessDependency {
     #[serde(default)]
     pub condition: DependencyCondition,
