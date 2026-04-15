@@ -1,0 +1,8 @@
+[book]
+title = "decompose"
+description = "A process orchestrator for local development"
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/sciyoshi/decompose"
