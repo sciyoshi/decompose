@@ -89,6 +89,21 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
 
     if let Ok(Response::Pong { pid, .. }) = send_request(&paths, Request::Ping).await {
         daemon_pid = Some(pid);
+        // Daemon is already running — send a Start request to incrementally
+        // bring up the requested services (or all services if none specified).
+        let start_resp = send_request(
+            &paths,
+            Request::Start {
+                services: args.processes.clone(),
+            },
+        )
+        .await;
+        match start_resp {
+            Ok(Response::Ack { .. }) => {}
+            Ok(Response::Error { message }) => bail!("{message}"),
+            Err(e) => bail!("failed to start services on running daemon: {e}"),
+            _ => {}
+        }
     } else {
         // Clean up stale socket/pid from a previously killed daemon so the
         // new daemon can bind the socket without interference.
