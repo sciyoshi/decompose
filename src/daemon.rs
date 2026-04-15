@@ -936,8 +936,35 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                     message: format!("unknown service(s): {}", unknown.join(", ")),
                 },
                 Ok(names) => {
+                    // Collect the set of services to start, including their
+                    // transitive dependencies that are also in a terminal state
+                    // (e.g. NotStarted). This ensures `start serviceB` also
+                    // brings up serviceB's deps if they haven't been launched.
+                    let mut to_start: std::collections::BTreeSet<String> =
+                        names.into_iter().collect();
+                    let mut queue: std::collections::VecDeque<String> =
+                        to_start.iter().cloned().collect();
+                    while let Some(name) = queue.pop_front() {
+                        if let Some(runtime) = guard.processes.get(&name) {
+                            for dep_base in runtime.spec.depends_on.keys() {
+                                // Find all runtime instances matching the dep base name
+                                let dep_names: Vec<String> = guard
+                                    .processes
+                                    .iter()
+                                    .filter(|(_, r)| r.spec.base_name == *dep_base)
+                                    .map(|(n, _)| n.clone())
+                                    .collect();
+                                for dep_name in dep_names {
+                                    if to_start.insert(dep_name.clone()) {
+                                        queue.push_back(dep_name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let mut started = 0;
-                    for name in &names {
+                    for name in &to_start {
                         if let Some(runtime) = guard.processes.get_mut(name) {
                             if runtime.status.is_terminal() {
                                 runtime.status = ProcessStatus::Pending;

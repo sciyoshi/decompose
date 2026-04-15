@@ -1774,3 +1774,262 @@ fn ps_empty_json_structure_has_running_false_and_empty_processes() {
         "processes should be empty when no daemon"
     );
 }
+
+#[test]
+fn incremental_up_starts_second_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Start only alpha
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "alpha"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "up alpha");
+    thread::sleep(Duration::from_millis(500));
+
+    // ps should show alpha running and beta not_started
+    let ps1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps1, "ps after up alpha");
+    let parsed: Value = serde_json::from_slice(&ps1.stdout).expect("ps json");
+    let procs = parsed.get("processes").and_then(Value::as_array).unwrap();
+    assert_eq!(procs.len(), 2, "should see both services in ps");
+    let beta_state = procs
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("beta"))
+        .and_then(|p| p.get("state").and_then(Value::as_str));
+    assert_eq!(
+        beta_state,
+        Some("not_started"),
+        "beta should be not_started"
+    );
+
+    // Now run `up -d beta` against the running daemon
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "beta"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "up beta (incremental)");
+    thread::sleep(Duration::from_millis(500));
+
+    // Both should now be running
+    let ps2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps2, "ps after up beta");
+    let parsed2: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    let procs2 = parsed2.get("processes").and_then(Value::as_array).unwrap();
+    for p in procs2 {
+        let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
+        let st = p.get("state").and_then(Value::as_str).unwrap_or("?");
+        assert_eq!(st, "running", "service {name} should be running, got {st}");
+    }
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn start_works_on_unlaunched_config_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Start only alpha
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "alpha"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up alpha");
+    thread::sleep(Duration::from_millis(500));
+
+    // `start beta` should succeed (previously would fail with "unknown service")
+    let start = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "start", "--json", "beta"],
+        &[],
+        &[],
+    );
+    assert_success(&start, "start beta");
+    let start_json: Value = serde_json::from_slice(&start.stdout).expect("start json");
+    assert_eq!(
+        start_json.get("status").and_then(Value::as_str),
+        Some("ok"),
+        "start should ack"
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    // beta should now be running
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after start beta");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let procs = parsed.get("processes").and_then(Value::as_array).unwrap();
+    let beta = procs
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some("beta"))
+        .expect("beta in ps");
+    assert_eq!(
+        beta.get("state").and_then(Value::as_str),
+        Some("running"),
+        "beta should be running after start"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn ps_shows_all_config_services_after_partial_up() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+  gamma:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // Start only alpha
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "alpha"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up alpha");
+    thread::sleep(Duration::from_millis(500));
+
+    // ps should list all three services
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after partial up");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let procs = parsed.get("processes").and_then(Value::as_array).unwrap();
+    assert_eq!(
+        procs.len(),
+        3,
+        "should see all 3 config-defined services in ps"
+    );
+
+    let names: Vec<&str> = procs
+        .iter()
+        .filter_map(|p| p.get("name").and_then(Value::as_str))
+        .collect();
+    assert!(names.contains(&"alpha"), "alpha in ps");
+    assert!(names.contains(&"beta"), "beta in ps");
+    assert!(names.contains(&"gamma"), "gamma in ps");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
