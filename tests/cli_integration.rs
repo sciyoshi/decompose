@@ -2189,35 +2189,42 @@ processes:
     );
     assert_success(&up, "up");
 
-    // Wait for server to start and probe to detect it
-    thread::sleep(Duration::from_secs(5));
-
-    let ps = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&ps, "ps");
-    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
-    let server = ps_json["processes"]
-        .as_array()
-        .expect("processes array")
-        .iter()
-        .find(|p| p["name"].as_str() == Some("server"))
-        .expect("server process");
-    assert_eq!(
-        server["healthy"].as_bool(),
-        Some(true),
-        "healthy should be true after HTTP server starts responding"
-    );
-    assert_eq!(
-        server["has_readiness_probe"].as_bool(),
-        Some(true),
-        "has_readiness_probe should be true"
+    // Poll until the probe flips healthy, with a generous timeout for slow CI.
+    let mut healthy = false;
+    for _ in 0..30 {
+        thread::sleep(Duration::from_secs(1));
+        let ps = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "ps", "--json"],
+            &[],
+            &[],
+        );
+        if !ps.status.success() {
+            continue;
+        }
+        if let Ok(ps_json) = serde_json::from_slice::<Value>(&ps.stdout) {
+            if let Some(server) = ps_json["processes"]
+                .as_array()
+                .and_then(|a| a.iter().find(|p| p["name"].as_str() == Some("server")))
+            {
+                if server["healthy"].as_bool() == Some(true) {
+                    assert_eq!(
+                        server["has_readiness_probe"].as_bool(),
+                        Some(true),
+                        "has_readiness_probe should be true"
+                    );
+                    healthy = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        healthy,
+        "healthy should be true after HTTP server starts responding (timed out after 30s)"
     );
 
     let down = run_cmd(
