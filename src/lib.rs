@@ -629,15 +629,13 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
             let color = use_color();
             let has_replicas = processes.iter().any(|p| p.replica > 1 || p.name != p.base);
 
-            // Build per-row display values for RESTARTS.
-            let restart_vals: Vec<String> = processes
+            // Build per-row PID display values.
+            let pid_vals: Vec<String> = processes
                 .iter()
                 .map(|p| {
-                    if p.restart_count == 0 {
-                        "-".to_string()
-                    } else {
-                        p.restart_count.to_string()
-                    }
+                    p.pid
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string())
                 })
                 .collect();
 
@@ -650,20 +648,17 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 .max("NAME".len());
             let w_status = processes
                 .iter()
-                .map(|p| p.status.len())
+                .map(|p| p.state.len())
                 .max()
                 .unwrap_or(0)
                 .max("STATUS".len());
-            // HEALTH is a single glyph now (1 column wide).
-            let w_health = "HEALTH".len();
-            let w_restarts = restart_vals
+            let w_pid = pid_vals
                 .iter()
                 .map(|v| v.len())
                 .max()
                 .unwrap_or(0)
-                .max("RESTARTS".len());
-
-            // Leading state-glyph column: 1 visible char, but we right-pad to 1.
+                .max("PID".len());
+            let w_health = "HEALTH".len();
             let w_glyph = 1;
 
             if has_replicas {
@@ -674,39 +669,39 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     .unwrap_or(0)
                     .max("BASE".len());
                 println!(
-                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
-                    "", "NAME", "STATUS", "HEALTH", "RESTARTS", "BASE",
+                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}  {:<w_base$}",
+                    "", "NAME", "STATUS", "PID", "HEALTH", "BASE",
                 );
                 for (i, p) in processes.iter().enumerate() {
                     let (glyph, glyph_style) = glyph_for_state(&p.state, color);
                     let st = style_for_status(&p.state, color);
                     let (hg, hs) = glyph_for_health(p.has_readiness_probe, p.healthy, color);
                     println!(
-                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}  {:<w_base$}",
+                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}  {:<w_base$}",
                         styled(glyph, glyph_style),
                         p.name,
-                        styled(&p.status, st),
+                        styled(&p.state, st),
+                        pid_vals[i],
                         styled(hg, hs),
-                        restart_vals[i],
                         p.base,
                     );
                 }
             } else {
                 println!(
-                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
-                    "", "NAME", "STATUS", "HEALTH", "RESTARTS",
+                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}",
+                    "", "NAME", "STATUS", "PID", "HEALTH",
                 );
                 for (i, p) in processes.iter().enumerate() {
                     let (glyph, glyph_style) = glyph_for_state(&p.state, color);
                     let st = style_for_status(&p.state, color);
                     let (hg, hs) = glyph_for_health(p.has_readiness_probe, p.healthy, color);
                     println!(
-                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_health$}  {:<w_restarts$}",
+                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}",
                         styled(glyph, glyph_style),
                         p.name,
-                        styled(&p.status, st),
+                        styled(&p.state, st),
+                        pid_vals[i],
                         styled(hg, hs),
-                        restart_vals[i],
                     );
                 }
             }

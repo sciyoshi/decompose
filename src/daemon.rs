@@ -935,6 +935,10 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                         ProcessStatus::Exited { code } => Some(*code),
                         _ => None,
                     };
+                    let pid = match &proc_runtime.status {
+                        ProcessStatus::Running { pid } => Some(*pid),
+                        _ => None,
+                    };
                     ProcessSnapshot {
                         name: proc_runtime.spec.name.clone(),
                         base: proc_runtime.spec.base_name.clone(),
@@ -946,6 +950,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                         log_ready: proc_runtime.log_ready,
                         healthy: proc_runtime.healthy,
                         has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),
+                        pid,
                         exit_code,
                     }
                 })

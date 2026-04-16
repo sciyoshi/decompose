@@ -1621,6 +1621,10 @@ fn ps_json_structure_has_all_expected_fields() {
 
         // Optional nullable fields must be present (even if null).
         assert!(
+            obj.contains_key("pid"),
+            "process must contain 'pid' key, got: {proc}"
+        );
+        assert!(
             obj.contains_key("exit_code"),
             "process must contain 'exit_code' key, got: {proc}"
         );

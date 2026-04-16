@@ -211,5 +211,6 @@ pub struct ProcessSnapshot {
     pub log_ready: bool,
     pub healthy: bool,
     pub has_readiness_probe: bool,
+    pub pid: Option<u32>,
     pub exit_code: Option<i32>,
 }
