@@ -616,6 +616,18 @@ pub fn apply_interpolation(cfg: &mut ProjectConfig) {
             }
         }
 
+        if let Some(ref mut probe) = proc_cfg.readiness_probe {
+            if let Some(ref mut exec) = probe.exec {
+                exec.command = interpolate_vars(&exec.command, &vars);
+            }
+        }
+
+        if let Some(ref mut probe) = proc_cfg.liveness_probe {
+            if let Some(ref mut exec) = probe.exec {
+                exec.command = interpolate_vars(&exec.command, &vars);
+            }
+        }
+
         let env_keys: Vec<String> = proc_cfg.environment.0.keys().cloned().collect();
         for key in &env_keys {
             if let Some(raw) = proc_cfg.environment.0.get(key) {
@@ -1307,6 +1319,49 @@ processes:
         let api = cfg.processes.get("api").unwrap();
         assert_eq!(api.command, "run --version 1.0");
         assert_eq!(api.description.as_deref(), Some("API v1.0"));
+    }
+
+    #[test]
+    fn apply_interpolation_on_probe_commands() {
+        let yaml = r#"
+environment:
+  PORT: "4222"
+processes:
+  svc:
+    command: "echo hi"
+    readiness_probe:
+      exec:
+        command: "check --port ${PORT}"
+      period_seconds: 5
+    liveness_probe:
+      exec:
+        command: "alive --port $PORT"
+      period_seconds: 10
+"#;
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        apply_interpolation(&mut cfg);
+
+        let svc = cfg.processes.get("svc").unwrap();
+        assert_eq!(
+            svc.readiness_probe
+                .as_ref()
+                .unwrap()
+                .exec
+                .as_ref()
+                .unwrap()
+                .command,
+            "check --port 4222"
+        );
+        assert_eq!(
+            svc.liveness_probe
+                .as_ref()
+                .unwrap()
+                .exec
+                .as_ref()
+                .unwrap()
+                .command,
+            "alive --port 4222"
+        );
     }
 
     #[test]
