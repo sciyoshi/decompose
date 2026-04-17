@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::model::{
     DependencyCondition, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime, ProcessStatus,
@@ -752,6 +753,68 @@ pub fn apply_interpolation(cfg: &mut ProjectConfig) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-service config hash
+// ---------------------------------------------------------------------------
+
+/// Serializable view of `ProcessConfig` with the fields that Docker Compose
+/// treats as changeable-without-recreate (`depends_on`, `replicas`, `disabled`)
+/// stripped out. Used exclusively to compute [`compute_config_hash`]. All
+/// remaining fields are serialized through their `Serialize` impls; the
+/// containers (`EnvVars` wraps a `BTreeMap`, `env_file` is a `Vec`) emit
+/// deterministic key orderings, so `serde_json::to_vec` over this struct is
+/// stable across runs.
+#[derive(Serialize)]
+struct ProcessConfigHashView<'a> {
+    command: &'a str,
+    description: &'a Option<String>,
+    working_dir: &'a Option<PathBuf>,
+    environment: &'a EnvVars,
+    env_file: &'a Vec<String>,
+    ready_log_line: &'a Option<String>,
+    restart_policy: &'a Option<RestartPolicy>,
+    backoff_seconds: &'a Option<u64>,
+    max_restarts: &'a Option<u32>,
+    shutdown: &'a Option<ShutdownConfig>,
+    readiness_probe: &'a Option<HealthProbe>,
+    liveness_probe: &'a Option<HealthProbe>,
+}
+
+/// Compute a stable SHA-256 hash of the service's `ProcessConfig`, **excluding**
+/// `depends_on`, `replicas`, and `disabled`. These three fields can be changed
+/// on a running compose stack without tearing down the underlying service —
+/// mirroring Docker Compose's recreate semantics. Everything else (command,
+/// environment, env files, working dir, probes, shutdown, restart policy, etc.)
+/// contributes to the hash, so any change there means the service must be
+/// recreated.
+///
+/// Used by the reload path to diff services: same hash == same definition,
+/// different hash == tear down and respawn.
+pub fn compute_config_hash(cfg: &ProcessConfig) -> String {
+    let view = ProcessConfigHashView {
+        command: &cfg.command,
+        description: &cfg.description,
+        working_dir: &cfg.working_dir,
+        environment: &cfg.environment,
+        env_file: &cfg.env_file,
+        ready_log_line: &cfg.ready_log_line,
+        restart_policy: &cfg.restart_policy,
+        backoff_seconds: &cfg.backoff_seconds,
+        max_restarts: &cfg.max_restarts,
+        shutdown: &cfg.shutdown,
+        readiness_probe: &cfg.readiness_probe,
+        liveness_probe: &cfg.liveness_probe,
+    };
+    // serde_json serialization of structs is field-declaration-order stable,
+    // and the containers we reference (BTreeMap, Vec, Option) are themselves
+    // deterministic. Unwrap is safe: the view contains only json-serializable
+    // leaf types (strings, numbers, maps keyed by String).
+    let bytes = serde_json::to_vec(&view).expect("ProcessConfigHashView is serializable");
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+// ---------------------------------------------------------------------------
 // Process instance building
 // ---------------------------------------------------------------------------
 
@@ -763,6 +826,9 @@ pub fn build_process_instances(
     let mut out = BTreeMap::new();
 
     for (base_name, proc_cfg) in &cfg.processes {
+        // Hash once per service; replicas share the same config hash since
+        // they're all spawned from the same ProcessConfig entry.
+        let config_hash = compute_config_hash(proc_cfg);
         for idx in 0..proc_cfg.replicas {
             let replica = idx + 1;
             let instance_name = if proc_cfg.replicas > 1 {
@@ -824,6 +890,7 @@ pub fn build_process_instances(
                 readiness_probe: proc_cfg.readiness_probe.clone(),
                 liveness_probe: proc_cfg.liveness_probe.clone(),
                 disabled,
+                config_hash: config_hash.clone(),
             };
 
             out.insert(
@@ -1685,5 +1752,119 @@ processes:
 "#;
         let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.exit_mode, ExitMode::ExitOnFailure);
+    }
+
+    #[test]
+    fn config_hash_is_stable_and_sensitive() {
+        // Baseline config with a broad mix of fields set.
+        let yaml_a = r#"
+processes:
+  api:
+    command: "run server"
+    description: "the api"
+    working_dir: "/srv"
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: "info"
+    env_file:
+      - "extra.env"
+    ready_log_line: "listening"
+    restart_policy: on_failure
+    backoff_seconds: 5
+    max_restarts: 3
+    shutdown:
+      signal: 15
+      timeout_seconds: 10
+      command: "cleanup.sh"
+    readiness_probe:
+      exec:
+        command: "curl -f localhost"
+      period_seconds: 5
+      timeout_seconds: 1
+    depends_on:
+      db:
+        condition: process_started
+    replicas: 2
+  db:
+    command: "db"
+"#;
+        let cfg_a: ProjectConfig = serde_yaml_ng::from_str(yaml_a).unwrap();
+        let api_a = cfg_a.processes.get("api").unwrap();
+        let hash_a = compute_config_hash(api_a);
+
+        // Identical config parsed independently must produce the same hash.
+        let cfg_a2: ProjectConfig = serde_yaml_ng::from_str(yaml_a).unwrap();
+        let hash_a2 = compute_config_hash(cfg_a2.processes.get("api").unwrap());
+        assert_eq!(hash_a, hash_a2, "same config must hash the same");
+
+        // Changing `command` must change the hash.
+        let mut cfg_cmd = cfg_a.clone();
+        cfg_cmd.processes.get_mut("api").unwrap().command = "run server --port 9000".to_string();
+        let hash_cmd = compute_config_hash(cfg_cmd.processes.get("api").unwrap());
+        assert_ne!(hash_a, hash_cmd, "command change must change hash");
+
+        // Changing only `depends_on`, `replicas`, or `disabled` must NOT
+        // change the hash — these are the Docker-Compose "mutable without
+        // recreate" fields.
+        let mut cfg_depends = cfg_a.clone();
+        cfg_depends
+            .processes
+            .get_mut("api")
+            .unwrap()
+            .depends_on
+            .clear();
+        assert_eq!(
+            hash_a,
+            compute_config_hash(cfg_depends.processes.get("api").unwrap()),
+            "depends_on change must NOT affect hash"
+        );
+
+        let mut cfg_replicas = cfg_a.clone();
+        cfg_replicas.processes.get_mut("api").unwrap().replicas = 7;
+        assert_eq!(
+            hash_a,
+            compute_config_hash(cfg_replicas.processes.get("api").unwrap()),
+            "replicas change must NOT affect hash"
+        );
+
+        let mut cfg_disabled = cfg_a.clone();
+        cfg_disabled.processes.get_mut("api").unwrap().disabled = true;
+        assert_eq!(
+            hash_a,
+            compute_config_hash(cfg_disabled.processes.get("api").unwrap()),
+            "disabled change must NOT affect hash"
+        );
+
+        // Changing environment (a non-excluded field) must change the hash.
+        let mut cfg_env = cfg_a.clone();
+        cfg_env
+            .processes
+            .get_mut("api")
+            .unwrap()
+            .environment
+            .0
+            .insert("NEW_VAR".to_string(), "x".to_string());
+        assert_ne!(
+            hash_a,
+            compute_config_hash(cfg_env.processes.get("api").unwrap()),
+            "environment change must change hash"
+        );
+    }
+
+    #[test]
+    fn build_instances_propagates_config_hash_to_replicas() {
+        let yaml = r#"
+processes:
+  web:
+    command: "serve"
+    replicas: 3
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let expected = compute_config_hash(cfg.processes.get("web").unwrap());
+        let out = build_process_instances(&cfg, Path::new("/tmp"), &BTreeMap::new());
+        assert_eq!(out.len(), 3);
+        for runtime in out.values() {
+            assert_eq!(runtime.spec.config_hash, expected);
+        }
     }
 }

@@ -1487,6 +1487,7 @@ mod tests {
                 readiness_probe: None,
                 liveness_probe: None,
                 disabled: false,
+                config_hash: String::new(),
             },
             status,
             started_once,

@@ -52,6 +52,12 @@ pub struct ProcessInstanceSpec {
     pub readiness_probe: Option<HealthProbe>,
     pub liveness_probe: Option<HealthProbe>,
     pub disabled: bool,
+    /// Stable SHA-256 hash of the service's `ProcessConfig`, excluding the
+    /// fields that Docker Compose considers changeable-without-recreate
+    /// (`depends_on`, `replicas`, `disabled`). Shared across replicas of the
+    /// same service. Used by reload to diff services and decide which need
+    /// to be restarted. Computed once in `build_process_instances`.
+    pub config_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
