@@ -4,6 +4,8 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Stdio;
@@ -31,7 +33,70 @@ use crate::model::{
     DependencyCondition, ExitMode, HealthProbe, ProcessRuntime, ProcessSnapshot, ProcessStatus,
     RestartPolicy, RuntimePaths,
 };
-use crate::paths::runtime_paths_for;
+#[cfg(unix)]
+use crate::paths::FILE_MODE;
+use crate::paths::{create_dir_secure, runtime_paths_for};
+
+/// Open a file with restrictive 0o600 permissions on Unix, and defensively
+/// tighten the mode if the file already existed with looser permissions.
+#[cfg(unix)]
+fn open_secure_append(path: &Path) -> std::io::Result<fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(FILE_MODE)
+        .open(path)?;
+    // If the file existed before this call, `mode` is ignored and we must
+    // tighten it explicitly.
+    fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_secure_append(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+#[cfg(unix)]
+fn open_secure_lock(path: &Path) -> std::io::Result<fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(FILE_MODE)
+        .open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_secure_lock(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Write a file atomically-ish with 0o600 permissions.
+#[cfg(unix)]
+fn write_secure(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(FILE_MODE)
+        .open(path)?;
+    file.write_all(contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_secure(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    fs::write(path, contents)
+}
 
 #[derive(Debug)]
 struct DaemonState {
@@ -53,11 +118,7 @@ type SharedState = Arc<Mutex<DaemonState>>;
 /// file descriptor is closed (including on crash).
 #[cfg(unix)]
 fn acquire_instance_lock(paths: &RuntimePaths) -> Result<fs::File> {
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&paths.lock)
+    let lock_file = open_secure_lock(&paths.lock)
         .with_context(|| format!("failed to open lock file at {}", paths.lock.display()))?;
 
     let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -74,11 +135,7 @@ fn acquire_instance_lock(paths: &RuntimePaths) -> Result<fs::File> {
 fn acquire_instance_lock(paths: &RuntimePaths) -> Result<fs::File> {
     // Advisory locking is Unix-only; on other platforms we skip it.
     // The socket bind below still provides some protection against duplicates.
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&paths.lock)
+    open_secure_lock(&paths.lock)
         .with_context(|| format!("failed to open lock file at {}", paths.lock.display()))
 }
 
@@ -95,19 +152,15 @@ pub fn spawn_daemon_process(
 ) -> Result<()> {
     let exe = env::current_exe().context("failed to locate current executable")?;
     if let Some(parent) = paths.daemon_log.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_secure(parent)?;
     }
 
-    let mut log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.daemon_log)
-        .with_context(|| {
-            format!(
-                "failed to open daemon log at {}",
-                paths.daemon_log.display()
-            )
-        })?;
+    let mut log_file = open_secure_append(&paths.daemon_log).with_context(|| {
+        format!(
+            "failed to open daemon log at {}",
+            paths.daemon_log.display()
+        )
+    })?;
     writeln!(
         log_file,
         "\n--- daemon started at {} ---",
@@ -159,10 +212,10 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     let paths = runtime_paths_for(&args.instance)?;
     if let Some(parent) = paths.socket.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_secure(parent)?;
     }
     if let Some(parent) = paths.pid.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_secure(parent)?;
     }
 
     // Acquire an exclusive advisory lock to prevent duplicate daemons.
@@ -210,7 +263,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     }
 
-    fs::write(&paths.pid, std::process::id().to_string()).with_context(|| {
+    write_secure(&paths.pid, std::process::id().to_string().as_bytes()).with_context(|| {
         format!(
             "failed to write pid file to {}",
             paths.pid.as_path().display()
@@ -222,6 +275,14 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         .name(socket_name)
         .create_tokio()
         .context("failed to create local socket listener")?;
+
+    // Tighten the newly-created socket's file mode. The `interprocess` crate
+    // binds the socket with the current umask, which could leave it world-
+    // readable or world-writable. We want owner-only access on local sockets.
+    #[cfg(unix)]
+    if paths.socket.exists() {
+        let _ = fs::set_permissions(&paths.socket, fs::Permissions::from_mode(FILE_MODE));
+    }
 
     let state = Arc::new(Mutex::new(DaemonState {
         instance: args.instance.clone(),

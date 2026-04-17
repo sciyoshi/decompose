@@ -1,12 +1,54 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 
 use crate::model::RuntimePaths;
+
+/// Restrictive mode (owner rwx only) for directories we own.
+#[cfg(unix)]
+pub const DIR_MODE: u32 = 0o700;
+
+/// Restrictive mode (owner rw only) for files we own.
+#[cfg(unix)]
+pub const FILE_MODE: u32 = 0o600;
+
+/// Create a directory (and ancestors as needed) with restrictive 0o700 perms.
+///
+/// If the final directory already exists (e.g. from an older decompose version
+/// that predates this hardening), defensively tighten its mode. Ancestors that
+/// already exist are left alone since they may not belong to us (e.g.
+/// `$XDG_RUNTIME_DIR` itself).
+pub fn create_dir_secure(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        // Create ancestors first with default (umask-respecting) perms, then
+        // the leaf with 0o700. We only own the leaf, so only tighten it.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(DIR_MODE);
+        builder.create(path)?;
+        // If the directory already existed, DirBuilder::create with
+        // recursive(true) succeeds without changing mode — tighten it now.
+        let perms = fs::Permissions::from_mode(DIR_MODE);
+        fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
 
 /// Build an instance identity string.
 ///
@@ -67,8 +109,8 @@ pub fn runtime_paths_for(instance: &str) -> Result<RuntimePaths> {
     );
     let state_root = state_root_with_env(&home, env::var_os("XDG_STATE_HOME").as_deref());
 
-    fs::create_dir_all(&socket_root)?;
-    fs::create_dir_all(&state_root)?;
+    create_dir_secure(&socket_root)?;
+    create_dir_secure(&state_root)?;
 
     Ok(RuntimePaths {
         socket: socket_root.join(format!("{instance}.sock")),
@@ -223,5 +265,27 @@ mod tests {
 
         let fallback = state_root_with_env(Path::new("/home/u"), None);
         assert_eq!(fallback, Path::new("/home/u/.local/state/decompose"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_secure_sets_0o700_on_new_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("new_dir");
+        create_dir_secure(&target).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_secure_tightens_existing_loose_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("loose_dir");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        create_dir_secure(&target).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

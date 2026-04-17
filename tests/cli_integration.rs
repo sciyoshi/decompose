@@ -2552,3 +2552,105 @@ processes:
     );
     assert_success(&down, "down");
 }
+
+#[test]
+fn up_creates_directories_and_files_with_restrictive_perms() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Give the daemon a moment to write its log file.
+    thread::sleep(Duration::from_millis(500));
+
+    let runtime_decompose = runtime.join("decompose");
+    let state_decompose = state.join("decompose");
+
+    let rt_mode = fs::metadata(&runtime_decompose)
+        .expect("runtime/decompose exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        rt_mode, 0o700,
+        "runtime dir should be 0o700, got {rt_mode:o}"
+    );
+
+    let st_mode = fs::metadata(&state_decompose)
+        .expect("state/decompose exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(st_mode, 0o700, "state dir should be 0o700, got {st_mode:o}");
+
+    // Locate the instance-specific files by scanning for extensions.
+    let mut log_file = None;
+    let mut pid_file = None;
+    let mut lock_file = None;
+    for entry in fs::read_dir(&state_decompose).expect("read state dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("log") => log_file = Some(path),
+            Some("pid") => pid_file = Some(path),
+            Some("lock") => lock_file = Some(path),
+            _ => {}
+        }
+    }
+
+    let log_path = log_file.expect("daemon log file");
+    let pid_path = pid_file.expect("pid file");
+    let lock_path = lock_file.expect("lock file");
+
+    for (label, p) in [("log", &log_path), ("pid", &pid_path), ("lock", &lock_path)] {
+        let mode = fs::metadata(p)
+            .unwrap_or_else(|e| panic!("{label} file stat: {e}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{label} should be 0o600, got {mode:o}");
+    }
+
+    // Find the socket in the runtime dir and verify its perms.
+    let mut socket_file = None;
+    for entry in fs::read_dir(&runtime_decompose).expect("read runtime dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("sock") {
+            socket_file = Some(path);
+        }
+    }
+    let sock_path = socket_file.expect("socket file");
+    let sock_mode = fs::metadata(&sock_path)
+        .expect("socket stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        sock_mode, 0o600,
+        "socket should be 0o600, got {sock_mode:o}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
