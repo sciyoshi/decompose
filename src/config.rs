@@ -893,6 +893,7 @@ pub fn build_process_instances(
                 config_hash: config_hash.clone(),
             };
 
+            let name_handle = crate::model::make_name_handle(instance_name.clone());
             out.insert(
                 instance_name,
                 ProcessRuntime {
@@ -906,6 +907,7 @@ pub fn build_process_instances(
                     log_ready: false,
                     restart_count: 0,
                     healthy: false,
+                    name_handle,
                 },
             );
         }

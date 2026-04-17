@@ -552,9 +552,10 @@ pub(crate) fn dependencies_met(
 }
 
 async fn start_process(name: String, state: SharedState) {
-    // Pull the spec for a pending process. Non-pending (or missing) entries
-    // are silent no-ops — callers may fire start_process opportunistically.
-    let spec = {
+    // Pull the spec and the name handle for a pending process. Non-pending
+    // (or missing) entries are silent no-ops — callers may fire
+    // start_process opportunistically.
+    let (spec, name_handle) = {
         let mut guard = state.lock().await;
         let Some(runtime) = guard.processes.get_mut(&name) else {
             return;
@@ -562,35 +563,44 @@ async fn start_process(name: String, state: SharedState) {
         if !matches!(runtime.status, ProcessStatus::Pending) {
             return;
         }
-        runtime.spec.clone()
+        (runtime.spec.clone(), runtime.name_handle.clone())
     };
 
     let ready_pattern: Option<Regex> = spec.ready_log_line.as_deref().map(compile_ready_pattern);
 
-    let Some(mut child) = spawn_process_child(&name, &spec, &state, SpawnContext::Initial).await
+    let Some(mut child) =
+        spawn_process_child(&name_handle, &spec, &state, SpawnContext::Initial).await
     else {
         return;
     };
 
     let pid = child.id().unwrap_or(0);
     {
+        let current = crate::model::read_name(&name_handle);
         let mut guard = state.lock().await;
-        if let Some(runtime) = guard.processes.get_mut(&name) {
+        if let Some(runtime) = guard.processes.get_mut(&current) {
             runtime.status = ProcessStatus::Running { pid };
             runtime.started_once = true;
         }
     }
 
-    spawn_health_probes(&name, &spec, &state);
-    attach_output_readers(&mut child, &name, ready_pattern, state.clone());
+    spawn_health_probes(&name_handle, &spec, &state);
+    attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
 
     let (kill_tx, kill_rx) = watch::channel(false);
     {
+        let current = crate::model::read_name(&name_handle);
         let mut guard = state.lock().await;
-        guard.controllers.insert(name.clone(), kill_tx);
+        guard.controllers.insert(current, kill_tx);
     }
 
-    tokio::spawn(process_lifecycle(name, spec, child, kill_rx, state.clone()));
+    tokio::spawn(process_lifecycle(
+        name_handle,
+        spec,
+        child,
+        kill_rx,
+        state.clone(),
+    ));
 }
 
 /// Identifies whether we're doing the initial spawn or a restart attempt,
@@ -622,17 +632,18 @@ impl SpawnContext {
 /// `FailedToStart`, and return `None`. The `ctx` parameter only affects the
 /// phrasing of error messages (initial spawn vs. restart).
 async fn spawn_process_child(
-    name: &str,
+    name_handle: &crate::model::NameHandle,
     spec: &crate::model::ProcessInstanceSpec,
     state: &SharedState,
     ctx: SpawnContext,
 ) -> Option<tokio::process::Child> {
+    let name = crate::model::read_name(name_handle);
     let mut cmd = match build_shell_command(&spec.command)
         .with_context(|| format!("[{name}] {} for {:?}", ctx.build_label(), spec.command))
     {
         Ok(c) => c,
         Err(e) => {
-            mark_failed_to_start(name, state, &e).await;
+            mark_failed_to_start(name_handle, state, &e).await;
             return None;
         }
     };
@@ -651,7 +662,7 @@ async fn spawn_process_child(
     }) {
         Ok(child) => Some(child),
         Err(e) => {
-            mark_failed_to_start(name, state, &e).await;
+            mark_failed_to_start(name_handle, state, &e).await;
             None
         }
     }
@@ -660,10 +671,15 @@ async fn spawn_process_child(
 /// Log the (already-contextualised) spawn error and transition the process
 /// to `FailedToStart`. Does not remove the controller — the caller decides
 /// what cleanup is appropriate for its phase.
-async fn mark_failed_to_start(name: &str, state: &SharedState, err: &anyhow::Error) {
+async fn mark_failed_to_start(
+    name_handle: &crate::model::NameHandle,
+    state: &SharedState,
+    err: &anyhow::Error,
+) {
+    let name = crate::model::read_name(name_handle);
     eprintln!("[{name}] {err:#}");
     let mut guard = state.lock().await;
-    if let Some(runtime) = guard.processes.get_mut(name) {
+    if let Some(runtime) = guard.processes.get_mut(&name) {
         runtime.status = ProcessStatus::FailedToStart {
             reason: format!("{err:#}"),
         };
@@ -671,11 +687,15 @@ async fn mark_failed_to_start(name: &str, state: &SharedState, err: &anyhow::Err
 }
 
 /// Spawn readiness and liveness probe tasks if configured on the spec.
-fn spawn_health_probes(name: &str, spec: &crate::model::ProcessInstanceSpec, state: &SharedState) {
+fn spawn_health_probes(
+    name_handle: &crate::model::NameHandle,
+    spec: &crate::model::ProcessInstanceSpec,
+    state: &SharedState,
+) {
     spawn_probe_if_present(
         spec.readiness_probe.as_ref(),
         ProbeKind::Readiness,
-        name,
+        name_handle,
         &spec.working_dir,
         &spec.environment,
         state,
@@ -683,7 +703,7 @@ fn spawn_health_probes(name: &str, spec: &crate::model::ProcessInstanceSpec, sta
     spawn_probe_if_present(
         spec.liveness_probe.as_ref(),
         ProbeKind::Liveness,
-        name,
+        name_handle,
         &spec.working_dir,
         &spec.environment,
         state,
@@ -694,7 +714,7 @@ fn spawn_health_probes(name: &str, spec: &crate::model::ProcessInstanceSpec, sta
 /// resulting terminal [`ProcessStatus`]. On kill, this also runs the
 /// spec-driven shutdown sequence (command, signal, SIGKILL).
 async fn wait_for_child_exit(
-    name: &str,
+    name_handle: &crate::model::NameHandle,
     spec: &crate::model::ProcessInstanceSpec,
     child: &mut tokio::process::Child,
     kill_rx: &mut watch::Receiver<bool>,
@@ -707,7 +727,7 @@ async fn wait_for_child_exit(
                 guard.shutdown_timeout_override
             };
             shutdown_child(child, spec, timeout_override).await;
-            let _ = name; // name retained for future logging hooks
+            let _ = name_handle; // handle retained for future logging hooks
             ProcessStatus::Stopped
         }
         wait_res = child.wait() => {
@@ -728,12 +748,13 @@ async fn wait_for_child_exit(
 /// `true` if the caller should respawn, or `false` if the lifecycle task
 /// should exit.
 async fn apply_restart_decision(
-    name: &str,
+    name_handle: &crate::model::NameHandle,
     state: &SharedState,
     final_status: ProcessStatus,
 ) -> bool {
+    let name = crate::model::read_name(name_handle);
     let mut guard = state.lock().await;
-    let Some(runtime) = guard.processes.get_mut(name) else {
+    let Some(runtime) = guard.processes.get_mut(&name) else {
         return false;
     };
     let do_restart = match (&final_status, runtime.spec.restart_policy) {
@@ -761,7 +782,7 @@ async fn apply_restart_decision(
 /// restart policy, backs off, and re-spawns. Runs as its own task; exits
 /// when the process reaches a non-restarting terminal state.
 async fn process_lifecycle(
-    name: String,
+    name_handle: crate::model::NameHandle,
     mut spec: crate::model::ProcessInstanceSpec,
     mut child: tokio::process::Child,
     mut kill_rx: watch::Receiver<bool>,
@@ -769,10 +790,11 @@ async fn process_lifecycle(
 ) {
     loop {
         let final_status =
-            wait_for_child_exit(&name, &spec, &mut child, &mut kill_rx, &state).await;
+            wait_for_child_exit(&name_handle, &spec, &mut child, &mut kill_rx, &state).await;
 
-        let should_restart = apply_restart_decision(&name, &state, final_status).await;
+        let should_restart = apply_restart_decision(&name_handle, &state, final_status).await;
         if !should_restart {
+            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
             guard.controllers.remove(&name);
             break;
@@ -781,6 +803,7 @@ async fn process_lifecycle(
         // Backoff delay. Look up the current spec under the lock, since a
         // reload could have swapped it out while we were waiting.
         let backoff = {
+            let name = crate::model::read_name(&name_handle);
             let guard = state.lock().await;
             guard
                 .processes
@@ -792,6 +815,7 @@ async fn process_lifecycle(
 
         // Pick up any new spec the reload may have installed.
         let next_spec = {
+            let name = crate::model::read_name(&name_handle);
             let guard = state.lock().await;
             guard.processes.get(&name).map(|r| r.spec.clone())
         };
@@ -799,8 +823,9 @@ async fn process_lifecycle(
         spec = next_spec;
 
         let Some(new_child) =
-            spawn_process_child(&name, &spec, &state, SpawnContext::Restart).await
+            spawn_process_child(&name_handle, &spec, &state, SpawnContext::Restart).await
         else {
+            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
             guard.controllers.remove(&name);
             break;
@@ -808,6 +833,7 @@ async fn process_lifecycle(
         child = new_child;
         let pid = child.id().unwrap_or(0);
         {
+            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
             if let Some(runtime) = guard.processes.get_mut(&name) {
                 runtime.status = ProcessStatus::Running { pid };
@@ -818,14 +844,15 @@ async fn process_lifecycle(
 
         let ready_pattern: Option<Regex> =
             spec.ready_log_line.as_deref().map(compile_ready_pattern);
-        attach_output_readers(&mut child, &name, ready_pattern, state.clone());
+        attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
 
         // Fresh kill channel for this restart iteration, replacing the one
         // whose sender was dropped when `broadcast_stop` last fired.
         let (new_kill_tx, new_kill_rx) = watch::channel(false);
         {
+            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
-            guard.controllers.insert(name.clone(), new_kill_tx);
+            guard.controllers.insert(name, new_kill_tx);
         }
         kill_rx = new_kill_rx;
     }
@@ -836,20 +863,21 @@ async fn process_lifecycle(
 /// `ready_log_line` regex to set the `log_ready` flag on the process runtime.
 fn attach_output_readers(
     child: &mut tokio::process::Child,
-    name: &str,
+    name_handle: &crate::model::NameHandle,
     ready_pattern: Option<Regex>,
     state: SharedState,
 ) {
     let log_ready_flag = Arc::new(AtomicBool::new(false));
 
     if let Some(stdout) = child.stdout.take() {
-        let proc_name = name.to_string();
+        let handle = name_handle.clone();
         let pattern = ready_pattern.clone();
         let flag = log_ready_flag.clone();
         let state_clone = state.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let proc_name = crate::model::read_name(&handle);
                 println!("[{proc_name}] {line}");
                 if let Some(ref re) = pattern {
                     if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
@@ -865,13 +893,14 @@ fn attach_output_readers(
     }
 
     if let Some(stderr) = child.stderr.take() {
-        let proc_name = name.to_string();
+        let handle = name_handle.clone();
         let pattern = ready_pattern;
         let flag = log_ready_flag;
         let state_clone = state;
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let proc_name = crate::model::read_name(&handle);
                 eprintln!("[{proc_name}] {line}");
                 if let Some(ref re) = pattern {
                     if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
@@ -993,7 +1022,7 @@ enum ProbeKind {
 fn spawn_probe_if_present(
     probe: Option<&HealthProbe>,
     kind: ProbeKind,
-    name: &str,
+    name_handle: &crate::model::NameHandle,
     working_dir: &Path,
     environment: &BTreeMap<String, String>,
     state: &SharedState,
@@ -1001,7 +1030,7 @@ fn spawn_probe_if_present(
     if let Some(probe) = probe {
         tokio::spawn(run_probe(
             kind,
-            name.to_string(),
+            name_handle.clone(),
             probe.clone(),
             state.clone(),
             working_dir.to_path_buf(),
@@ -1015,7 +1044,7 @@ fn spawn_probe_if_present(
 /// failure actions differ. See [`ProbeKind`] for the per-kind semantics.
 async fn run_probe(
     kind: ProbeKind,
-    name: String,
+    name_handle: crate::model::NameHandle,
     probe: HealthProbe,
     state: SharedState,
     working_dir: std::path::PathBuf,
@@ -1032,6 +1061,7 @@ async fn run_probe(
     loop {
         // Check if process is still running
         {
+            let name = crate::model::read_name(&name_handle);
             let guard = state.lock().await;
             if let Some(runtime) = guard.processes.get(&name) {
                 if runtime.status.is_terminal() {
@@ -1050,6 +1080,7 @@ async fn run_probe(
             if matches!(kind, ProbeKind::Readiness)
                 && consecutive_successes >= probe.success_threshold
             {
+                let name = crate::model::read_name(&name_handle);
                 let mut guard = state.lock().await;
                 if let Some(runtime) = guard.processes.get_mut(&name) {
                     runtime.healthy = true;
@@ -1061,6 +1092,7 @@ async fn run_probe(
             if consecutive_failures >= probe.failure_threshold {
                 match kind {
                     ProbeKind::Readiness => {
+                        let name = crate::model::read_name(&name_handle);
                         let mut guard = state.lock().await;
                         if let Some(runtime) = guard.processes.get_mut(&name) {
                             runtime.healthy = false;
@@ -1068,6 +1100,7 @@ async fn run_probe(
                     }
                     ProbeKind::Liveness => {
                         // Kill the process so the restart policy can re-launch it.
+                        let name = crate::model::read_name(&name_handle);
                         let guard = state.lock().await;
                         if let Some(runtime) = guard.processes.get(&name) {
                             if let ProcessStatus::Running { pid } = runtime.status {
@@ -1353,22 +1386,13 @@ pub(crate) fn compute_reload_plan(
                     // does not block this: scaling adds/drops replicas at the
                     // tail and leaves the others in place.
                     //
-                    // Exception: transitions across the `replicas == 1`
-                    // boundary fall back to a full recreate. When `replicas
-                    // == 1`, the instance is named `foo`; when `replicas >= 2`
-                    // it's `foo[1]`, `foo[2]`, … (see
-                    // `build_process_instances` in `src/config.rs`). Scaling
-                    // 1→N or N→1 would therefore require renaming the single
-                    // instance, which is not worth the complexity for this
-                    // edge case — a full recreate keeps the naming consistent
-                    // and is only paid once per boundary crossing.
-                    let crosses_one_boundary = old_fp.replicas == 1 || new_fp.replicas == 1;
-                    if crosses_one_boundary {
-                        plan.changed.push(name.clone());
-                    } else {
-                        plan.scaled
-                            .insert(name.clone(), (old_fp.replicas, new_fp.replicas));
-                    }
+                    // Transitions across the `replicas == 1` boundary are
+                    // still `scaled`: the daemon renames the single instance
+                    // in place (`foo` ↔ `foo[1]`) so the existing process
+                    // keeps its pid across a 1 → N or N → 1 reload. See
+                    // `handle_reload` for the re-keying under the state lock.
+                    plan.scaled
+                        .insert(name.clone(), (old_fp.replicas, new_fp.replicas));
                 } else {
                     plan.unchanged.push(name.clone());
                 }
@@ -1834,6 +1858,10 @@ async fn handle_reload(
     // Scale-down: for every `scaled` entry whose new count is strictly lower,
     // mark the tail replicas (indices `new+1..=old`) for stop+remove. The
     // lower-indexed replicas stay untouched.
+    //
+    // Special case `new_count == 1`: the surviving replica is `foo[1]`, which
+    // must be renamed to the unqualified `foo` (see `rename_plan` below).
+    // We still drop everything at index >= 2.
     let scaled_down_instances: Vec<String> = {
         let guard = state.lock().await;
         let mut to_drop = Vec::new();
@@ -1848,6 +1876,30 @@ async fn handle_reload(
         }
         to_drop
     };
+
+    // Rename plan for scale transitions that cross the `replicas == 1` naming
+    // boundary. See `build_process_instances`: a single-replica service uses
+    // the unqualified base name (`foo`) while a multi-replica service uses
+    // `foo[1]`, `foo[2]`, ….
+    //
+    //   1 → N: the surviving instance `foo`    → `foo[1]`; `foo[2..=N]` spawn
+    //   N → 1: the surviving instance `foo[1]` → `foo`;    `foo[2..=N]` stop
+    //
+    // Tuples are `(old_name, new_name)`; applied atomically under the state
+    // lock in the splice block below.
+    let rename_plan: Vec<(String, String)> = plan
+        .scaled
+        .iter()
+        .filter_map(|(base, (old_count, new_count))| {
+            if *old_count == 1 && *new_count >= 2 {
+                Some((base.clone(), format!("{base}[1]")))
+            } else if *old_count >= 2 && *new_count == 1 {
+                Some((format!("{base}[1]"), base.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let to_stop: Vec<String> = changed_instances
         .iter()
@@ -1871,14 +1923,15 @@ async fn handle_reload(
     }
 
     // 5c. Under the lock: drop old changed + orphaned + scaled-down entries
-    //     and their controllers, splice in new `added`/`changed` entries
-    //     from `new_process_map`, and spawn any new replicas for scale-up
-    //     transitions (leaving the existing replicas in place). With
-    //     `no_start`, park every freshly inserted runtime in `NotStarted`
-    //     so the supervisor leaves them alone; otherwise they land as
-    //     `Pending` and the supervisor's next tick picks them up in dep
-    //     order.
-    let (n_added, n_changed, n_removed, n_scaled_services, replica_delta) = {
+    //     and their controllers, apply any rename transitions (1↔N boundary
+    //     crossings preserve the existing pid in place), splice in new
+    //     `added`/`changed` entries from `new_process_map`, and spawn any
+    //     new replicas for scale-up transitions (leaving the existing
+    //     replicas in place). With `no_start`, park every freshly inserted
+    //     runtime in `NotStarted` so the supervisor leaves them alone;
+    //     otherwise they land as `Pending` and the supervisor's next tick
+    //     picks them up in dep order.
+    let (n_added, n_changed, n_removed, n_scaled_services, replica_delta, n_renamed) = {
         let mut guard = state.lock().await;
         for name in &changed_instances {
             guard.processes.remove(name);
@@ -1893,6 +1946,31 @@ async fn handle_reload(
             guard.controllers.remove(name);
         }
 
+        // Apply in-place renames for 1↔N scale transitions. Both the map keys
+        // and the shared `name_handle` inside the runtime are updated under
+        // the same lock acquisition, so any daemon task that next reads the
+        // handle sees the new name and looks up the correctly-keyed entry.
+        let mut renamed = 0usize;
+        for (old_name, new_name) in &rename_plan {
+            let Some(mut runtime) = guard.processes.remove(old_name) else {
+                // The surviving instance may have exited between the snapshot
+                // and here; nothing to rename.
+                continue;
+            };
+            // Update the `name` carried by the spec (visible through `ps`)
+            // and the shared cell every task task consults before touching
+            // `processes` / `controllers`.
+            runtime.spec.name = new_name.clone();
+            if let Ok(mut guard_name) = runtime.name_handle.write() {
+                *guard_name = new_name.clone();
+            }
+            guard.processes.insert(new_name.clone(), runtime);
+            if let Some(ctrl) = guard.controllers.remove(old_name) {
+                guard.controllers.insert(new_name.clone(), ctrl);
+            }
+            renamed += 1;
+        }
+
         let mut new_instances_added = 0usize;
         let mut new_instances_changed = 0usize;
         for (instance_name, runtime) in &new_process_map {
@@ -1901,6 +1979,13 @@ async fn handle_reload(
             // For `scaled` services, only insert replicas whose index exceeds
             // the old count — those are the newly-spawned tail entries.
             // Lower-indexed replicas already exist and must not be touched.
+            //
+            // For 1 → N transitions (`old_count == 1`), the `old_count` is
+            // inclusive of the one existing instance (now renamed to
+            // `foo[1]`), so the comparison correctly excludes replica 1 and
+            // spawns only indices 2..=N. For N → 1 transitions the condition
+            // `new_count > old_count` is false, so nothing is spliced in
+            // here; the surviving instance is handled by `rename_plan`.
             let scaled_up_tail =
                 plan.scaled
                     .get(&runtime.spec.base_name)
@@ -1942,6 +2027,7 @@ async fn handle_reload(
             removed_count,
             plan.scaled.len(),
             delta,
+            renamed,
         )
     };
 
@@ -1954,11 +2040,16 @@ async fn handle_reload(
 
     let removed_label = if remove_orphans { "removed" } else { "orphan" };
     let delta_sign = if replica_delta >= 0 { "+" } else { "" };
+    let rename_suffix = if n_renamed > 0 {
+        format!(", {n_renamed} renamed")
+    } else {
+        String::new()
+    };
     Response::Ack {
         message: format!(
             "reloaded: +{n_added} added, {n_changed} changed, \
              {n_scaled_services} scaled ({delta_sign}{replica_delta} replicas), \
-             {n_removed} {removed_label}",
+             {n_removed} {removed_label}{rename_suffix}",
         ),
     }
 }
@@ -2001,6 +2092,7 @@ mod tests {
             log_ready: false,
             restart_count: 0,
             healthy: false,
+            name_handle: crate::model::make_name_handle(base.to_string()),
         }
     }
 
@@ -2190,9 +2282,10 @@ mod tests {
     }
 
     #[test]
-    fn reload_plan_replica_1_boundary_falls_back_to_changed() {
+    fn reload_plan_replica_1_boundary_is_scaled_with_rename() {
         // 1 ↔ N transitions cross the replica-name boundary (`foo` vs `foo[1]`)
-        // and fall back to full recreate so we don't have to rename instances.
+        // but are still classified as `scaled` — the daemon renames the
+        // surviving instance in place rather than recreating it.
         for (old_count, new_count) in [(1u16, 2u16), (2, 1), (1, 3), (3, 1)] {
             let mut old = BTreeMap::new();
             old.insert("worker".to_string(), fp("same_hash", old_count));
@@ -2201,14 +2294,14 @@ mod tests {
 
             let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, false)
                 .expect("valid transition");
-            assert_eq!(
-                plan.changed,
-                vec!["worker".to_string()],
-                "{old_count}→{new_count} should be changed (naming boundary)"
-            );
             assert!(
-                plan.scaled.is_empty(),
-                "{old_count}→{new_count} should not be scaled"
+                plan.changed.is_empty(),
+                "{old_count}→{new_count} should not be a full recreate"
+            );
+            assert_eq!(
+                plan.scaled.get("worker"),
+                Some(&(old_count, new_count)),
+                "{old_count}→{new_count} should be scaled"
             );
         }
     }

@@ -3887,6 +3887,243 @@ processes:
 }
 
 #[test]
+fn reload_scale_one_to_n_renames_existing_instance() {
+    // Scale 1 → 2. The existing single-replica instance is named `foo`
+    // (unqualified); when replicas >= 2 every replica is named `foo[N]`.
+    // The daemon must rename the surviving instance in place (`foo` →
+    // `foo[1]`) so its pid is preserved across the boundary crossing.
+    // `foo[2]` is newly spawned.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up (replicas=1)");
+    thread::sleep(Duration::from_millis(400));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before scale-up");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid_before = pid_of(&parsed_before, "foo").expect("foo pid before");
+    assert!(pid_before > 0, "foo must be running before scale-up");
+
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+    replicas: 2
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up (replicas=2)");
+    let stdout2 = String::from_utf8_lossy(&up2.stdout);
+    assert!(
+        stdout2.contains("scaled"),
+        "reload ack should report a scaled transition (not a full recreate), got: {stdout2}"
+    );
+    assert!(
+        stdout2.contains("renamed"),
+        "reload ack should mention 'renamed' for the 1↔N boundary crossing, got: {stdout2}"
+    );
+    thread::sleep(Duration::from_millis(600));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after scale-up");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid1_after = pid_of(&parsed_after, "foo[1]").expect("foo[1] pid after");
+    let pid2_after = pid_of(&parsed_after, "foo[2]").expect("foo[2] pid after");
+    assert_eq!(
+        pid_before, pid1_after,
+        "the original `foo` pid must be preserved as `foo[1]` after scale-up"
+    );
+    assert!(
+        pid2_after > 0 && pid2_after != pid_before,
+        "foo[2] must be a freshly-spawned process"
+    );
+    // Sanity: the unqualified `foo` entry should no longer appear in ps.
+    assert!(
+        pid_of(&parsed_after, "foo").is_none(),
+        "unqualified `foo` must be gone after rename"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_scale_n_to_one_renames_surviving_instance() {
+    // Scale 2 → 1. `foo[2]` is stopped; the surviving `foo[1]` is renamed
+    // to the unqualified `foo` in place. The pid must persist.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+    replicas: 2
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up (replicas=2)");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before scale-down");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid1_before = pid_of(&parsed_before, "foo[1]").expect("foo[1] pid before");
+    let pid2_before = pid_of(&parsed_before, "foo[2]").expect("foo[2] pid before");
+    assert!(pid1_before > 0 && pid2_before > 0);
+
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up (replicas=1)");
+    let stdout2 = String::from_utf8_lossy(&up2.stdout);
+    assert!(
+        stdout2.contains("scaled"),
+        "reload ack should report a scaled transition, got: {stdout2}"
+    );
+    assert!(
+        stdout2.contains("renamed"),
+        "reload ack should mention 'renamed' for the 1↔N boundary crossing, got: {stdout2}"
+    );
+    thread::sleep(Duration::from_millis(800));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after scale-down");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let procs = parsed_after
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    assert_eq!(
+        procs.len(),
+        1,
+        "only the single renamed `foo` should remain"
+    );
+    let pid_after = pid_of(&parsed_after, "foo").expect("foo pid after");
+    assert_eq!(
+        pid1_before, pid_after,
+        "the surviving `foo[1]` pid must be preserved as `foo` after scale-down"
+    );
+    assert!(
+        pid_of(&parsed_after, "foo[1]").is_none(),
+        "`foo[1]` must be gone after rename"
+    );
+    assert!(
+        pid_of(&parsed_after, "foo[2]").is_none(),
+        "`foo[2]` must be gone after scale-down"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
 fn immediate_exit_process_reaches_exited_state() {
     // Covers the edge case where a process exits before the supervisor has
     // any chance to transition it past Pending/Running — the bookkeeping

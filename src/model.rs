@@ -1,7 +1,32 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
+
+/// Shared cell holding the current instance name for a running process.
+///
+/// Daemon tasks (lifecycle, output readers, probes) capture a clone of this
+/// handle rather than a plain `String` so that the daemon can rename an
+/// instance in place (e.g. scaling from `replicas == 1` to `replicas >= 2`
+/// promotes `foo` to `foo[1]`) without invalidating the task's view of which
+/// entry in `DaemonState.processes` belongs to it.
+///
+/// Writes happen under the daemon state lock as part of a reload. Reads are
+/// cheap and lock-free on the hot path (they use a standard `RwLock`).
+pub type NameHandle = Arc<RwLock<String>>;
+
+/// Construct a new [`NameHandle`] from a starting name.
+pub fn make_name_handle(name: String) -> NameHandle {
+    Arc::new(RwLock::new(name))
+}
+
+/// Read the current name out of a handle. Panics only if the `RwLock` is
+/// poisoned, which would indicate a panic in a daemon task under the lock
+/// and is not expected in normal operation.
+pub fn read_name(handle: &NameHandle) -> String {
+    handle.read().expect("NameHandle RwLock poisoned").clone()
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +220,13 @@ pub struct ProcessRuntime {
     pub log_ready: bool,
     pub restart_count: u32,
     pub healthy: bool,
+    /// Shared-by-reference current instance name. Daemon tasks spawned for
+    /// this runtime hold `Arc` clones of this handle. When the daemon
+    /// renames an instance in place during a scale 1↔N transition, it
+    /// updates this cell (and re-keys the `processes` / `controllers`
+    /// maps); tasks then continue looking up their own entry under the
+    /// new name without restart.
+    pub name_handle: NameHandle,
 }
 
 #[derive(Debug, Clone)]
