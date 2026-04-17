@@ -108,15 +108,10 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
                 no_start: args.no_start,
             },
         )
-        .await;
-        match reload_resp {
-            Ok(Response::Ack { message }) => {
-                emit_message(output_mode, "ok", &message);
-            }
-            Ok(Response::Error { message }) => bail!("{message}"),
-            Err(e) => bail!("failed to reload daemon config: {e}"),
-            _ => {}
-        }
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to reload daemon config: {e}"))?;
+        let reload_message = expect_ack(reload_resp)?;
+        emit_message(output_mode, "ok", &reload_message);
 
         // Then send a Start request to incrementally bring up the requested
         // services (or all services if none specified). Start is idempotent
@@ -130,13 +125,9 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
                     services: args.processes.clone(),
                 },
             )
-            .await;
-            match start_resp {
-                Ok(Response::Ack { .. }) => {}
-                Ok(Response::Error { message }) => bail!("{message}"),
-                Err(e) => bail!("failed to start services on running daemon: {e}"),
-                _ => {}
-            }
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start services on running daemon: {e}"))?;
+            let _ = expect_ack(start_resp)?;
         }
     } else {
         // Clean up stale socket/pid from a previously killed daemon so the

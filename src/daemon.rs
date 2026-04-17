@@ -150,6 +150,53 @@ impl DaemonState {
         self.shutdown_requested = true;
         self.broadcast_stop();
     }
+
+    /// Stop a specific set of process instances by name. For each name:
+    /// - If the process is `Pending` (has no controller yet), transition it
+    ///   directly to `Stopped`.
+    /// - Otherwise, send the shutdown signal to its controller so the
+    ///   lifecycle task will tear it down.
+    ///
+    /// Unknown names are silently ignored (callers should resolve/validate
+    /// first). Used by the Stop, RemoveOrphans, and Reload IPC handlers,
+    /// which all share this "best-effort targeted shutdown" shape.
+    fn stop_instances(&mut self, names: &[String]) {
+        for name in names {
+            if let Some(runtime) = self.processes.get_mut(name) {
+                if matches!(runtime.status, ProcessStatus::Pending) {
+                    runtime.status = ProcessStatus::Stopped;
+                    continue;
+                }
+            }
+            if let Some(tx) = self.controllers.get(name) {
+                let _ = tx.send(true);
+            }
+        }
+    }
+}
+
+/// Poll the shared state until every instance in `names` has reached a
+/// terminal status, or until `max_ticks` of `tick` elapses. Returns once
+/// either condition holds. Callers use this to gate follow-up work (e.g.
+/// respawning or removing entries) on the preceding stop signal actually
+/// having landed.
+async fn wait_for_terminal(state: &SharedState, names: &[String], tick: Duration, max_ticks: u32) {
+    for _ in 0..max_ticks {
+        let all_stopped = {
+            let guard = state.lock().await;
+            names.iter().all(|name| {
+                guard
+                    .processes
+                    .get(name)
+                    .map(|r| r.status.is_terminal())
+                    .unwrap_or(true)
+            })
+        };
+        if all_stopped {
+            return;
+        }
+        sleep(tick).await;
+    }
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
@@ -1396,20 +1443,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             match resolve_services_or_error(&guard, &services) {
                 Err(resp) => resp,
                 Ok(names) => {
-                    for name in &names {
-                        // Processes in Pending state have no controller yet —
-                        // transition them directly to Stopped.
-                        if let Some(runtime) = guard.processes.get(name) {
-                            if matches!(runtime.status, ProcessStatus::Pending) {
-                                guard.processes.get_mut(name).unwrap().status =
-                                    ProcessStatus::Stopped;
-                                continue;
-                            }
-                        }
-                        if let Some(tx) = guard.controllers.get(name) {
-                            let _ = tx.send(true);
-                        }
-                    }
+                    guard.stop_instances(&names);
                     Response::Ack {
                         message: format!("stopping {}", describe_services(&services)),
                     }
@@ -1497,36 +1531,23 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             }
         }
         Request::Restart { services } => {
-            let guard = state.lock().await;
+            let mut guard = state.lock().await;
             match resolve_services_or_error(&guard, &services) {
                 Err(resp) => resp,
                 Ok(names) => {
-                    for name in &names {
-                        if let Some(tx) = guard.controllers.get(name) {
-                            let _ = tx.send(true);
-                        }
-                    }
+                    guard.stop_instances(&names);
                     drop(guard);
                     // Spawn a task to wait for stop then reset to Pending
                     let state_clone = state.clone();
                     let names_clone = names.clone();
                     tokio::spawn(async move {
-                        for _ in 0..200 {
-                            let all_stopped = {
-                                let guard = state_clone.lock().await;
-                                names_clone.iter().all(|name| {
-                                    guard
-                                        .processes
-                                        .get(name)
-                                        .map(|r| r.status.is_terminal())
-                                        .unwrap_or(true)
-                                })
-                            };
-                            if all_stopped {
-                                break;
-                            }
-                            sleep(Duration::from_millis(50)).await;
-                        }
+                        wait_for_terminal(
+                            &state_clone,
+                            &names_clone,
+                            Duration::from_millis(50),
+                            200,
+                        )
+                        .await;
                         let mut guard = state_clone.lock().await;
                         for name in &names_clone {
                             if let Some(runtime) = guard.processes.get_mut(name) {
@@ -1555,38 +1576,14 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 })
                 .cloned()
                 .collect();
-            for name in &orphans {
-                if let Some(runtime) = guard.processes.get(name) {
-                    if matches!(runtime.status, ProcessStatus::Pending) {
-                        guard.processes.get_mut(name).unwrap().status = ProcessStatus::Stopped;
-                        continue;
-                    }
-                }
-                if let Some(tx) = guard.controllers.get(name) {
-                    let _ = tx.send(true);
-                }
-            }
+            guard.stop_instances(&orphans);
             // Spawn a task to wait for orphans to stop then remove them
             if !orphans.is_empty() {
                 let state_clone = state.clone();
                 let orphans_clone = orphans.clone();
                 tokio::spawn(async move {
-                    for _ in 0..200 {
-                        let all_stopped = {
-                            let guard = state_clone.lock().await;
-                            orphans_clone.iter().all(|name| {
-                                guard
-                                    .processes
-                                    .get(name)
-                                    .map(|r| r.status.is_terminal())
-                                    .unwrap_or(true)
-                            })
-                        };
-                        if all_stopped {
-                            break;
-                        }
-                        sleep(Duration::from_millis(50)).await;
-                    }
+                    wait_for_terminal(&state_clone, &orphans_clone, Duration::from_millis(50), 200)
+                        .await;
                     let mut guard = state_clone.lock().await;
                     for name in &orphans_clone {
                         guard.processes.remove(name);
@@ -1816,19 +1813,7 @@ async fn handle_reload(
 
     if !to_stop.is_empty() {
         let mut guard = state.lock().await;
-        for name in &to_stop {
-            // Pending instances have no controller yet — transition them
-            // straight to a terminal state, matching the `Stop` IPC path.
-            if let Some(runtime) = guard.processes.get(name) {
-                if matches!(runtime.status, ProcessStatus::Pending) {
-                    guard.processes.get_mut(name).unwrap().status = ProcessStatus::Stopped;
-                    continue;
-                }
-            }
-            if let Some(tx) = guard.controllers.get(name) {
-                let _ = tx.send(true);
-            }
-        }
+        guard.stop_instances(&to_stop);
     }
 
     // 5b. Wait for the stopped instances to reach a terminal state so the
@@ -1837,22 +1822,7 @@ async fn handle_reload(
     //     controller's lifecycle task, so the outer wait bound just needs to
     //     exceed the worst-case shutdown.
     if !to_stop.is_empty() {
-        for _ in 0..1200 {
-            let all_stopped = {
-                let guard = state.lock().await;
-                to_stop.iter().all(|name| {
-                    guard
-                        .processes
-                        .get(name)
-                        .map(|r| r.status.is_terminal())
-                        .unwrap_or(true)
-                })
-            };
-            if all_stopped {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_terminal(&state, &to_stop, Duration::from_millis(50), 1200).await;
     }
 
     // 5c. Under the lock: drop old changed + orphaned + scaled-down entries
