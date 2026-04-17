@@ -3,6 +3,8 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -43,6 +45,42 @@ struct DaemonState {
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
+
+/// Acquire an exclusive, non-blocking advisory lock for this daemon instance.
+///
+/// Returns the open lock file handle — the caller must keep it alive for the
+/// daemon's entire lifetime. The lock is automatically released when the
+/// file descriptor is closed (including on crash).
+#[cfg(unix)]
+fn acquire_instance_lock(paths: &RuntimePaths) -> Result<fs::File> {
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&paths.lock)
+        .with_context(|| format!("failed to open lock file at {}", paths.lock.display()))?;
+
+    let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        anyhow::bail!(
+            "another daemon is already running for this project (lock held on {})",
+            paths.lock.display()
+        );
+    }
+    Ok(lock_file)
+}
+
+#[cfg(not(unix))]
+fn acquire_instance_lock(paths: &RuntimePaths) -> Result<fs::File> {
+    // Advisory locking is Unix-only; on other platforms we skip it.
+    // The socket bind below still provides some protection against duplicates.
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&paths.lock)
+        .with_context(|| format!("failed to open lock file at {}", paths.lock.display()))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_daemon_process(
@@ -127,6 +165,13 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
+    // Acquire an exclusive advisory lock to prevent duplicate daemons.
+    // The lock file descriptor must be held for the lifetime of the daemon;
+    // it is automatically released when the process exits (even on crash).
+    let _lock_file = acquire_instance_lock(&paths)?;
+
+    // Now that we hold the lock, it's safe to clean up a stale socket from
+    // a previously crashed daemon.
     if paths.socket.exists() {
         let _ = fs::remove_file(&paths.socket);
     }
@@ -216,6 +261,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     let _ = fs::remove_file(&paths.socket);
     let _ = fs::remove_file(&paths.pid);
+    let _ = fs::remove_file(&paths.lock);
     Ok(())
 }
 
@@ -369,7 +415,19 @@ async fn start_process(name: String, state: SharedState) {
         Regex::new(pattern).unwrap_or_else(|_| Regex::new(&regex::escape(pattern)).unwrap())
     });
 
-    let mut cmd = build_shell_command(&spec.command);
+    let mut cmd = match build_shell_command(&spec.command) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[{name}] failed to build shell command: {e}");
+            let mut guard = state.lock().await;
+            if let Some(runtime) = guard.processes.get_mut(&name) {
+                runtime.status = ProcessStatus::FailedToStart {
+                    reason: e.to_string(),
+                };
+            }
+            return;
+        }
+    };
     cmd.current_dir(&spec.working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -379,6 +437,7 @@ async fn start_process(name: String, state: SharedState) {
     let mut child = match spawn_res {
         Ok(c) => c,
         Err(e) => {
+            eprintln!("[{name}] failed to start: {e}");
             let mut guard = state.lock().await;
             if let Some(runtime) = guard.processes.get_mut(&name) {
                 runtime.status = ProcessStatus::FailedToStart {
@@ -509,7 +568,20 @@ async fn start_process(name: String, state: SharedState) {
                 };
                 let Some(spec) = spec else { break };
 
-                let mut cmd = build_shell_command(&spec.command);
+                let mut cmd = match build_shell_command(&spec.command) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[{name}] failed to build shell command on restart: {e}");
+                        let mut guard = state.lock().await;
+                        if let Some(runtime) = guard.processes.get_mut(&name) {
+                            runtime.status = ProcessStatus::FailedToStart {
+                                reason: e.to_string(),
+                            };
+                        }
+                        guard.controllers.remove(&name);
+                        break;
+                    }
+                };
                 cmd.current_dir(&spec.working_dir)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -624,9 +696,15 @@ async fn shutdown_child(
 ) {
     // Step 1: Run optional shutdown command
     if let Some(ref cmd_str) = spec.shutdown_command {
-        let mut cmd = build_shell_command(cmd_str);
-        cmd.current_dir(&spec.working_dir).envs(&spec.environment);
-        let _ = cmd.output().await;
+        match build_shell_command(cmd_str) {
+            Ok(mut cmd) => {
+                cmd.current_dir(&spec.working_dir).envs(&spec.environment);
+                let _ = cmd.output().await;
+            }
+            Err(e) => {
+                eprintln!("[{}] shutdown command failed to build: {e}", spec.name);
+            }
+        }
     }
 
     // Step 2: Send signal
@@ -792,7 +870,10 @@ async fn run_single_check(
 ) -> bool {
     if let Some(ref exec) = probe.exec {
         let timeout = Duration::from_secs(probe.timeout_seconds);
-        let mut cmd = build_shell_command(&exec.command);
+        let mut cmd = match build_shell_command(&exec.command) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
         cmd.current_dir(working_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -847,16 +928,35 @@ async fn http_get_check(http: &crate::model::HttpCheck) -> bool {
     (200..400).contains(&status)
 }
 
-fn build_shell_command(command: &str) -> TokioCommand {
+/// Build a shell command for executing a user-supplied command string.
+///
+/// Commands come from user-authored config files (trusted input), matching
+/// Docker Compose semantics where `command:` is always interpreted by a shell.
+/// The shell is configurable via the `COMPOSE_SHELL` env var (default: `sh`).
+fn build_shell_command(command: &str) -> Result<TokioCommand> {
     if cfg!(windows) {
         let mut cmd = TokioCommand::new("cmd");
         cmd.arg("/C").arg(command);
-        cmd
+        Ok(cmd)
     } else {
         let shell = env::var("COMPOSE_SHELL").unwrap_or_else(|_| "sh".to_string());
-        let mut cmd = TokioCommand::new(shell);
+
+        // Validate the shell exists and is plausibly executable.
+        let shell_path = Path::new(&shell);
+        if shell_path.is_absolute() {
+            if !shell_path.exists() {
+                anyhow::bail!("shell {shell:?} (from COMPOSE_SHELL) does not exist");
+            }
+        } else {
+            // For bare names, verify they can be found on PATH.
+            if which::which(&shell).is_err() {
+                anyhow::bail!("shell {shell:?} (from COMPOSE_SHELL) not found on PATH");
+            }
+        }
+
+        let mut cmd = TokioCommand::new(&shell);
         cmd.arg("-c").arg(command);
-        cmd
+        Ok(cmd)
     }
 }
 
