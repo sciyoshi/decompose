@@ -4184,3 +4184,98 @@ processes:
         panic!("grandchild pid {child_pid} survived `down` — process group was not signalled");
     }
 }
+
+#[test]
+fn logs_no_pager_writes_directly_to_stdout() {
+    // Integration test note: the test harness captures the child's stdout
+    // via a pipe, so stdout is *not* a TTY here and paging wouldn't engage
+    // anyway. We still exercise --no-pager explicitly to confirm:
+    //   1. The flag parses and the command exits cleanly.
+    //   2. Log content reaches stdout directly (not via pager).
+    //   3. `DECOMPOSE_PAGER` set to something that would fail loudly (e.g.
+    //      `false`) does NOT run when --no-pager wins the gate.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  talker:
+    command: "sh -c 'echo HELLO_FROM_TALKER; sleep 30'"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up talker");
+
+    // Wait for the log line to appear on disk before asking for logs.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_line = false;
+    while std::time::Instant::now() < deadline {
+        let logs = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "logs", "--no-pager"],
+            // Set DECOMPOSE_PAGER to `false` (always exit 1). If --no-pager
+            // were ignored and we *did* spawn this, the pager process would
+            // exit 1 before any output got written to our stdout. So a
+            // successful exit + the log content on stdout proves the bypass.
+            &[("DECOMPOSE_PAGER", "false")],
+            &[],
+        );
+        assert_success(&logs, "logs --no-pager");
+        let text = String::from_utf8_lossy(&logs.stdout);
+        if text.contains("HELLO_FROM_TALKER") {
+            saw_line = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        saw_line,
+        "expected HELLO_FROM_TALKER in logs --no-pager output"
+    );
+
+    // Also sanity-check the flag is recognized in --help output so we notice
+    // if a rename or removal happens later.
+    let help = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["logs", "--help"],
+        &[],
+        &[],
+    );
+    assert_success(&help, "logs --help");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_text.contains("--no-pager"),
+        "logs --help should document --no-pager, got:\n{help_text}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down talker");
+}

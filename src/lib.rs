@@ -464,12 +464,92 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
                 );
             }
         }
-        for line in output {
-            println!("{line}");
-        }
+        write_logs_maybe_paged(&output, args.no_pager);
     }
 
     Ok(())
+}
+
+/// Write filtered, one-shot log output to stdout, optionally paging through
+/// `$PAGER` (or `less -R`) when stdout is a TTY. See [`should_page`] for the
+/// gate.
+fn write_logs_maybe_paged(lines: &[String], no_pager: bool) {
+    if should_page(no_pager) {
+        if let Some(mut child) = spawn_pager() {
+            let status = {
+                let stdin = child.stdin.as_mut();
+                if let Some(stdin) = stdin {
+                    // BrokenPipe just means the user quit the pager — stop
+                    // writing without treating it as an error.
+                    let mut bw = std::io::BufWriter::new(stdin);
+                    for line in lines {
+                        if writeln!(bw, "{line}").is_err() {
+                            break;
+                        }
+                    }
+                    let _ = bw.flush();
+                }
+                // Drop stdin (via the end of this block) so the pager sees
+                // EOF and exits. Then wait for it.
+                drop(child.stdin.take());
+                child.wait()
+            };
+            let _ = status;
+            return;
+        }
+        // Falls through to direct stdout on pager spawn failure.
+    }
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// Whether `decompose logs` (one-shot, non-follow) output should be piped
+/// through a pager. True iff:
+///   - `--no-pager` was not set,
+///   - stdout is a TTY,
+///   - `$PAGER` is not set to an empty string (matches git's convention for
+///     disabling paging via env).
+fn should_page(no_pager: bool) -> bool {
+    use std::io::IsTerminal;
+    if no_pager {
+        return false;
+    }
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    // Explicit empty PAGER / DECOMPOSE_PAGER disables paging (matches git).
+    if let Some(v) = env::var_os("DECOMPOSE_PAGER") {
+        if v.is_empty() {
+            return false;
+        }
+    } else if let Some(v) = env::var_os("PAGER") {
+        if v.is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Spawn the pager subprocess with stdin piped. Honors `DECOMPOSE_PAGER`
+/// first, then `PAGER`, falling back to `less -R` (raw control chars so
+/// colorized log lines render correctly). Returns `None` on spawn failure so
+/// the caller can fall back to direct stdout.
+fn spawn_pager() -> Option<std::process::Child> {
+    let cmd_str = env::var("DECOMPOSE_PAGER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env::var("PAGER").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "less -R".to_string());
+
+    // Run the pager via the shell so users can set things like
+    // `PAGER="less -FRX"` or `PAGER="bat --paging=always"`.
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .ok()
 }
 
 async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: ServiceOp) -> Result<()> {

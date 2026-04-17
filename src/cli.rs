@@ -130,6 +130,9 @@ pub struct LogsArgs {
     /// Number of lines to show from end of log.
     #[arg(short = 'n', long = "tail")]
     pub tail: Option<usize>,
+    /// Disable paging (do not pipe output through $PAGER).
+    #[arg(long = "no-pager")]
+    pub no_pager: bool,
     /// Filter logs to specific process(es).
     pub processes: Vec<String>,
 }
