@@ -39,6 +39,13 @@ pub enum Request {
     RemoveOrphans {
         keep: Vec<String>,
     },
+    /// Re-read the daemon's config files from disk and reconcile running
+    /// processes against the new definition. Stops and re-spawns services
+    /// whose `config_hash` has changed, spawns newly-added services, and
+    /// warns about services that have been removed from the config (orphans
+    /// are left running by default; `--remove-orphans` handling lands in a
+    /// follow-up bead).
+    Reload,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

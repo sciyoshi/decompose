@@ -93,8 +93,23 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
 
     if let Ok(Response::Pong { pid, .. }) = send_request(&paths, Request::Ping).await {
         daemon_pid = Some(pid);
-        // Daemon is already running — send a Start request to incrementally
-        // bring up the requested services (or all services if none specified).
+        // Daemon is already running — first trigger a reload so any config
+        // edits made since `up` last ran are reconciled (added/changed/removed
+        // services). On parse/validation failure, bail before touching Start.
+        let reload_resp = send_request(&paths, Request::Reload).await;
+        match reload_resp {
+            Ok(Response::Ack { message }) => {
+                emit_message(output_mode, "ok", &message);
+            }
+            Ok(Response::Error { message }) => bail!("{message}"),
+            Err(e) => bail!("failed to reload daemon config: {e}"),
+            _ => {}
+        }
+
+        // Then send a Start request to incrementally bring up the requested
+        // services (or all services if none specified). Start is idempotent
+        // on already-running processes and picks up any newly-added ones
+        // that reload inserted as Pending.
         let start_resp = send_request(
             &paths,
             Request::Start {

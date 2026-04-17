@@ -120,6 +120,12 @@ struct DaemonState {
     exit_mode: ExitMode,
     /// CLI-level override for shutdown timeout (from `down --timeout`).
     shutdown_timeout_override: Option<u64>,
+    /// Original daemon-launch arguments kept so the `Reload` IPC handler can
+    /// re-read config from the same paths the daemon was launched with.
+    cwd: std::path::PathBuf,
+    config_files: Vec<std::path::PathBuf>,
+    env_files: Vec<std::path::PathBuf>,
+    disable_dotenv: bool,
 }
 
 impl DaemonState {
@@ -328,6 +334,10 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         shutdown_requested: false,
         exit_mode,
         shutdown_timeout_override: None,
+        cwd: args.cwd.clone(),
+        config_files: args.config_files.clone(),
+        env_files: args.env_files.clone(),
+        disable_dotenv: args.disable_dotenv,
     }));
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -1171,6 +1181,77 @@ fn resolve_services_or_error(
     })
 }
 
+/// Classification of a service across an old and new config snapshot.
+/// Replica-count changes are folded into `Changed` for this bead — special-
+/// casing scale-without-recreate is deferred to a follow-up.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReloadPlan {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+    pub unchanged: Vec<String>,
+}
+
+/// Summary of a single service's hash and replica count, keyed by the stable
+/// base-name. Used as a simple input shape for [`compute_reload_plan`] so it
+/// can be unit-tested without booting a full daemon.
+#[derive(Debug, Clone)]
+pub(crate) struct ServiceFingerprint {
+    pub config_hash: String,
+    pub replicas: u16,
+}
+
+/// Diff an old set of service fingerprints against a new one. `deps` maps
+/// each *new* service to the base-names it depends on; if a removed service
+/// is still referenced by a service that remains, returns an error describing
+/// the violation — the caller must abort without touching any running
+/// processes.
+pub(crate) fn compute_reload_plan(
+    old: &BTreeMap<String, ServiceFingerprint>,
+    new: &BTreeMap<String, ServiceFingerprint>,
+    deps: &BTreeMap<String, Vec<String>>,
+) -> std::result::Result<ReloadPlan, String> {
+    let mut plan = ReloadPlan::default();
+
+    for (name, new_fp) in new {
+        match old.get(name) {
+            None => plan.added.push(name.clone()),
+            Some(old_fp) => {
+                if old_fp.config_hash != new_fp.config_hash || old_fp.replicas != new_fp.replicas {
+                    plan.changed.push(name.clone());
+                } else {
+                    plan.unchanged.push(name.clone());
+                }
+            }
+        }
+    }
+
+    for name in old.keys() {
+        if !new.contains_key(name) {
+            plan.removed.push(name.clone());
+        }
+    }
+
+    // Reject the request if a service that's being removed is still a
+    // dependency of a service that remains (or is newly added). We check the
+    // *new* dep graph — i.e. what the user's updated config asks for.
+    for (svc, svc_deps) in deps {
+        for dep in svc_deps {
+            if plan.removed.contains(dep) {
+                return Err(format!(
+                    "cannot reload: service {svc:?} still depends on {dep:?}, which is removed in the new config"
+                ));
+            }
+        }
+    }
+
+    plan.added.sort();
+    plan.removed.sort();
+    plan.changed.sort();
+    plan.unchanged.sort();
+    Ok(plan)
+}
+
 async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -1447,6 +1528,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             };
             Response::Ack { message: msg }
         }
+        Request::Reload => handle_reload(state.clone()).await,
     };
 
     let payload = serde_json::to_string(&response)?;
@@ -1454,6 +1536,209 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
     Ok(())
+}
+
+/// Re-read the daemon's config from disk, compute a reload plan against the
+/// currently-tracked process map, and execute the plan.
+///
+/// On parse/validate failure: returns `Response::Error` and leaves running
+/// processes untouched. On a removed-but-still-depended-on violation: same.
+/// Otherwise: stops `changed` instances (they'll be respawned with the new
+/// spec by the supervisor), logs a warning about `removed` services (default
+/// behaviour matches Docker Compose: orphans stay running until the user
+/// asks to remove them), and inserts `added`/`changed` Pending entries so
+/// the supervisor loop launches them in dependency order.
+async fn handle_reload(state: SharedState) -> Response {
+    // Snapshot the daemon-launch args so we don't hold the state lock across
+    // disk I/O.
+    let (cwd, config_files, env_files, disable_dotenv) = {
+        let guard = state.lock().await;
+        (
+            guard.cwd.clone(),
+            guard.config_files.clone(),
+            guard.env_files.clone(),
+            guard.disable_dotenv,
+        )
+    };
+
+    // 1. Load and interpolate the new config. Any failure here aborts the
+    //    reload without touching any running processes.
+    let dotenv = match load_dotenv_files(&cwd, &env_files, disable_dotenv) {
+        Ok(d) => d,
+        Err(e) => {
+            return Response::Error {
+                message: format!("reload: failed to load env files: {e:#}"),
+            };
+        }
+    };
+
+    let mut new_config = match load_and_merge_configs(&config_files) {
+        Ok(c) => c,
+        Err(e) => {
+            return Response::Error {
+                message: format!("reload: invalid config: {e:#}"),
+            };
+        }
+    };
+    apply_interpolation(&mut new_config);
+
+    let new_process_map = build_process_instances(&new_config, &cwd, &dotenv);
+
+    // 2. Build fingerprints keyed by base-name. Replicas share a config_hash,
+    //    so collapsing to base-name is sufficient — and replica-count changes
+    //    fall out naturally in the diff because we also include `replicas`
+    //    (counted by iterating the instance map).
+    let new_fingerprints: BTreeMap<String, ServiceFingerprint> = {
+        let mut map: BTreeMap<String, (String, u16)> = BTreeMap::new();
+        for runtime in new_process_map.values() {
+            let entry = map
+                .entry(runtime.spec.base_name.clone())
+                .or_insert_with(|| (runtime.spec.config_hash.clone(), 0));
+            entry.1 += 1;
+        }
+        map.into_iter()
+            .map(|(k, (hash, replicas))| {
+                (
+                    k,
+                    ServiceFingerprint {
+                        config_hash: hash,
+                        replicas,
+                    },
+                )
+            })
+            .collect()
+    };
+
+    let new_deps: BTreeMap<String, Vec<String>> = new_process_map
+        .values()
+        .map(|r| {
+            (
+                r.spec.base_name.clone(),
+                r.spec.depends_on.keys().cloned().collect(),
+            )
+        })
+        .collect();
+
+    // 3. Snapshot current state under the lock.
+    let old_fingerprints: BTreeMap<String, ServiceFingerprint> = {
+        let guard = state.lock().await;
+        let mut map: BTreeMap<String, (String, u16)> = BTreeMap::new();
+        for runtime in guard.processes.values() {
+            let entry = map
+                .entry(runtime.spec.base_name.clone())
+                .or_insert_with(|| (runtime.spec.config_hash.clone(), 0));
+            entry.1 += 1;
+        }
+        map.into_iter()
+            .map(|(k, (hash, replicas))| {
+                (
+                    k,
+                    ServiceFingerprint {
+                        config_hash: hash,
+                        replicas,
+                    },
+                )
+            })
+            .collect()
+    };
+
+    // 4. Diff. A removed-but-still-depended-on violation returns early with
+    //    an error; nothing has been touched yet.
+    let plan = match compute_reload_plan(&old_fingerprints, &new_fingerprints, &new_deps) {
+        Ok(p) => p,
+        Err(msg) => return Response::Error { message: msg },
+    };
+
+    // 5. Execute the plan. We only touch running state past this point.
+
+    // 5a. Signal `changed` instances to stop. Their lifecycle tasks handle
+    //     the graceful shutdown per the existing `shutdown_timeout_seconds`
+    //     path reused by the `Stop` IPC.
+    let changed_instances: Vec<String> = {
+        let guard = state.lock().await;
+        guard
+            .processes
+            .iter()
+            .filter(|(_, r)| plan.changed.contains(&r.spec.base_name))
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+
+    if !changed_instances.is_empty() {
+        let guard = state.lock().await;
+        for name in &changed_instances {
+            if let Some(tx) = guard.controllers.get(name) {
+                let _ = tx.send(true);
+            }
+        }
+    }
+
+    // 5b. Wait for the changed instances to reach a terminal state so the
+    //     replacement spawn isn't racing a still-shutting-down child. Poll
+    //     briefly; the per-process shutdown timeout applies inside each
+    //     controller's lifecycle task, so the outer wait bound just needs to
+    //     exceed the worst-case shutdown.
+    if !changed_instances.is_empty() {
+        for _ in 0..1200 {
+            let all_stopped = {
+                let guard = state.lock().await;
+                changed_instances.iter().all(|name| {
+                    guard
+                        .processes
+                        .get(name)
+                        .map(|r| r.status.is_terminal())
+                        .unwrap_or(true)
+                })
+            };
+            if all_stopped {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // 5c. Under the lock: drop old changed entries + controllers, splice in
+    //     new `added`/`changed` Pending entries from `new_process_map`. The
+    //     supervisor's tick will pick these up in dep order.
+    let (n_added, n_changed, n_removed) = {
+        let mut guard = state.lock().await;
+        for name in &changed_instances {
+            guard.processes.remove(name);
+            guard.controllers.remove(name);
+        }
+
+        let mut new_instances_added = 0usize;
+        let mut new_instances_changed = 0usize;
+        for (instance_name, runtime) in &new_process_map {
+            if plan.added.contains(&runtime.spec.base_name) {
+                guard
+                    .processes
+                    .insert(instance_name.clone(), runtime.clone());
+                new_instances_added += 1;
+            } else if plan.changed.contains(&runtime.spec.base_name) {
+                guard
+                    .processes
+                    .insert(instance_name.clone(), runtime.clone());
+                new_instances_changed += 1;
+            }
+        }
+        (
+            new_instances_added,
+            new_instances_changed,
+            plan.removed.len(),
+        )
+    };
+
+    if !plan.removed.is_empty() {
+        eprintln!(
+            "reload: orphan service(s) no longer in config (left running): [{}]",
+            plan.removed.join(", ")
+        );
+    }
+
+    Response::Ack {
+        message: format!("reloaded: +{n_added} added, {n_changed} changed, {n_removed} removed",),
+    }
 }
 
 #[cfg(test)]
@@ -1566,5 +1851,85 @@ mod tests {
             db.log_ready = true;
         }
         assert!(dependencies_met(&candidate, &snapshot));
+    }
+
+    fn fp(hash: &str, replicas: u16) -> ServiceFingerprint {
+        ServiceFingerprint {
+            config_hash: hash.to_string(),
+            replicas,
+        }
+    }
+
+    #[test]
+    fn reload_plan_classifies_added_removed_changed_unchanged() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp("h_api_v1", 1));
+        old.insert("db".to_string(), fp("h_db", 1));
+        old.insert("cache".to_string(), fp("h_cache", 1));
+
+        let mut new = BTreeMap::new();
+        // changed: hash differs
+        new.insert("api".to_string(), fp("h_api_v2", 1));
+        // unchanged
+        new.insert("db".to_string(), fp("h_db", 1));
+        // added
+        new.insert("worker".to_string(), fp("h_worker", 1));
+        // "cache" absent from new -> removed
+
+        let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let plan = compute_reload_plan(&old, &new, &deps).expect("no dep violations");
+
+        assert_eq!(plan.added, vec!["worker".to_string()]);
+        assert_eq!(plan.removed, vec!["cache".to_string()]);
+        assert_eq!(plan.changed, vec!["api".to_string()]);
+        assert_eq!(plan.unchanged, vec!["db".to_string()]);
+    }
+
+    #[test]
+    fn reload_plan_detects_replica_count_change_as_changed() {
+        let mut old = BTreeMap::new();
+        old.insert("worker".to_string(), fp("same_hash", 1));
+
+        let mut new = BTreeMap::new();
+        new.insert("worker".to_string(), fp("same_hash", 3));
+
+        let plan = compute_reload_plan(&old, &new, &BTreeMap::new()).expect("no dep violations");
+        assert_eq!(plan.changed, vec!["worker".to_string()]);
+        assert!(plan.unchanged.is_empty());
+    }
+
+    #[test]
+    fn reload_plan_rejects_removed_service_still_depended_on() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp("h_api", 1));
+        old.insert("db".to_string(), fp("h_db", 1));
+
+        // "db" is gone in the new config, but "api" (which remains) still
+        // lists it as a dep.
+        let mut new = BTreeMap::new();
+        new.insert("api".to_string(), fp("h_api", 1));
+
+        let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        deps.insert("api".to_string(), vec!["db".to_string()]);
+
+        let err = compute_reload_plan(&old, &new, &deps)
+            .expect_err("must reject removed-but-still-depended-on");
+        assert!(err.contains("api"), "error mentions dependent: {err}");
+        assert!(err.contains("db"), "error mentions removed dep: {err}");
+    }
+
+    #[test]
+    fn reload_plan_allows_removal_when_no_remaining_service_depends_on_it() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp("h_api", 1));
+        old.insert("legacy".to_string(), fp("h_legacy", 1));
+
+        let mut new = BTreeMap::new();
+        new.insert("api".to_string(), fp("h_api", 1));
+
+        // api does not depend on legacy — removing legacy is fine.
+        let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let plan = compute_reload_plan(&old, &new, &deps).expect("removal is allowed");
+        assert_eq!(plan.removed, vec!["legacy".to_string()]);
     }
 }
