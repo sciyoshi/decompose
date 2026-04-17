@@ -2654,3 +2654,1020 @@ fn up_creates_directories_and_files_with_restrictive_perms() {
     );
     assert_success(&down, "down");
 }
+
+// ---------------------------------------------------------------------------
+// Config-reload integration tests (bd decompose-rn2)
+//
+// These exercise the Reload IPC + reconcile loop via the `up` CLI entry
+// point: when `up` runs against a live daemon it sends `Reload` before
+// `Start`, and the `--force-recreate` / `--no-recreate` / `--remove-orphans`
+// / `--no-start` flags are plumbed through to the daemon's plan executor.
+// ---------------------------------------------------------------------------
+
+/// Small helper used across the reload tests to rewrite the config file
+/// in-place. Kept local to this section because the semantics are
+/// "overwrite whatever was there" - simpler than a builder.
+fn rewrite_config(cfg_path: &Path, contents: &str) {
+    fs::write(cfg_path, contents).expect("rewrite config");
+}
+
+/// Extract the running pid of a named process from `ps --json` output.
+/// Returns `None` when the process is absent or has no pid (e.g. not_started).
+fn pid_of(ps_json: &Value, name: &str) -> Option<u64> {
+    ps_json
+        .get("processes")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|p| p.get("pid").and_then(Value::as_u64))
+}
+
+fn state_of(ps_json: &Value, name: &str) -> Option<String> {
+    ps_json
+        .get("processes")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|p| p.get("state").and_then(Value::as_str))
+        .map(std::string::ToString::to_string)
+}
+
+#[test]
+fn reload_adds_new_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps1, "ps after first up");
+    let parsed1: Value = serde_json::from_slice(&ps1.stdout).expect("ps json");
+    let procs1 = parsed1.get("processes").and_then(Value::as_array).unwrap();
+    assert_eq!(procs1.len(), 1, "only alpha should be present");
+
+    // Rewrite config to add beta, then re-run up.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up after adding beta");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps2, "ps after second up");
+    let parsed2: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    let procs2 = parsed2.get("processes").and_then(Value::as_array).unwrap();
+    assert_eq!(procs2.len(), 2, "alpha + beta after reload");
+    assert_eq!(state_of(&parsed2, "alpha").as_deref(), Some("running"));
+    assert_eq!(state_of(&parsed2, "beta").as_deref(), Some("running"));
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_removes_service_leaves_orphan_by_default() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    // Remove beta from the config, re-run up without --remove-orphans.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up without --remove-orphans");
+    // The Ack's reload message is printed on stdout. It carries the word
+    // "orphan" when services were removed from config without cleanup.
+    let stdout = String::from_utf8_lossy(&up2.stdout);
+    assert!(
+        stdout.contains("orphan"),
+        "reload ack should mention 'orphan', got: {stdout}"
+    );
+
+    thread::sleep(Duration::from_millis(300));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after reload");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    assert_eq!(state_of(&parsed, "alpha").as_deref(), Some("running"));
+    // beta is left running as an orphan even though it's no longer in config.
+    assert_eq!(
+        state_of(&parsed, "beta").as_deref(),
+        Some("running"),
+        "orphan beta should still be running by default"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_with_remove_orphans_stops_removed_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "--remove-orphans"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up with --remove-orphans");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after remove-orphans reload");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let procs = parsed.get("processes").and_then(Value::as_array).unwrap();
+    assert_eq!(
+        procs.len(),
+        1,
+        "only alpha should remain after --remove-orphans, got: {parsed}"
+    );
+    assert_eq!(state_of(&parsed, "alpha").as_deref(), Some("running"));
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_modified_command_recreates_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before reload");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid_before = pid_of(&parsed_before, "alpha").expect("alpha pid before");
+
+    // Change alpha's command, forcing a hash divergence.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 60"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up with modified command");
+    thread::sleep(Duration::from_millis(800));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after reload");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid_after = pid_of(&parsed_after, "alpha").expect("alpha pid after");
+    assert_eq!(
+        state_of(&parsed_after, "alpha").as_deref(),
+        Some("running"),
+        "alpha should be running after recreate"
+    );
+    assert_ne!(
+        pid_before, pid_after,
+        "changed command should spawn a new pid (before={pid_before}, after={pid_after})"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_unchanged_service_not_restarted() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before reload");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid_before = pid_of(&parsed_before, "alpha").expect("alpha pid before");
+
+    // Add an unrelated service; alpha's hash is unchanged.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up adds beta, alpha unchanged");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after reload");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid_after = pid_of(&parsed_after, "alpha").expect("alpha pid after");
+    assert_eq!(
+        pid_before, pid_after,
+        "unchanged alpha should keep its pid across reload"
+    );
+    assert_eq!(
+        state_of(&parsed_after, "beta").as_deref(),
+        Some("running"),
+        "newly-added beta should be running"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_force_recreate_recreates_unchanged_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before reload");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid_before = pid_of(&parsed_before, "alpha").expect("alpha pid before");
+
+    // No config change, but --force-recreate forces a respawn.
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "--force-recreate"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up --force-recreate");
+    thread::sleep(Duration::from_millis(800));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after --force-recreate");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid_after = pid_of(&parsed_after, "alpha").expect("alpha pid after");
+    assert_eq!(
+        state_of(&parsed_after, "alpha").as_deref(),
+        Some("running"),
+        "alpha should be running after --force-recreate"
+    );
+    assert_ne!(
+        pid_before, pid_after,
+        "--force-recreate should respawn alpha (before={pid_before}, after={pid_after})"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_no_recreate_preserves_changed_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before reload");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid_before = pid_of(&parsed_before, "alpha").expect("alpha pid before");
+
+    // Change the command, but pass --no-recreate so the running instance stays.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 60"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "--no-recreate"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up --no-recreate");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after --no-recreate");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid_after = pid_of(&parsed_after, "alpha").expect("alpha pid after");
+    assert_eq!(
+        pid_before, pid_after,
+        "--no-recreate should keep the hash-diverged alpha alive (before={pid_before}, after={pid_after})"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_no_start_registers_service_without_starting_it() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    // Add beta and run `up --no-start` so beta is registered but parked.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "--no-start"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up --no-start");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after --no-start");
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let beta_state = state_of(&parsed, "beta").unwrap_or_default();
+    assert_ne!(
+        beta_state, "running",
+        "beta should NOT be running after --no-start, got: {beta_state}"
+    );
+    // Concretely, the daemon parks --no-start entries in NotStarted.
+    assert_eq!(
+        beta_state, "not_started",
+        "beta should be parked as not_started, got: {beta_state}"
+    );
+
+    // Follow-up `start` should bring beta up.
+    let start = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "start", "--json", "beta"],
+        &[],
+        &[],
+    );
+    assert_success(&start, "start beta");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps2, "ps after start beta");
+    let parsed2: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    assert_eq!(
+        state_of(&parsed2, "beta").as_deref(),
+        Some("running"),
+        "beta should be running after explicit start"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_parse_error_does_not_affect_running_services() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(300));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before invalid rewrite");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid_before = pid_of(&parsed_before, "alpha").expect("alpha pid before");
+
+    // Rewrite the config to invalid YAML.
+    rewrite_config(&cfg_path, "not: valid: yaml: [[[");
+
+    let up_bad = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert!(
+        !up_bad.status.success(),
+        "up with invalid yaml should fail; stdout={}, stderr={}",
+        String::from_utf8_lossy(&up_bad.stdout),
+        String::from_utf8_lossy(&up_bad.stderr)
+    );
+
+    // Restore a valid config so ps (which also resolves config) works, and
+    // confirm alpha is still running with the same pid.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after failed reload");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid_after = pid_of(&parsed_after, "alpha").expect("alpha pid after");
+    assert_eq!(
+        pid_before, pid_after,
+        "alpha pid must be untouched after a failed reload (before={pid_before}, after={pid_after})"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_rejects_removed_service_still_depended_on() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+    depends_on:
+      alpha:
+        condition: process_started
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before bad reload");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let alpha_before = pid_of(&parsed_before, "alpha").expect("alpha pid before");
+    let beta_before = pid_of(&parsed_before, "beta").expect("beta pid before");
+
+    // Remove alpha but keep beta - beta still declares a dep on alpha.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  beta:
+    command: "sleep 30"
+    depends_on:
+      alpha:
+        condition: process_started
+"#,
+    );
+
+    let up_bad = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert!(
+        !up_bad.status.success(),
+        "up with dep-violation should fail; stdout={}, stderr={}",
+        String::from_utf8_lossy(&up_bad.stdout),
+        String::from_utf8_lossy(&up_bad.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&up_bad.stderr);
+    assert!(
+        stderr.contains("depends on") || stderr.contains("removed"),
+        "error should mention the dep violation, got: {stderr}"
+    );
+
+    // Fix the config before ps / down, and confirm both services still
+    // running with their original pids.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  beta:
+    command: "sleep 30"
+    depends_on:
+      alpha:
+        condition: process_started
+"#,
+    );
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after rejected reload");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let alpha_after = pid_of(&parsed_after, "alpha").expect("alpha pid after");
+    let beta_after = pid_of(&parsed_after, "beta").expect("beta pid after");
+    assert_eq!(
+        alpha_before, alpha_after,
+        "alpha pid must be untouched by a rejected reload"
+    );
+    assert_eq!(
+        beta_before, beta_after,
+        "beta pid must be untouched by a rejected reload"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
