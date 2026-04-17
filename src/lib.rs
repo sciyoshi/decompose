@@ -338,9 +338,21 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
         let _ = log_stop_tx.send(true);
         let _ = log_handle.await;
     } else {
-        let content = tokio::fs::read_to_string(&paths.daemon_log)
-            .await
-            .unwrap_or_default();
+        let content = match tokio::fs::read_to_string(&paths.daemon_log).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // No log file yet — treat as empty (daemon just started).
+                String::new()
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read daemon log at {}",
+                        paths.daemon_log.display()
+                    )
+                });
+            }
+        };
         let lines: Vec<&str> = content.lines().collect();
         let filtered = filter_log_lines(&lines, &args.processes);
         let output = match args.tail {
@@ -450,26 +462,25 @@ async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
 }
 
 fn parse_signal(s: &str) -> Result<i32> {
-    // Try parsing as a number first
-    if let Ok(num) = s.parse::<i32>() {
+    // Accept numeric form (e.g. "9" or "-9").
+    if let Ok(num) = s.trim().parse::<i32>() {
         return Ok(num);
     }
 
-    // Strip optional "SIG" prefix and match by name
-    let name = s.to_ascii_uppercase();
-    let name = name.strip_prefix("SIG").unwrap_or(&name);
+    // Accept "SIGTERM" or "TERM" (and "sigterm" / "term"). Nix's
+    // `Signal::from_str` only accepts the SIG-prefixed, upper-case form, so
+    // normalize into that shape first.
+    let upper = s.trim().to_ascii_uppercase();
+    let canonical = if upper.starts_with("SIG") {
+        upper
+    } else {
+        format!("SIG{upper}")
+    };
 
-    match name {
-        "KILL" => Ok(9),
-        "TERM" => Ok(15),
-        "INT" => Ok(2),
-        "HUP" => Ok(1),
-        "USR1" => Ok(10),
-        "USR2" => Ok(12),
-        "QUIT" => Ok(3),
-        "STOP" => Ok(19),
-        "CONT" => Ok(18),
-        _ => bail!("unknown signal: {s}"),
+    use std::str::FromStr;
+    match nix::sys::signal::Signal::from_str(&canonical) {
+        Ok(sig) => Ok(sig as i32),
+        Err(_) => bail!("unknown signal: {s:?} (try e.g. SIGTERM, TERM, 15, or see `kill -l`)"),
     }
 }
 
@@ -960,5 +971,72 @@ async fn stream_filtered_logs(
             }
             _ = sleep(Duration::from_millis(100)) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_signal_accepts_numeric_form() {
+        assert_eq!(parse_signal("9").unwrap(), 9);
+        assert_eq!(parse_signal("15").unwrap(), 15);
+        assert_eq!(parse_signal(" 2 ").unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_signal_accepts_sig_prefixed_name() {
+        assert_eq!(parse_signal("SIGTERM").unwrap(), 15);
+        assert_eq!(parse_signal("SIGKILL").unwrap(), 9);
+        assert_eq!(parse_signal("SIGHUP").unwrap(), 1);
+        assert_eq!(parse_signal("SIGINT").unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_signal_accepts_bare_name() {
+        assert_eq!(parse_signal("TERM").unwrap(), 15);
+        assert_eq!(parse_signal("KILL").unwrap(), 9);
+        assert_eq!(parse_signal("HUP").unwrap(), 1);
+        assert_eq!(
+            parse_signal("USR1").unwrap(),
+            nix::sys::signal::SIGUSR1 as i32
+        );
+        assert_eq!(
+            parse_signal("USR2").unwrap(),
+            nix::sys::signal::SIGUSR2 as i32
+        );
+    }
+
+    #[test]
+    fn parse_signal_is_case_insensitive() {
+        assert_eq!(parse_signal("sigterm").unwrap(), 15);
+        assert_eq!(parse_signal("term").unwrap(), 15);
+        assert_eq!(parse_signal("SigKill").unwrap(), 9);
+    }
+
+    #[test]
+    fn parse_signal_supports_expanded_signal_set() {
+        // Sample signals that the old hardcoded implementation did *not*
+        // support, to guard against regressing back to the short list.
+        assert!(parse_signal("SIGCHLD").is_ok());
+        assert!(parse_signal("SIGALRM").is_ok());
+        assert!(parse_signal("SIGPIPE").is_ok());
+        assert!(parse_signal("SIGTTIN").is_ok());
+        assert!(parse_signal("SIGSEGV").is_ok());
+    }
+
+    #[test]
+    fn parse_signal_unknown_signal_returns_clear_error() {
+        let err = parse_signal("NOPESIG").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown signal"), "error was: {msg}");
+        assert!(msg.contains("NOPESIG"), "error was: {msg}");
+    }
+
+    #[test]
+    fn parse_signal_empty_string_fails_clearly() {
+        let err = parse_signal("").unwrap_err();
+        assert!(err.to_string().contains("unknown signal"));
     }
 }

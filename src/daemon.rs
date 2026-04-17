@@ -37,6 +37,19 @@ use crate::model::{
 use crate::paths::FILE_MODE;
 use crate::paths::{create_dir_secure, runtime_paths_for};
 
+/// Compile a `ready_log_line` pattern, falling back to a literal (escaped)
+/// match if the user-supplied pattern isn't a valid regex. The escaped
+/// fallback is guaranteed-valid regex, so this never panics.
+fn compile_ready_pattern(pattern: &str) -> Regex {
+    Regex::new(pattern).unwrap_or_else(|_| {
+        // `regex::escape` returns a string of literal characters only, which
+        // is always a valid regex. If this somehow fails, fall back to a
+        // never-matching pattern rather than panicking.
+        Regex::new(&regex::escape(pattern))
+            .unwrap_or_else(|_| Regex::new("$.^").expect("never-matching pattern is valid regex"))
+    })
+}
+
 /// Open a file with restrictive 0o600 permissions on Unix, and defensively
 /// tighten the mode if the file already existed with looser permissions.
 #[cfg(unix)]
@@ -312,8 +325,39 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
                         });
                     }
                     Err(e) => {
-                        eprintln!("socket accept error: {e}");
-                        sleep(Duration::from_millis(50)).await;
+                        // Accept errors are almost always transient (e.g.
+                        // ECONNABORTED when a client hangs up between the
+                        // kernel accepting the connection and us reading it,
+                        // or EMFILE if we're briefly out of file descriptors).
+                        // We distinguish "fatal" cases — principally EBADF,
+                        // which would indicate the listening socket has been
+                        // closed out from under us — and shut the daemon
+                        // down. Everything else we log and retry after a
+                        // short backoff.
+                        #[cfg(unix)]
+                        let is_fatal = matches!(e.raw_os_error(), Some(libc::EBADF) | Some(libc::ENOTSOCK) | Some(libc::EINVAL));
+                        #[cfg(not(unix))]
+                        let is_fatal = false;
+
+                        if is_fatal {
+                            eprintln!("socket accept failed fatally, shutting down: {e}");
+                            // Trigger a graceful shutdown — supervisor will
+                            // stop processes and break the outer loop.
+                            let mut guard = state.lock().await;
+                            guard.shutdown_requested = true;
+                            for tx in guard.controllers.values() {
+                                let _ = tx.send(true);
+                            }
+                            for runtime in guard.processes.values_mut() {
+                                if matches!(runtime.status, ProcessStatus::Pending) {
+                                    runtime.status = ProcessStatus::Stopped;
+                                }
+                            }
+                            break;
+                        } else {
+                            eprintln!("socket accept error (transient): {e}");
+                            sleep(Duration::from_millis(50)).await;
+                        }
                     }
                 }
             }
@@ -472,18 +516,21 @@ async fn start_process(name: String, state: SharedState) {
     };
 
     // Compile ready_log_line pattern
-    let ready_pattern: Option<Regex> = spec.ready_log_line.as_ref().map(|pattern| {
-        Regex::new(pattern).unwrap_or_else(|_| Regex::new(&regex::escape(pattern)).unwrap())
-    });
+    let ready_pattern: Option<Regex> = spec.ready_log_line.as_deref().map(compile_ready_pattern);
 
-    let mut cmd = match build_shell_command(&spec.command) {
+    let mut cmd = match build_shell_command(&spec.command).with_context(|| {
+        format!(
+            "[{name}] failed to build shell command for {:?}",
+            spec.command
+        )
+    }) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[{name}] failed to build shell command: {e}");
+            eprintln!("[{name}] {e:#}");
             let mut guard = state.lock().await;
             if let Some(runtime) = guard.processes.get_mut(&name) {
                 runtime.status = ProcessStatus::FailedToStart {
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 };
             }
             return;
@@ -494,15 +541,21 @@ async fn start_process(name: String, state: SharedState) {
         .stderr(Stdio::piped())
         .envs(&spec.environment);
 
-    let spawn_res = cmd.spawn();
+    let spawn_res = cmd.spawn().with_context(|| {
+        format!(
+            "[{name}] failed to spawn process (command={:?}, cwd={})",
+            spec.command,
+            spec.working_dir.display()
+        )
+    });
     let mut child = match spawn_res {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[{name}] failed to start: {e}");
+            eprintln!("[{name}] {e:#}");
             let mut guard = state.lock().await;
             if let Some(runtime) = guard.processes.get_mut(&name) {
                 runtime.status = ProcessStatus::FailedToStart {
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 };
             }
             return;
@@ -629,14 +682,19 @@ async fn start_process(name: String, state: SharedState) {
                 };
                 let Some(spec) = spec else { break };
 
-                let mut cmd = match build_shell_command(&spec.command) {
+                let mut cmd = match build_shell_command(&spec.command).with_context(|| {
+                    format!(
+                        "[{name}] failed to build shell command on restart for {:?}",
+                        spec.command
+                    )
+                }) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("[{name}] failed to build shell command on restart: {e}");
+                        eprintln!("[{name}] {e:#}");
                         let mut guard = state.lock().await;
                         if let Some(runtime) = guard.processes.get_mut(&name) {
                             runtime.status = ProcessStatus::FailedToStart {
-                                reason: e.to_string(),
+                                reason: format!("{e:#}"),
                             };
                         }
                         guard.controllers.remove(&name);
@@ -648,7 +706,13 @@ async fn start_process(name: String, state: SharedState) {
                     .stderr(Stdio::piped())
                     .envs(&spec.environment);
 
-                match cmd.spawn() {
+                match cmd.spawn().with_context(|| {
+                    format!(
+                        "[{name}] failed to spawn process on restart (command={:?}, cwd={})",
+                        spec.command,
+                        spec.working_dir.display()
+                    )
+                }) {
                     Ok(new_child) => {
                         child = new_child;
                         let pid = child.id().unwrap_or(0);
@@ -663,11 +727,7 @@ async fn start_process(name: String, state: SharedState) {
 
                         // Re-attach stdout/stderr readers
                         let ready_pattern: Option<Regex> =
-                            spec.ready_log_line.as_ref().map(|pattern| {
-                                Regex::new(pattern).unwrap_or_else(|_| {
-                                    Regex::new(&regex::escape(pattern)).unwrap()
-                                })
-                            });
+                            spec.ready_log_line.as_deref().map(compile_ready_pattern);
                         attach_output_readers(&mut child, &name, ready_pattern, state.clone());
 
                         // Create new kill channel for this restart iteration
@@ -679,10 +739,11 @@ async fn start_process(name: String, state: SharedState) {
                         kill_rx = new_kill_rx;
                     }
                     Err(e) => {
+                        eprintln!("[{name}] {e:#}");
                         let mut guard = state.lock().await;
                         if let Some(runtime) = guard.processes.get_mut(&name) {
                             runtime.status = ProcessStatus::FailedToStart {
-                                reason: e.to_string(),
+                                reason: format!("{e:#}"),
                             };
                         }
                         guard.controllers.remove(&name);
@@ -755,12 +816,51 @@ async fn shutdown_child(
     spec: &crate::model::ProcessInstanceSpec,
     timeout_override: Option<u64>,
 ) {
-    // Step 1: Run optional shutdown command
+    let total_timeout =
+        Duration::from_secs(timeout_override.unwrap_or(spec.shutdown_timeout_seconds));
+    let deadline = tokio::time::Instant::now() + total_timeout;
+
+    // Step 1: Run optional shutdown command. Bound it by the overall
+    // shutdown timeout so a hung cleanup script can't block us forever.
     if let Some(ref cmd_str) = spec.shutdown_command {
         match build_shell_command(cmd_str) {
             Ok(mut cmd) => {
                 cmd.current_dir(&spec.working_dir).envs(&spec.environment);
-                let _ = cmd.output().await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    eprintln!(
+                        "[{}] shutdown command {:?} skipped: no time budget remaining",
+                        spec.name, cmd_str
+                    );
+                } else {
+                    match tokio::time::timeout(remaining, cmd.output()).await {
+                        Ok(Ok(output)) => {
+                            if !output.status.success() {
+                                let code = output
+                                    .status
+                                    .code()
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_else(|| "signal".to_string());
+                                eprintln!(
+                                    "[{}] shutdown command {:?} exited with status {code}",
+                                    spec.name, cmd_str
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!(
+                                "[{}] shutdown command {:?} failed to spawn: {e}",
+                                spec.name, cmd_str
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[{}] shutdown command {:?} timed out; proceeding to SIGTERM",
+                                spec.name, cmd_str
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[{}] shutdown command failed to build: {e}", spec.name);
@@ -786,15 +886,20 @@ async fn shutdown_child(
         }
     }
 
-    // Step 3: Wait with timeout
-    let timeout = Duration::from_secs(timeout_override.unwrap_or(spec.shutdown_timeout_seconds));
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(_) => {}
-        Err(_) => {
-            // Step 4: Force kill
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+    // Step 3: Wait for the remaining portion of the total timeout. If the
+    // shutdown command ate most of it, we'll move on to SIGKILL quickly —
+    // which is the right behaviour: the user's time budget is over.
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let terminated = if remaining.is_zero() {
+        false
+    } else {
+        tokio::time::timeout(remaining, child.wait()).await.is_ok()
+    };
+
+    if !terminated {
+        // Step 4: Force kill
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 }
 

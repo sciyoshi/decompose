@@ -436,13 +436,25 @@ pub fn discover_config(cwd: &Path) -> Result<PathBuf> {
 pub fn parse_dotenv(path: &Path) -> Result<BTreeMap<String, String>> {
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read env file {}", path.display()))?;
-    parse_dotenv_str(&data)
+    parse_dotenv_with_source(&data, Some(&path.display().to_string()))
 }
 
 pub fn parse_dotenv_str(data: &str) -> Result<BTreeMap<String, String>> {
+    parse_dotenv_with_source(data, None)
+}
+
+/// Parse a `.env`-style file. Malformed lines (no `=` separator, empty key)
+/// are skipped but emit a warning on stderr so users can notice typos.
+///
+/// `source` is an optional label (typically the file path) used in warnings.
+pub fn parse_dotenv_with_source(
+    data: &str,
+    source: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
 
-    for line in data.lines() {
+    for (idx, line) in data.lines().enumerate() {
+        let line_no = idx + 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -451,15 +463,29 @@ pub fn parse_dotenv_str(data: &str) -> Result<BTreeMap<String, String>> {
         let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
 
         let Some((key, value)) = trimmed.split_once('=') else {
+            warn_malformed_dotenv(source, line_no, line, "missing '=' separator");
             continue;
         };
 
-        let key = key.trim().to_string();
+        let key = key.trim();
+        if key.is_empty() {
+            warn_malformed_dotenv(source, line_no, line, "empty key");
+            continue;
+        }
+
         let value = strip_quotes(value.trim());
-        env.insert(key, value);
+        env.insert(key.to_string(), value);
     }
 
     Ok(env)
+}
+
+fn warn_malformed_dotenv(source: Option<&str>, line_no: usize, line: &str, reason: &str) {
+    let src = source.unwrap_or("<env>");
+    eprintln!(
+        "warning: {src}:{line_no}: skipping malformed env line ({reason}): {:?}",
+        line.trim_end()
+    );
 }
 
 fn strip_quotes(s: &str) -> String {
@@ -1166,6 +1192,23 @@ processes:
         let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let err = filter_process_subset(&mut cfg, &["nope".to_string()], true).unwrap_err();
         assert!(err.to_string().contains("unknown process"));
+    }
+
+    #[test]
+    fn parse_dotenv_keeps_valid_lines_when_malformed_present() {
+        // Malformed lines (no '=') should be skipped but not cause the parse
+        // to fail; valid lines on either side of them must still be returned.
+        // A warning is emitted to stderr — we can't capture that here without
+        // forking tests, but we assert the good lines survive.
+        let data = "GOOD1=yes\nbare_no_equals\n=empty_key_ignored\nGOOD2=also_yes\n";
+        let env = parse_dotenv_str(data).expect("parse should not fail on malformed lines");
+        assert_eq!(env.get("GOOD1"), Some(&"yes".to_string()));
+        assert_eq!(env.get("GOOD2"), Some(&"also_yes".to_string()));
+        // Empty-key line is dropped with a warning.
+        assert!(!env.contains_key(""));
+        // Stray bare line didn't get turned into anything accidentally.
+        assert!(!env.contains_key("bare_no_equals"));
+        assert_eq!(env.len(), 2);
     }
 
     #[test]
