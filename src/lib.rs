@@ -255,14 +255,9 @@ async fn run_down(
         Err(err) => return Err(err),
     };
 
-    match response {
-        Response::Ack { message } => {
-            wait_for_daemon_stop(&paths).await;
-            emit_message(output_mode, "ok", &message);
-        }
-        Response::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected response from daemon"),
-    }
+    let message = expect_ack(response)?;
+    wait_for_daemon_stop(&paths).await;
+    emit_message(output_mode, "ok", &message);
 
     Ok(())
 }
@@ -405,11 +400,8 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
         Err(err) => return Err(err),
     };
 
-    match response {
-        Response::Ack { message } => emit_message(output_mode, "ok", &message),
-        Response::Error { message } => bail!("{message}"),
-        _ => bail!("unexpected response from daemon"),
-    }
+    let message = expect_ack(response)?;
+    emit_message(output_mode, "ok", &message);
 
     Ok(())
 }
@@ -453,13 +445,21 @@ async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
         Err(err) => return Err(err),
     };
 
+    let message = expect_ack(response)?;
+    emit_message(output_mode, "ok", &message);
+
+    Ok(())
+}
+
+/// Extract the message from a `Response::Ack`, or bail with an appropriate
+/// error for `Response::Error`/unexpected variants. Collapses a match pattern
+/// that previously appeared at every "fire-and-acknowledge" IPC callsite.
+fn expect_ack(response: Response) -> Result<String> {
     match response {
-        Response::Ack { message } => emit_message(output_mode, "ok", &message),
+        Response::Ack { message } => Ok(message),
         Response::Error { message } => bail!("{message}"),
         _ => bail!("unexpected response from daemon"),
     }
-
-    Ok(())
 }
 
 fn parse_signal(s: &str) -> Result<i32> {

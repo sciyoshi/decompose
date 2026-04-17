@@ -122,6 +122,30 @@ struct DaemonState {
     shutdown_timeout_override: Option<u64>,
 }
 
+impl DaemonState {
+    /// Broadcast a shutdown signal to every running process controller and
+    /// transition any still-Pending processes directly to Stopped (they have
+    /// no controller of their own). Does not set `shutdown_requested`.
+    fn broadcast_stop(&mut self) {
+        for tx in self.controllers.values() {
+            let _ = tx.send(true);
+        }
+        for runtime in self.processes.values_mut() {
+            if matches!(runtime.status, ProcessStatus::Pending) {
+                runtime.status = ProcessStatus::Stopped;
+            }
+        }
+    }
+
+    /// Set `shutdown_requested` and broadcast stop to all controllers. Used
+    /// by callers that want to initiate shutdown (exit-mode trigger, fatal
+    /// accept error, `Down` RPC).
+    fn request_shutdown(&mut self) {
+        self.shutdown_requested = true;
+        self.broadcast_stop();
+    }
+}
+
 type SharedState = Arc<Mutex<DaemonState>>;
 
 /// Acquire an exclusive, non-blocking advisory lock for this daemon instance.
@@ -344,15 +368,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
                             // Trigger a graceful shutdown — supervisor will
                             // stop processes and break the outer loop.
                             let mut guard = state.lock().await;
-                            guard.shutdown_requested = true;
-                            for tx in guard.controllers.values() {
-                                let _ = tx.send(true);
-                            }
-                            for runtime in guard.processes.values_mut() {
-                                if matches!(runtime.status, ProcessStatus::Pending) {
-                                    runtime.status = ProcessStatus::Stopped;
-                                }
-                            }
+                            guard.request_shutdown();
                             break;
                         } else {
                             eprintln!("socket accept error (transient): {e}");
@@ -394,16 +410,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
                 if triggered {
                     drop(guard);
                     let mut guard = state.lock().await;
-                    guard.shutdown_requested = true;
-                    for tx in guard.controllers.values() {
-                        let _ = tx.send(true);
-                    }
-                    // Pending processes have no controller — stop them directly
-                    for runtime in guard.processes.values_mut() {
-                        if matches!(runtime.status, ProcessStatus::Pending) {
-                            runtime.status = ProcessStatus::Stopped;
-                        }
-                    }
+                    guard.request_shutdown();
                     request_shutdown = true;
                 } else {
                     for (name, proc_runtime) in &snapshot {
@@ -420,28 +427,12 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
 
                     if guard.shutdown_requested {
                         request_shutdown = true;
-                        for tx in guard.controllers.values() {
-                            let _ = tx.send(true);
-                        }
-                        // Pending processes have no controller — stop them directly
-                        for runtime in guard.processes.values_mut() {
-                            if matches!(runtime.status, ProcessStatus::Pending) {
-                                runtime.status = ProcessStatus::Stopped;
-                            }
-                        }
+                        guard.broadcast_stop();
                     }
                 }
             } else {
                 request_shutdown = true;
-                for tx in guard.controllers.values() {
-                    let _ = tx.send(true);
-                }
-                // Pending processes have no controller — stop them directly
-                for runtime in guard.processes.values_mut() {
-                    if matches!(runtime.status, ProcessStatus::Pending) {
-                        runtime.status = ProcessStatus::Stopped;
-                    }
-                }
+                guard.broadcast_stop();
             }
         }
 
@@ -572,24 +563,22 @@ async fn start_process(name: String, state: SharedState) {
     }
 
     // Spawn health check probes
-    if let Some(ref probe) = spec.readiness_probe {
-        tokio::spawn(run_readiness_probe(
-            name.clone(),
-            probe.clone(),
-            state.clone(),
-            spec.working_dir.clone(),
-            spec.environment.clone(),
-        ));
-    }
-    if let Some(ref probe) = spec.liveness_probe {
-        tokio::spawn(run_liveness_probe(
-            name.clone(),
-            probe.clone(),
-            state.clone(),
-            spec.working_dir.clone(),
-            spec.environment.clone(),
-        ));
-    }
+    spawn_probe_if_present(
+        spec.readiness_probe.as_ref(),
+        ProbeKind::Readiness,
+        &name,
+        &spec.working_dir,
+        &spec.environment,
+        &state,
+    );
+    spawn_probe_if_present(
+        spec.liveness_probe.as_ref(),
+        ProbeKind::Liveness,
+        &name,
+        &spec.working_dir,
+        &spec.environment,
+        &state,
+    );
 
     attach_output_readers(&mut child, &name, ready_pattern, state.clone());
 
@@ -903,10 +892,42 @@ async fn shutdown_child(
     }
 }
 
-/// Run a readiness probe periodically. Sets the `healthy` flag on the process
-/// runtime when the probe succeeds (and clears it when the failure threshold
-/// is reached).
-async fn run_readiness_probe(
+#[derive(Debug, Clone, Copy)]
+enum ProbeKind {
+    /// Flips the `healthy` flag on success/failure thresholds.
+    Readiness,
+    /// On reaching `failure_threshold`, SIGKILLs the process so the restart
+    /// policy can re-launch it.
+    Liveness,
+}
+
+/// Spawn a probe task if a `HealthProbe` is configured. Combines the
+/// previously-duplicated readiness/liveness setup blocks into one call.
+fn spawn_probe_if_present(
+    probe: Option<&HealthProbe>,
+    kind: ProbeKind,
+    name: &str,
+    working_dir: &Path,
+    environment: &BTreeMap<String, String>,
+    state: &SharedState,
+) {
+    if let Some(probe) = probe {
+        tokio::spawn(run_probe(
+            kind,
+            name.to_string(),
+            probe.clone(),
+            state.clone(),
+            working_dir.to_path_buf(),
+            environment.clone(),
+        ));
+    }
+}
+
+/// Run a health probe periodically. The polling/threshold scaffolding is
+/// identical between readiness and liveness probes; only the success and
+/// failure actions differ. See [`ProbeKind`] for the per-kind semantics.
+async fn run_probe(
+    kind: ProbeKind,
     name: String,
     probe: HealthProbe,
     state: SharedState,
@@ -939,7 +960,9 @@ async fn run_readiness_probe(
         if success {
             consecutive_successes += 1;
             consecutive_failures = 0;
-            if consecutive_successes >= probe.success_threshold {
+            if matches!(kind, ProbeKind::Readiness)
+                && consecutive_successes >= probe.success_threshold
+            {
                 let mut guard = state.lock().await;
                 if let Some(runtime) = guard.processes.get_mut(&name) {
                     runtime.healthy = true;
@@ -949,79 +972,45 @@ async fn run_readiness_probe(
             consecutive_failures += 1;
             consecutive_successes = 0;
             if consecutive_failures >= probe.failure_threshold {
-                let mut guard = state.lock().await;
-                if let Some(runtime) = guard.processes.get_mut(&name) {
-                    runtime.healthy = false;
-                }
-            }
-        }
-
-        sleep(Duration::from_secs(probe.period_seconds)).await;
-    }
-}
-
-/// Run a liveness probe periodically. When the failure threshold is reached,
-/// the process is killed so that the restart policy can re-launch it.
-async fn run_liveness_probe(
-    name: String,
-    probe: HealthProbe,
-    state: SharedState,
-    working_dir: std::path::PathBuf,
-    environment: BTreeMap<String, String>,
-) {
-    // Initial delay
-    if probe.initial_delay_seconds > 0 {
-        sleep(Duration::from_secs(probe.initial_delay_seconds)).await;
-    }
-
-    let mut consecutive_failures: u32 = 0;
-
-    loop {
-        // Check if process is still running
-        {
-            let guard = state.lock().await;
-            if let Some(runtime) = guard.processes.get(&name) {
-                if runtime.status.is_terminal() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        let success = run_single_check(&probe, &working_dir, &environment).await;
-
-        if success {
-            consecutive_failures = 0;
-        } else {
-            consecutive_failures += 1;
-            if consecutive_failures >= probe.failure_threshold {
-                // Kill the process so the restart policy can re-launch it.
-                let guard = state.lock().await;
-                if let Some(runtime) = guard.processes.get(&name) {
-                    if let ProcessStatus::Running { pid } = runtime.status {
-                        #[cfg(unix)]
-                        {
-                            use nix::sys::signal::{self, Signal};
-                            use nix::unistd::Pid;
-                            let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = pid; // suppress unused warning
+                match kind {
+                    ProbeKind::Readiness => {
+                        let mut guard = state.lock().await;
+                        if let Some(runtime) = guard.processes.get_mut(&name) {
+                            runtime.healthy = false;
                         }
                     }
+                    ProbeKind::Liveness => {
+                        // Kill the process so the restart policy can re-launch it.
+                        let guard = state.lock().await;
+                        if let Some(runtime) = guard.processes.get(&name) {
+                            if let ProcessStatus::Running { pid } = runtime.status {
+                                #[cfg(unix)]
+                                {
+                                    use nix::sys::signal::{self, Signal};
+                                    use nix::unistd::Pid;
+                                    let _ =
+                                        signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    let _ = pid; // suppress unused warning
+                                }
+                            }
+                        }
+                        drop(guard);
+
+                        // Reset counter — the restart policy will re-launch
+                        // the process and the probe will re-evaluate from
+                        // scratch.
+                        consecutive_failures = 0;
+
+                        // Wait for the process to actually restart before
+                        // probing again so we don't immediately kill the
+                        // new instance.
+                        sleep(Duration::from_secs(probe.period_seconds)).await;
+                        continue;
+                    }
                 }
-                drop(guard);
-
-                // Reset counter — the restart policy will re-launch the
-                // process and the probe will re-evaluate from scratch.
-                consecutive_failures = 0;
-
-                // Wait for the process to actually restart before probing
-                // again so we don't immediately kill the new instance.
-                sleep(Duration::from_secs(probe.period_seconds)).await;
-                continue;
             }
         }
 
@@ -1170,6 +1159,18 @@ fn describe_services(services: &[String]) -> String {
     }
 }
 
+/// Resolve services and convert any unknown-name error into a
+/// `Response::Error` so IPC handlers can exit early with `?`-style control
+/// flow. Mirrors the check/format used by Stop/Start/Kill/Restart.
+fn resolve_services_or_error(
+    state: &DaemonState,
+    services: &[String],
+) -> std::result::Result<Vec<String>, Response> {
+    resolve_services(state, services).map_err(|unknown| Response::Error {
+        message: format!("unknown service(s): {}", unknown.join(", ")),
+    })
+}
+
 async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -1230,27 +1231,16 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
         }
         Request::Down { timeout_seconds } => {
             let mut guard = state.lock().await;
-            guard.shutdown_requested = true;
             guard.shutdown_timeout_override = timeout_seconds;
-            for tx in guard.controllers.values() {
-                let _ = tx.send(true);
-            }
-            // Pending processes have no controller — stop them directly
-            for runtime in guard.processes.values_mut() {
-                if matches!(runtime.status, ProcessStatus::Pending) {
-                    runtime.status = ProcessStatus::Stopped;
-                }
-            }
+            guard.request_shutdown();
             Response::Ack {
                 message: "shutdown requested".to_string(),
             }
         }
         Request::Stop { services } => {
             let mut guard = state.lock().await;
-            match resolve_services(&guard, &services) {
-                Err(unknown) => Response::Error {
-                    message: format!("unknown service(s): {}", unknown.join(", ")),
-                },
+            match resolve_services_or_error(&guard, &services) {
+                Err(resp) => resp,
                 Ok(names) => {
                     for name in &names {
                         // Processes in Pending state have no controller yet —
@@ -1274,10 +1264,8 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
         }
         Request::Start { services } => {
             let mut guard = state.lock().await;
-            match resolve_services(&guard, &services) {
-                Err(unknown) => Response::Error {
-                    message: format!("unknown service(s): {}", unknown.join(", ")),
-                },
+            match resolve_services_or_error(&guard, &services) {
+                Err(resp) => resp,
                 Ok(names) => {
                     // Collect the set of services to start, including their
                     // transitive dependencies that are also in a terminal state
@@ -1331,10 +1319,8 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
         }
         Request::Kill { services, signal } => {
             let guard = state.lock().await;
-            match resolve_services(&guard, &services) {
-                Err(unknown) => Response::Error {
-                    message: format!("unknown service(s): {}", unknown.join(", ")),
-                },
+            match resolve_services_or_error(&guard, &services) {
+                Err(resp) => resp,
                 Ok(names) => {
                     for name in &names {
                         if let Some(runtime) = guard.processes.get(name) {
@@ -1358,10 +1344,8 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
         }
         Request::Restart { services } => {
             let guard = state.lock().await;
-            match resolve_services(&guard, &services) {
-                Err(unknown) => Response::Error {
-                    message: format!("unknown service(s): {}", unknown.join(", ")),
-                },
+            match resolve_services_or_error(&guard, &services) {
+                Err(resp) => resp,
                 Ok(names) => {
                     for name in &names {
                         if let Some(tx) = guard.controllers.get(name) {
