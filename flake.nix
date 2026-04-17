@@ -27,6 +27,7 @@
             lockFile = ./Cargo.lock;
           };
           nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeCheckInputs = [ pkgs.python3 ];
           meta = {
             description = cargoToml.package.description;
             homepage = cargoToml.package.homepage;
