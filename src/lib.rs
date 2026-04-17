@@ -20,8 +20,11 @@ use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use crate::cli::{Cli, Commands, KillArgs, LogsArgs, ServiceArgs, UpArgs};
-use crate::config::{load_and_merge_configs, resolve_config_paths};
+use crate::cli::{Cli, Commands, ExecArgs, KillArgs, LogsArgs, RunArgs, ServiceArgs, UpArgs};
+use crate::config::{
+    apply_interpolation, build_process_instances, load_and_merge_configs, load_dotenv_files,
+    resolve_config_paths,
+};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{
@@ -61,8 +64,173 @@ pub async fn run_cli() -> Result<()> {
         Commands::Config(args) => run_config(global, args.output.resolve()).await,
         Commands::Kill(args) => run_kill(global, args).await,
         Commands::Ls(args) => run_ls(args.output.resolve()).await,
+        Commands::Run(args) => run_run(global, args).await,
+        Commands::Exec(args) => run_exec(global, args).await,
         Commands::Daemon(args) => run_daemon(args).await,
     }
+}
+
+/// Build the environment/working_dir for a service from the on-disk config,
+/// exactly the way the daemon does when spawning it.
+fn resolve_service_context(
+    global: &GlobalConfig,
+    service: &str,
+) -> Result<(PathBuf, std::collections::BTreeMap<String, String>)> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config_files = resolve_config_paths(&global.config_files, &cwd)?;
+    let dotenv = load_dotenv_files(&cwd, &global.env_files, global.disable_dotenv)?;
+    let mut cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
+    apply_interpolation(&mut cfg);
+    if !cfg.processes.contains_key(service) {
+        let known: Vec<&str> = cfg.processes.keys().map(|k| k.as_str()).collect();
+        bail!(
+            "unknown service: {service:?} (known services: {})",
+            known.join(", ")
+        );
+    }
+    let instances = build_process_instances(&cfg, &cwd, &dotenv);
+    // Pick the first replica (or the bare service name when replicas == 1).
+    let (_, runtime) = instances
+        .iter()
+        .find(|(_, r)| r.spec.base_name == service)
+        .ok_or_else(|| anyhow::anyhow!("service {service:?} has no replicas"))?;
+    Ok((
+        runtime.spec.working_dir.clone(),
+        runtime.spec.environment.clone(),
+    ))
+}
+
+/// Parse a `-e KEY=VALUE` override. Accepts `KEY=VALUE`; a bare `KEY` pulls
+/// the value from the current process environment (matches `docker compose
+/// run -e KEY` semantics). Returns an error for empty keys or leading-`=`.
+fn parse_env_override(raw: &str) -> Result<(String, String)> {
+    match raw.split_once('=') {
+        Some(("", _)) => bail!("invalid -e entry {raw:?}: empty key"),
+        Some((k, v)) => Ok((k.to_string(), v.to_string())),
+        None => {
+            if raw.is_empty() {
+                bail!("invalid -e entry: empty string");
+            }
+            let v = env::var(raw).unwrap_or_default();
+            Ok((raw.to_string(), v))
+        }
+    }
+}
+
+/// Spawn CMD... with the given cwd and environment, inheriting stdio so
+/// interactive commands (psql, bash) work. Returns the child's exit code
+/// (128 + signal on Unix signal termination).
+fn spawn_one_off(
+    cwd: &std::path::Path,
+    env_vars: &std::collections::BTreeMap<String, String>,
+    command: &[String],
+) -> Result<i32> {
+    let (program, args) = command.split_first().expect("clap guarantees non-empty");
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    // Start from a clean slate then overlay the service env so we don't leak
+    // unrelated caller environment into the child (matching how the daemon
+    // spawns services).
+    cmd.env_clear();
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+    // stdin/stdout/stderr default to inherit, which is what we want.
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to spawn {program:?}"))?;
+    if let Some(code) = status.code() {
+        return Ok(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return Ok(128 + sig);
+        }
+    }
+    Ok(1)
+}
+
+async fn run_run(global: GlobalConfig, args: RunArgs) -> Result<()> {
+    let (cwd, mut env_vars) = resolve_service_context(&global, &args.service)?;
+    for raw in &args.env {
+        let (k, v) = parse_env_override(raw)?;
+        env_vars.insert(k, v);
+    }
+    let workdir = args.workdir.map(|p| {
+        if p.is_absolute() {
+            p
+        } else {
+            env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+        }
+    });
+    let final_cwd = workdir.unwrap_or(cwd);
+    let code = spawn_one_off(&final_cwd, &env_vars, &args.command)?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+async fn run_exec(global: GlobalConfig, args: ExecArgs) -> Result<()> {
+    // `exec` requires a running service. Preflight against the daemon before
+    // doing any local work so users get a clear "service not running" error.
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+
+    let response = match send_request(
+        &paths,
+        Request::ServiceRunState {
+            name: args.service.clone(),
+        },
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(err) if is_no_daemon_error(&err, &paths) => {
+            bail!(
+                "no running environment for this project — start one with `decompose up` (or use `decompose run` for a one-off command)"
+            );
+        }
+        Err(err) => return Err(err),
+    };
+
+    match response {
+        Response::ServiceRunState { known, any_running } => {
+            if !known {
+                bail!("unknown service: {:?}", args.service);
+            }
+            if !any_running {
+                bail!(
+                    "service {:?} is not running — start it with `decompose start {}` (or use `decompose run` for a one-off command)",
+                    args.service,
+                    args.service
+                );
+            }
+        }
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected response from daemon"),
+    }
+
+    let (cwd, mut env_vars) = resolve_service_context(&global, &args.service)?;
+    for raw in &args.env {
+        let (k, v) = parse_env_override(raw)?;
+        env_vars.insert(k, v);
+    }
+    let workdir = args.workdir.map(|p| {
+        if p.is_absolute() {
+            p
+        } else {
+            env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+        }
+    });
+    let final_cwd = workdir.unwrap_or(cwd);
+    let code = spawn_one_off(&final_cwd, &env_vars, &args.command)?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

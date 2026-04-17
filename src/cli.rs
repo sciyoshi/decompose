@@ -66,8 +66,49 @@ pub enum Commands {
     Kill(KillArgs),
     /// List running decompose environments.
     Ls(OutputOnlyArgs),
+    /// Run a one-off command in a service's environment (env vars, working
+    /// dir, env_file) without attaching to a running replica. Does not require
+    /// a running daemon. Fire-and-forget: the command is not added to the
+    /// supervised process list.
+    Run(RunArgs),
+    /// Execute a one-off command in the environment of a currently-running
+    /// service. Requires the daemon to be running and at least one replica of
+    /// SERVICE to be in the Running state. Otherwise behaves like `run`.
+    Exec(ExecArgs),
     #[command(hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RunArgs {
+    /// Override working directory for the command.
+    #[arg(short = 'w', long = "workdir")]
+    pub workdir: Option<PathBuf>,
+    /// Extra environment variables (KEY=VALUE). Can be repeated. Override
+    /// values from the service environment.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+    /// Service whose environment to use.
+    pub service: String,
+    /// Command and arguments to execute. Everything after SERVICE is treated
+    /// as the command.
+    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ExecArgs {
+    /// Override working directory for the command.
+    #[arg(short = 'w', long = "workdir")]
+    pub workdir: Option<PathBuf>,
+    /// Extra environment variables (KEY=VALUE). Can be repeated.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+    /// Service whose environment to attach to.
+    pub service: String,
+    /// Command and arguments to execute.
+    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]

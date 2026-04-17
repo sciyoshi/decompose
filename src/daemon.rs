@@ -1643,6 +1643,21 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             )
             .await
         }
+        Request::ServiceRunState { name } => {
+            let guard = state.lock().await;
+            let mut known = false;
+            let mut any_running = false;
+            for runtime in guard.processes.values() {
+                if runtime.spec.base_name == name || runtime.spec.name == name {
+                    known = true;
+                    if matches!(runtime.status, ProcessStatus::Running { .. }) {
+                        any_running = true;
+                        break;
+                    }
+                }
+            }
+            Response::ServiceRunState { known, any_running }
+        }
     };
 
     let payload = serde_json::to_string(&response)?;

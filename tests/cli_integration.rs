@@ -4279,3 +4279,326 @@ processes:
     );
     assert_success(&down, "down talker");
 }
+
+// ---------------------------------------------------------------------------
+// `run` and `exec` (decompose-s2g)
+// ---------------------------------------------------------------------------
+
+/// `run` works when no daemon is running — it should read the config
+/// directly, spawn the command with the service's env/cwd, and exit with the
+/// child's code. No IPC needed.
+#[test]
+fn run_works_without_daemon() {
+    let (_root, project, runtime, state, _cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    // Overwrite config with a service that has a distinctive env var we can
+    // echo back from the one-off command.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  worker:
+    command: "sleep 30"
+    environment:
+      DECOMPOSE_TEST_VAR: hello-from-service
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &[
+            "--file",
+            &cfg,
+            "run",
+            "worker",
+            "sh",
+            "-c",
+            "printf '%s' \"$DECOMPOSE_TEST_VAR\"",
+        ],
+        &[],
+        &[],
+    );
+    assert_success(&output, "run worker");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "hello-from-service",
+        "run should inherit service env, got: {stdout}"
+    );
+}
+
+/// `run` propagates the child's non-zero exit code.
+#[test]
+fn run_propagates_exit_code() {
+    let (_root, project, runtime, state, cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_str = cfg.to_string_lossy().to_string();
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg_str, "run", "sleeper", "sh", "-c", "exit 42"],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "expected exit 42, got {:?}",
+        output.status.code()
+    );
+}
+
+/// `run` fails clearly when the service doesn't exist.
+#[test]
+fn run_rejects_unknown_service() {
+    let (_root, project, runtime, state, cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_str = cfg.to_string_lossy().to_string();
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg_str, "run", "does-not-exist", "echo", "hi"],
+        &[],
+        &[],
+    );
+    assert!(!output.status.success(), "run unknown-service should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown service"),
+        "stderr should mention unknown service, got: {stderr}"
+    );
+}
+
+/// `exec` refuses to run when no daemon is running, pointing the user at `up`
+/// or `run`.
+#[test]
+fn exec_fails_without_daemon() {
+    let (_root, project, runtime, state, cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_str = cfg.to_string_lossy().to_string();
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg_str, "exec", "sleeper", "echo", "hi"],
+        &[],
+        &[],
+    );
+    assert!(!output.status.success(), "exec should fail without daemon");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no running environment"),
+        "stderr should explain no daemon running, got: {stderr}"
+    );
+}
+
+/// `exec` refuses to run when the service is defined but no replica is
+/// currently Running (e.g. stopped or not yet started).
+#[test]
+fn exec_fails_when_service_not_running() {
+    let (_root, project, runtime, state, _cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    // Two services: `alive` is running; `dead` is disabled so it never runs.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  alive:
+    command: "sleep 30"
+  dead:
+    command: "sleep 30"
+    disabled: true
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+    // Give `alive` a moment to reach Running.
+    thread::sleep(Duration::from_millis(500));
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "exec", "dead", "echo", "hi"],
+        &[],
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "exec on disabled service should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not running"),
+        "stderr should explain service not running, got: {stderr}"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+/// `exec` succeeds when the service has a running replica — it spawns the
+/// user command with the service's environment and returns the child's exit
+/// code.
+#[test]
+fn exec_runs_when_service_is_running() {
+    let (_root, project, runtime, state, _cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  db:
+    command: "sleep 30"
+    environment:
+      DB_URL: "postgres://localhost/test"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up db");
+    thread::sleep(Duration::from_millis(500));
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &[
+            "--file",
+            &cfg,
+            "exec",
+            "db",
+            "sh",
+            "-c",
+            "printf '%s' \"$DB_URL\"",
+        ],
+        &[],
+        &[],
+    );
+    assert_success(&output, "exec db");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "postgres://localhost/test");
+
+    // `-e` overrides take precedence.
+    let output2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &[
+            "--file",
+            &cfg,
+            "exec",
+            "--env",
+            "DB_URL=postgres://override/db",
+            "db",
+            "sh",
+            "-c",
+            "printf '%s' \"$DB_URL\"",
+        ],
+        &[],
+        &[],
+    );
+    assert_success(&output2, "exec -e override");
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    assert_eq!(stdout2.trim(), "postgres://override/db");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+/// `--workdir`/`-w` overrides the service's working directory.
+#[test]
+fn run_workdir_override() {
+    let (root, project, runtime, state, cfg) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_str = cfg.to_string_lossy().to_string();
+
+    let alt_dir = root.path().join("altwd");
+    fs::create_dir_all(&alt_dir).expect("create altwd");
+
+    let output = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &[
+            "--file",
+            &cfg_str,
+            "run",
+            "-w",
+            alt_dir.to_str().unwrap(),
+            "sleeper",
+            "sh",
+            "-c",
+            "pwd",
+        ],
+        &[],
+        &[],
+    );
+    assert_success(&output, "run with -w");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // On macOS `pwd` may report `/private/var/...` vs `/var/...`; accept either
+    // the original path or a path that ends with the same suffix.
+    let trimmed = stdout.trim();
+    let alt_str = alt_dir.to_string_lossy();
+    assert!(
+        trimmed == alt_str || trimmed.ends_with(alt_str.trim_start_matches('/')),
+        "pwd should be {alt_str}, got {trimmed}"
+    );
+}

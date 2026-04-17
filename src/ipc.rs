@@ -56,6 +56,13 @@ pub enum Request {
         remove_orphans: bool,
         no_start: bool,
     },
+    /// Query whether a service is currently known to the daemon and whether
+    /// any of its replicas is in the Running state. Used by `exec` to
+    /// preflight-check before spawning a one-off command in the service's
+    /// environment.
+    ServiceRunState {
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,6 +79,13 @@ pub enum Response {
     },
     Ack {
         message: String,
+    },
+    /// Reply to `ServiceRunState`. `known` is whether the service is in the
+    /// daemon's process map at all; `any_running` is whether any replica is
+    /// currently in the Running state.
+    ServiceRunState {
+        known: bool,
+        any_running: bool,
     },
     Error {
         message: String,
