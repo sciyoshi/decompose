@@ -3671,3 +3671,217 @@ processes:
     );
     assert_success(&down, "down");
 }
+
+#[test]
+fn reload_scale_up_preserves_existing_replica_pids() {
+    // Scale 2 → 3. The existing foo[1], foo[2] must keep their pids; only
+    // foo[3] is newly spawned. Using 2→3 rather than 1→2 avoids the
+    // naming boundary (single replica is named `foo`, not `foo[1]`); that
+    // transition falls back to full recreate by design.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+    replicas: 2
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up (replicas=2)");
+    thread::sleep(Duration::from_millis(400));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before scale-up");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid1_before = pid_of(&parsed_before, "foo[1]").expect("foo[1] pid before");
+    let pid2_before = pid_of(&parsed_before, "foo[2]").expect("foo[2] pid before");
+
+    // Scale up to 3.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+    replicas: 3
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up (replicas=3)");
+    let stdout2 = String::from_utf8_lossy(&up2.stdout);
+    assert!(
+        stdout2.contains("scaled"),
+        "reload ack should mention 'scaled', got: {stdout2}"
+    );
+    thread::sleep(Duration::from_millis(600));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after scale-up");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let pid1_after = pid_of(&parsed_after, "foo[1]").expect("foo[1] pid after");
+    let pid2_after = pid_of(&parsed_after, "foo[2]").expect("foo[2] pid after");
+    let pid3_after = pid_of(&parsed_after, "foo[3]").expect("foo[3] pid after");
+    assert_eq!(pid1_before, pid1_after, "foo[1] pid must be preserved");
+    assert_eq!(pid2_before, pid2_after, "foo[2] pid must be preserved");
+    assert!(pid3_after > 0, "foo[3] should be running with a valid pid");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn reload_scale_down_stops_highest_indexed_replica() {
+    // Scale 3 → 2. foo[1] and foo[2] keep their pids; foo[3] goes away.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+    replicas: 3
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up (replicas=3)");
+    thread::sleep(Duration::from_millis(500));
+
+    let ps_before = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_before, "ps before scale-down");
+    let parsed_before: Value = serde_json::from_slice(&ps_before.stdout).expect("ps json");
+    let pid1_before = pid_of(&parsed_before, "foo[1]").expect("foo[1] pid before");
+    let pid2_before = pid_of(&parsed_before, "foo[2]").expect("foo[2] pid before");
+    let pid3_before = pid_of(&parsed_before, "foo[3]").expect("foo[3] pid before");
+    assert!(pid3_before > 0);
+
+    // Scale down to 2.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  foo:
+    command: "sleep 30"
+    replicas: 2
+"#,
+    );
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up (replicas=2)");
+    let stdout2 = String::from_utf8_lossy(&up2.stdout);
+    assert!(
+        stdout2.contains("scaled"),
+        "reload ack should mention 'scaled', got: {stdout2}"
+    );
+    thread::sleep(Duration::from_millis(800));
+
+    let ps_after = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps_after, "ps after scale-down");
+    let parsed_after: Value = serde_json::from_slice(&ps_after.stdout).expect("ps json");
+    let procs = parsed_after
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    assert_eq!(procs.len(), 2, "only foo[1] and foo[2] should remain");
+    let pid1_after = pid_of(&parsed_after, "foo[1]").expect("foo[1] pid after");
+    let pid2_after = pid_of(&parsed_after, "foo[2]").expect("foo[2] pid after");
+    assert_eq!(pid1_before, pid1_after, "foo[1] pid must be preserved");
+    assert_eq!(pid2_before, pid2_after, "foo[2] pid must be preserved");
+    assert!(
+        pid_of(&parsed_after, "foo[3]").is_none(),
+        "foo[3] must be gone after scale-down"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}

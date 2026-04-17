@@ -1182,14 +1182,22 @@ fn resolve_services_or_error(
 }
 
 /// Classification of a service across an old and new config snapshot.
-/// Replica-count changes are folded into `Changed` for this bead — special-
-/// casing scale-without-recreate is deferred to a follow-up.
+///
+/// A service's hash excludes `replicas` (see [`crate::config::compute_config_hash`]),
+/// so a pure replica-count change lands in [`ReloadPlan::scaled`] — the daemon
+/// adds or drops replica instances without disturbing the ones that remain.
+/// Hash divergence always means `changed` (full recreate of every replica),
+/// regardless of how the replica count moved.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReloadPlan {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
     pub unchanged: Vec<String>,
+    /// Services whose hash is identical but whose replica count changed.
+    /// Maps base-name → `(old_count, new_count)`. Handled by the daemon as
+    /// spawn-up / stop-highest-index rather than a full recreate.
+    pub scaled: BTreeMap<String, (u16, u16)>,
 }
 
 /// Summary of a single service's hash and replica count, keyed by the stable
@@ -1213,6 +1221,23 @@ pub(crate) struct ServiceFingerprint {
 /// running). Added and removed services are unaffected by either flag.
 /// The caller is expected to enforce that the two flags are mutually
 /// exclusive; this function asserts it in debug builds.
+///
+/// Classification rules for a service present in both snapshots:
+///
+/// | hash      | replicas  | flags                 | category   |
+/// |-----------|-----------|-----------------------|------------|
+/// | equal     | equal     | —                     | unchanged  |
+/// | equal     | differ    | —                     | scaled     |
+/// | equal     | differ    | `force_recreate=true` | changed    |
+/// | equal     | differ    | `no_recreate=true`    | scaled     |
+/// | differ    | any       | —                     | changed    |
+/// | differ    | any       | `no_recreate=true`    | unchanged  |
+/// | any       | any       | `force_recreate=true` | changed    |
+///
+/// `no_recreate` intentionally does NOT block a `scaled` transition:
+/// adding or dropping replicas is not a recreate of existing instances,
+/// so the flag's guarantee ("don't touch running processes") holds — we
+/// only spawn or kill replicas at the tail of the replica set.
 pub(crate) fn compute_reload_plan(
     old: &BTreeMap<String, ServiceFingerprint>,
     new: &BTreeMap<String, ServiceFingerprint>,
@@ -1231,17 +1256,42 @@ pub(crate) fn compute_reload_plan(
         match old.get(name) {
             None => plan.added.push(name.clone()),
             Some(old_fp) => {
-                let hash_differs =
-                    old_fp.config_hash != new_fp.config_hash || old_fp.replicas != new_fp.replicas;
-                let treat_as_changed = if force_recreate {
-                    true
-                } else if no_recreate {
-                    false
-                } else {
-                    hash_differs
-                };
-                if treat_as_changed {
+                let hash_differs = old_fp.config_hash != new_fp.config_hash;
+                let replicas_differ = old_fp.replicas != new_fp.replicas;
+
+                if force_recreate {
+                    // `--force-recreate` overrides everything: recreate all.
                     plan.changed.push(name.clone());
+                } else if hash_differs {
+                    // Real config change. `--no-recreate` demotes to unchanged;
+                    // otherwise full recreate (which also covers any replica-
+                    // count delta — the whole service is being rebuilt).
+                    if no_recreate {
+                        plan.unchanged.push(name.clone());
+                    } else {
+                        plan.changed.push(name.clone());
+                    }
+                } else if replicas_differ {
+                    // Hash equal, replicas differ → scale. `--no-recreate`
+                    // does not block this: scaling adds/drops replicas at the
+                    // tail and leaves the others in place.
+                    //
+                    // Exception: transitions across the `replicas == 1`
+                    // boundary fall back to a full recreate. When `replicas
+                    // == 1`, the instance is named `foo`; when `replicas >= 2`
+                    // it's `foo[1]`, `foo[2]`, … (see
+                    // `build_process_instances` in `src/config.rs`). Scaling
+                    // 1→N or N→1 would therefore require renaming the single
+                    // instance, which is not worth the complexity for this
+                    // edge case — a full recreate keeps the naming consistent
+                    // and is only paid once per boundary crossing.
+                    let crosses_one_boundary = old_fp.replicas == 1 || new_fp.replicas == 1;
+                    if crosses_one_boundary {
+                        plan.changed.push(name.clone());
+                    } else {
+                        plan.scaled
+                            .insert(name.clone(), (old_fp.replicas, new_fp.replicas));
+                    }
                 } else {
                     plan.unchanged.push(name.clone());
                 }
@@ -1739,9 +1789,28 @@ async fn handle_reload(
         Vec::new()
     };
 
+    // Scale-down: for every `scaled` entry whose new count is strictly lower,
+    // mark the tail replicas (indices `new+1..=old`) for stop+remove. The
+    // lower-indexed replicas stay untouched.
+    let scaled_down_instances: Vec<String> = {
+        let guard = state.lock().await;
+        let mut to_drop = Vec::new();
+        for (base, (old_count, new_count)) in &plan.scaled {
+            if new_count < old_count {
+                for (name, runtime) in &guard.processes {
+                    if &runtime.spec.base_name == base && runtime.spec.replica > *new_count {
+                        to_drop.push(name.clone());
+                    }
+                }
+            }
+        }
+        to_drop
+    };
+
     let to_stop: Vec<String> = changed_instances
         .iter()
         .chain(removed_instances.iter())
+        .chain(scaled_down_instances.iter())
         .cloned()
         .collect();
 
@@ -1786,12 +1855,15 @@ async fn handle_reload(
         }
     }
 
-    // 5c. Under the lock: drop old changed + orphaned entries and their
-    //     controllers, splice in new `added`/`changed` entries from
-    //     `new_process_map`. With `no_start`, park them in `NotStarted` so
-    //     the supervisor leaves them alone; otherwise they land as `Pending`
-    //     and the supervisor's next tick picks them up in dep order.
-    let (n_added, n_changed, n_removed) = {
+    // 5c. Under the lock: drop old changed + orphaned + scaled-down entries
+    //     and their controllers, splice in new `added`/`changed` entries
+    //     from `new_process_map`, and spawn any new replicas for scale-up
+    //     transitions (leaving the existing replicas in place). With
+    //     `no_start`, park every freshly inserted runtime in `NotStarted`
+    //     so the supervisor leaves them alone; otherwise they land as
+    //     `Pending` and the supervisor's next tick picks them up in dep
+    //     order.
+    let (n_added, n_changed, n_removed, n_scaled_services, replica_delta) = {
         let mut guard = state.lock().await;
         for name in &changed_instances {
             guard.processes.remove(name);
@@ -1801,13 +1873,26 @@ async fn handle_reload(
             guard.processes.remove(name);
             guard.controllers.remove(name);
         }
+        for name in &scaled_down_instances {
+            guard.processes.remove(name);
+            guard.controllers.remove(name);
+        }
 
         let mut new_instances_added = 0usize;
         let mut new_instances_changed = 0usize;
         for (instance_name, runtime) in &new_process_map {
             let is_added = plan.added.contains(&runtime.spec.base_name);
             let is_changed = plan.changed.contains(&runtime.spec.base_name);
-            if !(is_added || is_changed) {
+            // For `scaled` services, only insert replicas whose index exceeds
+            // the old count — those are the newly-spawned tail entries.
+            // Lower-indexed replicas already exist and must not be touched.
+            let scaled_up_tail =
+                plan.scaled
+                    .get(&runtime.spec.base_name)
+                    .is_some_and(|(old_count, new_count)| {
+                        new_count > old_count && runtime.spec.replica > *old_count
+                    });
+            if !(is_added || is_changed || scaled_up_tail) {
                 continue;
             }
             let mut runtime = runtime.clone();
@@ -1817,16 +1902,32 @@ async fn handle_reload(
             guard.processes.insert(instance_name.clone(), runtime);
             if is_added {
                 new_instances_added += 1;
-            } else {
+            } else if is_changed {
                 new_instances_changed += 1;
             }
+            // scaled_up_tail contributes to `replica_delta` via plan.scaled,
+            // so it doesn't need a separate counter here.
         }
         let removed_count = if remove_orphans {
             removed_instances.len()
         } else {
             plan.removed.len()
         };
-        (new_instances_added, new_instances_changed, removed_count)
+        // Net replica delta across all `scaled` services, positive for
+        // scale-up, negative for scale-down (reported as a signed count in
+        // the ack so operators can see at a glance).
+        let delta: i32 = plan
+            .scaled
+            .values()
+            .map(|(old_count, new_count)| i32::from(*new_count) - i32::from(*old_count))
+            .sum();
+        (
+            new_instances_added,
+            new_instances_changed,
+            removed_count,
+            plan.scaled.len(),
+            delta,
+        )
     };
 
     if !plan.removed.is_empty() && !remove_orphans {
@@ -1837,9 +1938,12 @@ async fn handle_reload(
     }
 
     let removed_label = if remove_orphans { "removed" } else { "orphan" };
+    let delta_sign = if replica_delta >= 0 { "+" } else { "" };
     Response::Ack {
         message: format!(
-            "reloaded: +{n_added} added, {n_changed} changed, {n_removed} {removed_label}",
+            "reloaded: +{n_added} added, {n_changed} changed, \
+             {n_scaled_services} scaled ({delta_sign}{replica_delta} replicas), \
+             {n_removed} {removed_label}",
         ),
     }
 }
@@ -1989,17 +2093,109 @@ mod tests {
     }
 
     #[test]
-    fn reload_plan_detects_replica_count_change_as_changed() {
+    fn reload_plan_scales_pure_replica_count_change() {
+        // 2 → 3: no naming boundary crossing, hash equal → scaled.
         let mut old = BTreeMap::new();
-        old.insert("worker".to_string(), fp("same_hash", 1));
+        old.insert("worker".to_string(), fp("same_hash", 2));
 
         let mut new = BTreeMap::new();
         new.insert("worker".to_string(), fp("same_hash", 3));
 
         let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, false)
             .expect("no dep violations");
+        assert!(
+            plan.changed.is_empty(),
+            "pure replica change should not recreate: {plan:?}"
+        );
+        assert!(
+            plan.unchanged.is_empty(),
+            "pure replica change should not be unchanged: {plan:?}"
+        );
+        assert_eq!(plan.scaled.get("worker"), Some(&(2, 3)));
+    }
+
+    #[test]
+    fn reload_plan_scale_down_classifies_as_scaled() {
+        // 5 → 2: no naming boundary crossing.
+        let mut old = BTreeMap::new();
+        old.insert("worker".to_string(), fp("same_hash", 5));
+
+        let mut new = BTreeMap::new();
+        new.insert("worker".to_string(), fp("same_hash", 2));
+
+        let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, false)
+            .expect("no dep violations");
+        assert!(plan.changed.is_empty());
+        assert_eq!(plan.scaled.get("worker"), Some(&(5, 2)));
+    }
+
+    #[test]
+    fn reload_plan_replica_change_plus_hash_change_is_changed() {
+        // Hash divergence dominates: full recreate regardless of replica delta.
+        let mut old = BTreeMap::new();
+        old.insert("worker".to_string(), fp("h_v1", 2));
+
+        let mut new = BTreeMap::new();
+        new.insert("worker".to_string(), fp("h_v2", 3));
+
+        let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, false)
+            .expect("no dep violations");
         assert_eq!(plan.changed, vec!["worker".to_string()]);
-        assert!(plan.unchanged.is_empty());
+        assert!(plan.scaled.is_empty());
+    }
+
+    #[test]
+    fn reload_plan_force_recreate_overrides_scale() {
+        let mut old = BTreeMap::new();
+        old.insert("worker".to_string(), fp("same_hash", 2));
+
+        let mut new = BTreeMap::new();
+        new.insert("worker".to_string(), fp("same_hash", 3));
+
+        let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), true, false)
+            .expect("force_recreate valid");
+        assert_eq!(plan.changed, vec!["worker".to_string()]);
+        assert!(plan.scaled.is_empty());
+    }
+
+    #[test]
+    fn reload_plan_no_recreate_does_not_block_scale() {
+        // `--no-recreate` is about not recreating existing instances. Scaling
+        // only adds/drops tail replicas, so it should still apply.
+        let mut old = BTreeMap::new();
+        old.insert("worker".to_string(), fp("same_hash", 2));
+
+        let mut new = BTreeMap::new();
+        new.insert("worker".to_string(), fp("same_hash", 3));
+
+        let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, true)
+            .expect("no_recreate valid");
+        assert!(plan.changed.is_empty());
+        assert_eq!(plan.scaled.get("worker"), Some(&(2, 3)));
+    }
+
+    #[test]
+    fn reload_plan_replica_1_boundary_falls_back_to_changed() {
+        // 1 ↔ N transitions cross the replica-name boundary (`foo` vs `foo[1]`)
+        // and fall back to full recreate so we don't have to rename instances.
+        for (old_count, new_count) in [(1u16, 2u16), (2, 1), (1, 3), (3, 1)] {
+            let mut old = BTreeMap::new();
+            old.insert("worker".to_string(), fp("same_hash", old_count));
+            let mut new = BTreeMap::new();
+            new.insert("worker".to_string(), fp("same_hash", new_count));
+
+            let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, false)
+                .expect("valid transition");
+            assert_eq!(
+                plan.changed,
+                vec!["worker".to_string()],
+                "{old_count}→{new_count} should be changed (naming boundary)"
+            );
+            assert!(
+                plan.scaled.is_empty(),
+                "{old_count}→{new_count} should not be scaled"
+            );
+        }
     }
 
     #[test]
