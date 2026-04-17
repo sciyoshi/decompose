@@ -74,6 +74,7 @@ pub fn runtime_paths_for(instance: &str) -> Result<RuntimePaths> {
         socket: socket_root.join(format!("{instance}.sock")),
         pid: state_root.join(format!("{instance}.pid")),
         daemon_log: state_root.join(format!("{instance}.log")),
+        lock: state_root.join(format!("{instance}.lock")),
     })
 }
 

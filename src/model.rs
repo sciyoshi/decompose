@@ -196,6 +196,7 @@ pub struct RuntimePaths {
     pub socket: PathBuf,
     pub pid: PathBuf,
     pub daemon_log: PathBuf,
+    pub lock: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
