@@ -251,10 +251,10 @@ decompose --disable-dotenv up -d
 If `-f/--file` is omitted, decompose looks for the first matching file in the
 current directory:
 
-1. `compose.yml`
-2. `compose.yaml`
-3. `decompose.yml`
-4. `decompose.yaml`
+1. `decompose.yml`
+2. `decompose.yaml`
+3. `compose.yml`
+4. `compose.yaml`
 
 Multiple `-f` flags merge with overlay semantics -- later files override
 earlier ones.
@@ -537,10 +537,10 @@ Since decompose runs native processes instead of containers, these Docker Compos
 
 decompose auto-discovers config files in this order:
 
-1. `compose.yml` (same filename Docker Compose uses)
-2. `compose.yaml`
-3. `decompose.yml`
-4. `decompose.yaml`
+1. `decompose.yml`
+2. `decompose.yaml`
+3. `compose.yml` (same filename Docker Compose uses)
+4. `compose.yaml`
 
 You can keep your file named `compose.yml` and decompose will find it, or rename to `decompose.yml` to avoid ambiguity.
 

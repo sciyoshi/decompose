@@ -27,12 +27,12 @@ decompose attach                   # Reattach to daemon log stream
 
 - `decompose up` spawns a **background daemon** that manages all processes. The CLI is a thin client that talks to the daemon over a local Unix socket.
 - Each environment is identified by a hash of the config directory + files, or by `--session NAME`.
-- Config is discovered automatically: `compose.yml` > `compose.yaml` > `decompose.yml` > `decompose.yaml`. Use `-f FILE` to override (can be repeated for overlay merging).
+- Config is discovered automatically: `decompose.yml` > `decompose.yaml` > `compose.yml` > `compose.yaml`. Use `-f FILE` to override (can be repeated for overlay merging).
 - Output modes: `--json` (machine), `--table` (human), or auto-detect (TTY/CI/LLM -> table, pipe -> JSON).
 
 # When the user asks to start/debug their environment
 
-1. **Check if a compose file exists** in the working directory. Look for `compose.yml`, `compose.yaml`, `decompose.yml`, or `decompose.yaml`.
+1. **Check if a compose file exists** in the working directory. Look for `decompose.yml`, `decompose.yaml`, `compose.yml`, or `compose.yaml`.
 2. **Check if a daemon is already running**: `decompose ps --json`. If it returns `"running": true`, services are already up.
 3. **Start services**: `decompose up -d` for detached mode.
 4. **Check status**: `decompose ps` to verify everything is running.

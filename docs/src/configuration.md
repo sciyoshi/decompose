@@ -5,10 +5,10 @@
 When no `-f`/`--file` flags are given, `decompose` searches the current
 directory for the first file that exists, in this order:
 
-1. `compose.yml`
-2. `compose.yaml`
-3. `decompose.yml`
-4. `decompose.yaml`
+1. `decompose.yml`
+2. `decompose.yaml`
+3. `compose.yml`
+4. `compose.yaml`
 
 You can pass one or more `-f` flags to specify config files explicitly.
 Multiple files are merged with **overlay semantics** -- fields in later files

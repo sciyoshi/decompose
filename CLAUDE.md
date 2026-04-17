@@ -44,8 +44,8 @@ otherwise JSON).
 
 ## Configuration
 
-Config files are discovered in order: `compose.yml`, `compose.yaml`,
-`decompose.yml`, `decompose.yaml`. Multiple `-f` flags merge with overlay
+Config files are discovered in order: `decompose.yml`, `decompose.yaml`,
+`compose.yml`, `compose.yaml`. Multiple `-f` flags merge with overlay
 semantics (later files override earlier ones).
 
 ### YAML schema

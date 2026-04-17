@@ -502,10 +502,10 @@ pub fn resolve_config_paths(user_supplied: &[PathBuf], cwd: &Path) -> Result<Vec
 
 pub fn discover_config(cwd: &Path) -> Result<PathBuf> {
     const CANDIDATES: [&str; 4] = [
-        "compose.yml",
-        "compose.yaml",
         "decompose.yml",
         "decompose.yaml",
+        "compose.yml",
+        "compose.yaml",
     ];
     for name in CANDIDATES {
         let candidate = cwd.join(name);
@@ -513,7 +513,7 @@ pub fn discover_config(cwd: &Path) -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    bail!("no config file found (tried compose.yml, compose.yaml, decompose.yml, decompose.yaml)")
+    bail!("no config file found (tried decompose.yml, decompose.yaml, compose.yml, compose.yaml)")
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,12 +1228,12 @@ processes:
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         fs::write(
-            root.join("decompose.yaml"),
+            root.join("decompose.yml"),
             "processes: {a: {command: 'echo'}}",
         )
         .expect("write");
         fs::write(
-            root.join("compose.yaml"),
+            root.join("decompose.yaml"),
             "processes: {a: {command: 'echo'}}",
         )
         .expect("write");
@@ -1242,9 +1242,14 @@ processes:
             "processes: {a: {command: 'echo'}}",
         )
         .expect("write");
+        fs::write(
+            root.join("compose.yaml"),
+            "processes: {a: {command: 'echo'}}",
+        )
+        .expect("write");
 
         let chosen = discover_config(root).expect("discover");
-        assert_eq!(chosen, root.join("compose.yml"));
+        assert_eq!(chosen, root.join("decompose.yml"));
     }
 
     #[test]

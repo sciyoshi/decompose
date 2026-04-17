@@ -17,7 +17,7 @@ Quick start:
   decompose logs -f     Follow logs
   decompose down        Stop everything
 
-Config files: compose.yml, compose.yaml, decompose.yml, decompose.yaml
+Config files: decompose.yml, decompose.yaml, compose.yml, compose.yaml
 Docs: https://github.com/sciyoshi/decompose"
 )]
 pub struct Cli {
