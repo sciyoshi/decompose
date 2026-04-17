@@ -3885,3 +3885,302 @@ processes:
     );
     assert_success(&down, "down");
 }
+
+#[test]
+fn immediate_exit_process_reaches_exited_state() {
+    // Covers the edge case where a process exits before the supervisor has
+    // any chance to transition it past Pending/Running — the bookkeeping
+    // must still catch the exit and report `exited`/`failed` rather than
+    // leaving a zombie "running" row. `true` on PATH returns instantly on
+    // every POSIX system we target.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  quick_ok:
+    command: "true"
+  quick_fail:
+    command: "sh -c 'exit 7'"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up with immediate-exit processes");
+
+    // Poll briefly: by the time `up --detach` returns the daemon is up,
+    // but the supervisor tick may not have observed the exit yet.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (mut ok_state, mut fail_state, mut fail_code) = (String::new(), String::new(), None);
+    while std::time::Instant::now() < deadline {
+        let ps = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "ps", "--json"],
+            &[],
+            &[],
+        );
+        assert_success(&ps, "ps");
+        let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+        let processes = ps_json
+            .get("processes")
+            .and_then(Value::as_array)
+            .expect("processes array");
+        ok_state = processes
+            .iter()
+            .find(|p| p.get("name").and_then(Value::as_str) == Some("quick_ok"))
+            .and_then(|p| p.get("state").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        let fail_proc = processes
+            .iter()
+            .find(|p| p.get("name").and_then(Value::as_str) == Some("quick_fail"));
+        fail_state = fail_proc
+            .and_then(|p| p.get("state").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        fail_code = fail_proc.and_then(|p| p.get("exit_code").and_then(Value::as_i64));
+        if ok_state == "exited" && (fail_state == "failed" || fail_state == "exited") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    assert_eq!(
+        ok_state, "exited",
+        "quick_ok should reach terminal `exited` state"
+    );
+    assert!(
+        fail_state == "failed" || fail_state == "exited",
+        "quick_fail should reach a terminal state, got: {fail_state}"
+    );
+    assert_eq!(fail_code, Some(7), "quick_fail exit_code captured");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+fn concurrent_up_invocations_coexist() {
+    // Two `decompose up --detach` processes start simultaneously against
+    // the same project dir. The daemon's flock() and the CLI's
+    // Ping-then-spawn race guard should let both invocations return
+    // success — one spawns the daemon, the other reconnects to it. Neither
+    // may leave the daemon in a broken state.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  sleeper:
+    command: "sleep 30"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let spawn_up = || {
+        let mut cmd = Command::new(bin_path());
+        cmd.current_dir(&project)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_STATE_HOME", &state)
+            .env("HOME", &home)
+            .args(["--file", &cfg, "up", "--detach", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn().expect("spawn up")
+    };
+
+    let child_a = spawn_up();
+    let child_b = spawn_up();
+
+    let out_a = child_a.wait_with_output().expect("wait a");
+    let out_b = child_b.wait_with_output().expect("wait b");
+
+    assert_success(&out_a, "concurrent up A");
+    assert_success(&out_b, "concurrent up B");
+
+    // Both responses should agree on the daemon pid — there's only one.
+    let a_json: Value = serde_json::from_slice(&out_a.stdout).expect("a json");
+    let b_json: Value = serde_json::from_slice(&out_b.stdout).expect("b json");
+    let pid_a = a_json.get("pid").and_then(Value::as_u64);
+    let pid_b = b_json.get("pid").and_then(Value::as_u64);
+    assert!(pid_a.is_some(), "a must report a daemon pid");
+    assert_eq!(pid_a, pid_b, "both invocations must see the same daemon");
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "ps after concurrent up");
+    let ps_json: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let processes = ps_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("processes array");
+    assert_eq!(processes.len(), 1, "only one sleeper instance");
+    let state_str = processes[0]
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(state_str, "running", "sleeper should be running");
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
+#[ignore = "process-group handling not yet implemented — see bd issue"]
+fn shutdown_terminates_grandchild_processes() {
+    // A shell command that forks off a long-lived grandchild. On `down`
+    // the daemon should signal the whole process group so the grandchild
+    // dies with its parent — otherwise we leak a `sleep` for the caller
+    // to notice later.
+    //
+    // Currently the daemon sends SIGTERM to the direct child pid only, so
+    // backgrounded grandchildren are orphaned. This test is `#[ignore]`d
+    // until the daemon spawns children into their own process group (via
+    // `setsid`/`pre_exec`) and signals the group on shutdown. Runs with
+    // `cargo test -- --ignored` for local verification once fixed.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let pidfile = project.join("child.pid");
+    let readyfile = project.join("child.ready");
+    let cfg_path = project.join("decompose.yaml");
+    // Parent prints the grandchild's pid to a file, writes a ready marker,
+    // then waits. The grandchild is `sleep 60` so it outlives the test
+    // unless we actually signal the whole group.
+    let shell = format!(
+        "sh -c 'sleep 60 & echo $! > {pid}; touch {ready}; wait'",
+        pid = pidfile.display(),
+        ready = readyfile.display()
+    );
+    fs::write(
+        &cfg_path,
+        format!(
+            r#"
+processes:
+  forker:
+    command: {shell:?}
+"#
+        ),
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up forker");
+
+    // Wait until the parent has forked and the pidfile + ready marker
+    // exist — this is a deterministic signal, not a timing guess.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !readyfile.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        readyfile.exists(),
+        "child did not record its pid within the deadline"
+    );
+
+    let child_pid: i32 = fs::read_to_string(&pidfile)
+        .expect("read pid")
+        .trim()
+        .parse()
+        .expect("parse pid");
+
+    // Sanity: the grandchild is alive right now (kill -0 returns 0).
+    let alive_before = Command::new("kill")
+        .arg("-0")
+        .arg(child_pid.to_string())
+        .status()
+        .expect("kill -0");
+    assert!(
+        alive_before.success(),
+        "grandchild pid {child_pid} should be alive before down"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down forker");
+
+    // Give the kernel a moment to reap. Poll rather than sleep blindly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut still_alive = true;
+    while std::time::Instant::now() < deadline {
+        let status = Command::new("kill")
+            .arg("-0")
+            .arg(child_pid.to_string())
+            .status()
+            .expect("kill -0 after down");
+        if !status.success() {
+            still_alive = false;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    if still_alive {
+        // Best effort cleanup so the grandchild doesn't outlive the test
+        // binary even when we fail.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(child_pid.to_string())
+            .status();
+        panic!("grandchild pid {child_pid} survived `down` — process group was not signalled");
+    }
+}

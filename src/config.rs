@@ -1434,6 +1434,169 @@ processes:
     }
 
     #[test]
+    fn merge_three_layer_overlay_last_wins() {
+        // Three layers: base -> staging -> local. Each layer overrides part
+        // of the previous one. Locks in that env maps layer additively
+        // while simple scalars (command, working_dir) follow last-write-wins
+        // and probes/shutdown get replaced as a whole (overlay struct wins).
+        let base_yaml = r#"
+environment:
+  TIER: "base"
+  ONLY_BASE: "b"
+processes:
+  api:
+    command: "echo base"
+    working_dir: "/srv/base"
+    environment:
+      PORT: "3000"
+      FROM_BASE: "yes"
+    readiness_probe:
+      exec:
+        command: "check-base"
+      period_seconds: 5
+    shutdown:
+      signal: 15
+      timeout_seconds: 5
+"#;
+        let staging_yaml = r#"
+environment:
+  TIER: "staging"
+  ONLY_STAGING: "s"
+processes:
+  api:
+    command: "echo staging"
+    environment:
+      PORT: "4000"
+      FROM_STAGING: "yes"
+    shutdown:
+      signal: 2
+      timeout_seconds: 15
+"#;
+        let local_yaml = r#"
+environment:
+  TIER: "local"
+processes:
+  api:
+    command: "echo local"
+    environment:
+      PORT: "9000"
+    readiness_probe:
+      exec:
+        command: "check-local"
+      period_seconds: 2
+"#;
+
+        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let staging: ProjectConfig = serde_yaml_ng::from_str(staging_yaml).unwrap();
+        let local: ProjectConfig = serde_yaml_ng::from_str(local_yaml).unwrap();
+
+        let merged = merge_configs(merge_configs(base, staging), local);
+
+        // Global env: last-wins on conflicts, additive on distinct keys.
+        assert_eq!(merged.environment.0.get("TIER"), Some(&"local".to_string()));
+        assert_eq!(
+            merged.environment.0.get("ONLY_BASE"),
+            Some(&"b".to_string())
+        );
+        assert_eq!(
+            merged.environment.0.get("ONLY_STAGING"),
+            Some(&"s".to_string())
+        );
+
+        let api = merged.processes.get("api").unwrap();
+        // Scalars: last file wins.
+        assert_eq!(api.command, "echo local");
+        // working_dir only set in base, middle & last layer don't touch it.
+        assert_eq!(api.working_dir.as_deref(), Some(Path::new("/srv/base")));
+
+        // Process env: all three layers contribute.
+        assert_eq!(api.environment.0.get("PORT"), Some(&"9000".to_string()));
+        assert_eq!(api.environment.0.get("FROM_BASE"), Some(&"yes".to_string()));
+        assert_eq!(
+            api.environment.0.get("FROM_STAGING"),
+            Some(&"yes".to_string())
+        );
+
+        // Probe replaced by local (base's probe should be gone).
+        let probe = api.readiness_probe.as_ref().unwrap();
+        assert_eq!(probe.exec.as_ref().unwrap().command, "check-local");
+        assert_eq!(probe.period_seconds, 2);
+
+        // Shutdown only set in base+staging; staging wins since local left it
+        // untouched — demonstrates "intermediate layers stick" behavior.
+        let shutdown = api.shutdown.as_ref().unwrap();
+        assert_eq!(shutdown.signal, 2);
+        assert_eq!(shutdown.timeout_seconds, 15);
+    }
+
+    #[test]
+    fn merge_overlay_without_matching_process_is_noop() {
+        // Overlay referencing a new process adds it; overlay with *no*
+        // process section doesn't wipe the base processes. This used to
+        // catch a regression where an empty-processes overlay reset the
+        // map.
+        let base_yaml = r#"
+processes:
+  api:
+    command: "echo api"
+  worker:
+    command: "echo worker"
+"#;
+        let overlay_yaml = r#"
+environment:
+  EXTRA: "1"
+processes: {}
+"#;
+        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = merge_configs(base, overlay);
+
+        assert_eq!(merged.processes.len(), 2);
+        assert!(merged.processes.contains_key("api"));
+        assert!(merged.processes.contains_key("worker"));
+        assert_eq!(merged.environment.0.get("EXTRA"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn merge_preserves_base_fields_when_overlay_omits_them() {
+        // When overlay only tweaks command, the rest of the base process
+        // (description, env_file, depends_on, probe) should survive
+        // untouched. Prevents accidental "overlay resets to defaults".
+        let base_yaml = r#"
+processes:
+  db:
+    command: "echo db"
+  api:
+    command: "echo base"
+    description: "base description"
+    env_file: ["base.env"]
+    depends_on:
+      db:
+        condition: process_started
+    liveness_probe:
+      exec:
+        command: "ping"
+      period_seconds: 3
+"#;
+        let overlay_yaml = r#"
+processes:
+  api:
+    command: "echo overlay"
+"#;
+        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = merge_configs(base, overlay);
+
+        let api = merged.processes.get("api").unwrap();
+        assert_eq!(api.command, "echo overlay");
+        assert_eq!(api.description.as_deref(), Some("base description"));
+        assert_eq!(api.env_file, vec!["base.env"]);
+        assert!(api.depends_on.contains_key("db"));
+        let probe = api.liveness_probe.as_ref().unwrap();
+        assert_eq!(probe.exec.as_ref().unwrap().command, "ping");
+    }
+
+    #[test]
     fn filter_process_subset_with_deps() {
         let yaml = r#"
 processes:
@@ -1638,6 +1801,41 @@ processes:
         vars.insert("A".to_string(), "1".to_string());
         vars.insert("B".to_string(), "2".to_string());
         assert_eq!(interpolate_vars("$A and ${B}", &vars), "1 and 2");
+    }
+
+    #[test]
+    fn interpolate_double_dollar_then_var() {
+        // "$$VAR" should produce a literal "$" followed by the unexpanded
+        // text "VAR" — the "$$" escape consumes both dollar signs, so the
+        // remaining "VAR" is just plain text (no `$` prefix to kick off
+        // another substitution). Set VAR anyway to prove that.
+        let mut vars = BTreeMap::new();
+        vars.insert("VAR".to_string(), "world".to_string());
+        assert_eq!(interpolate_vars("$$VAR", &vars), "$VAR");
+        assert_eq!(interpolate_vars("a$$b", &vars), "a$b");
+        // Chaining: two escapes in a row still collapse independently.
+        assert_eq!(interpolate_vars("$$$$", &vars), "$$");
+    }
+
+    #[test]
+    fn interpolate_nested_default_is_not_recursive() {
+        // Nested `${A:-${B:-c}}` is NOT supported: the scanner grabs the
+        // first closing brace and treats everything up to it as the inner
+        // expression. The default portion is emitted verbatim — no second
+        // pass of interpolation over the fallback text. This test locks in
+        // that behavior so a future change is made consciously.
+        let mut vars = BTreeMap::new();
+        vars.insert("B".to_string(), "bee".to_string());
+        // A unset, B set: fallback is the raw literal "${B" (without the
+        // inner close) and the outer scanner then prints the trailing "}"
+        // as a plain character.
+        assert_eq!(interpolate_vars("${A:-${B:-c}}", &vars), "${B:-c}");
+        // A unset, simpler nested ${B}: fallback stays literal.
+        assert_eq!(interpolate_vars("${A:-${B}}", &vars), "${B}");
+        // A set: default branch never runs, so the nesting quirk is
+        // invisible and it behaves normally.
+        vars.insert("A".to_string(), "ay".to_string());
+        assert_eq!(interpolate_vars("${A:-${B}}", &vars), "ay}");
     }
 
     #[test]

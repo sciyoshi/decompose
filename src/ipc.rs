@@ -122,3 +122,77 @@ pub fn to_socket_name(path: &Path) -> Result<interprocess::local_socket::Name<'s
     utf.to_fs_name::<GenericFilePath>()
         .context("failed to create local socket name")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_rejects_plain_garbage() {
+        // The daemon feeds each line from the wire to `serde_json::from_str`
+        // and surfaces failures as `invalid request json`. A random
+        // non-JSON blob must not silently parse into one of the Request
+        // variants.
+        let err = serde_json::from_str::<Request>("not json at all").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("expected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn request_rejects_unknown_variant() {
+        // Adjacently-tagged enum with `#[serde(tag = "type")]`: a message
+        // with a known-looking shape but an unknown `type` tag must fail
+        // parsing rather than defaulting to Ping or similar.
+        let err = serde_json::from_str::<Request>(r#"{"type":"no_such_command"}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn request_rejects_missing_required_fields() {
+        // `Kill` has required `services` and `signal` fields. Dropping the
+        // signal must surface a parse error — not fall back to 0, which
+        // would silently send signal 0 (no-op) to every process.
+        let err = serde_json::from_str::<Request>(r#"{"type":"kill","services":[]}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("signal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn request_rejects_wrong_field_types() {
+        // `Down.timeout_seconds` is `Option<u64>`. Passing a negative
+        // number (or a string) must fail rather than coercing.
+        let err =
+            serde_json::from_str::<Request>(r#"{"type":"down","timeout_seconds":-5}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid") || msg.contains("out of range") || msg.contains("negative"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn request_round_trips_through_json() {
+        // Sanity: the wire encoding matches what the daemon reads. Helps
+        // catch accidental rename_all / tag drift.
+        let req = Request::Kill {
+            services: vec!["api".to_string()],
+            signal: 15,
+        };
+        let encoded = serde_json::to_string(&req).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        match decoded {
+            Request::Kill { services, signal } => {
+                assert_eq!(services, vec!["api".to_string()]);
+                assert_eq!(signal, 15);
+            }
+            other => panic!("wrong variant round-tripped: {other:?}"),
+        }
+    }
+}
