@@ -24,8 +24,8 @@ use crate::config::{load_and_merge_configs, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{
-    FooterInfo, OutputMode, glyph_for_health, glyph_for_state, print_footer, print_json,
-    style_for_status, styled, use_color,
+    FooterInfo, OutputMode, print_footer, print_json, style_for_status, styled, unified_state,
+    use_color,
 };
 use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
 
@@ -629,13 +629,27 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
             let color = use_color();
             let has_replicas = processes.iter().any(|p| p.replica > 1 || p.name != p.base);
 
-            // Build per-row PID display values.
+            // Build per-row display values.
             let pid_vals: Vec<String> = processes
                 .iter()
                 .map(|p| {
                     p.pid
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "-".to_string())
+                })
+                .collect();
+
+            // Build unified state strings for width calculation (glyph + space + label).
+            let state_labels: Vec<String> = processes
+                .iter()
+                .map(|p| {
+                    let (g, label, _) =
+                        unified_state(&p.state, p.has_readiness_probe, p.healthy, false);
+                    if label.is_empty() {
+                        g.to_string()
+                    } else {
+                        format!("{g} {label}")
+                    }
                 })
                 .collect();
 
@@ -646,20 +660,18 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 .max()
                 .unwrap_or(0)
                 .max("NAME".len());
-            let w_status = processes
+            let w_state = state_labels
                 .iter()
-                .map(|p| p.state.len())
+                .map(|s| s.len())
                 .max()
                 .unwrap_or(0)
-                .max("STATUS".len());
+                .max("STATE".len());
             let w_pid = pid_vals
                 .iter()
                 .map(|v| v.len())
                 .max()
                 .unwrap_or(0)
                 .max("PID".len());
-            let w_health = "HEALTH".len();
-            let w_glyph = 1;
 
             if has_replicas {
                 let w_base = processes
@@ -669,39 +681,43 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     .unwrap_or(0)
                     .max("BASE".len());
                 println!(
-                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}  {:<w_base$}",
-                    "", "NAME", "STATUS", "PID", "HEALTH", "BASE",
+                    "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {:<w_base$}",
+                    "NAME", "STATE", "PID", "BASE",
                 );
                 for (i, p) in processes.iter().enumerate() {
-                    let (glyph, glyph_style) = glyph_for_state(&p.state, color);
-                    let st = style_for_status(&p.state, color);
-                    let (hg, hs) = glyph_for_health(p.has_readiness_probe, p.healthy, color);
+                    let (glyph, label, st) =
+                        unified_state(&p.state, p.has_readiness_probe, p.healthy, color);
+                    let cell = if label.is_empty() {
+                        glyph.to_string()
+                    } else {
+                        format!("{glyph} {label}")
+                    };
                     println!(
-                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}  {:<w_base$}",
-                        styled(glyph, glyph_style),
+                        "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {:<w_base$}",
                         p.name,
-                        styled(&p.state, st),
+                        styled(&cell, st),
                         pid_vals[i],
-                        styled(hg, hs),
                         p.base,
                     );
                 }
             } else {
                 println!(
-                    "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}",
-                    "", "NAME", "STATUS", "PID", "HEALTH",
+                    "{:<w_name$}  {:<w_state$}  {:<w_pid$}",
+                    "NAME", "STATE", "PID",
                 );
                 for (i, p) in processes.iter().enumerate() {
-                    let (glyph, glyph_style) = glyph_for_state(&p.state, color);
-                    let st = style_for_status(&p.state, color);
-                    let (hg, hs) = glyph_for_health(p.has_readiness_probe, p.healthy, color);
+                    let (glyph, label, st) =
+                        unified_state(&p.state, p.has_readiness_probe, p.healthy, color);
+                    let cell = if label.is_empty() {
+                        glyph.to_string()
+                    } else {
+                        format!("{glyph} {label}")
+                    };
                     println!(
-                        "{:<w_glyph$}  {:<w_name$}  {:<w_status$}  {:<w_pid$}  {:<w_health$}",
-                        styled(glyph, glyph_style),
+                        "{:<w_name$}  {:<w_state$}  {:<w_pid$}",
                         p.name,
-                        styled(&p.state, st),
+                        styled(&cell, st),
                         pid_vals[i],
-                        styled(hg, hs),
                     );
                 }
             }
@@ -746,6 +762,7 @@ fn emit_detach(mode: OutputMode) {
 fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
     let _ = std::fs::remove_file(&paths.socket);
     let _ = std::fs::remove_file(&paths.pid);
+    let _ = std::fs::remove_file(&paths.lock);
 }
 
 /// Poll the daemon until all non-disabled processes are started (or healthy,

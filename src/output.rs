@@ -99,32 +99,33 @@ pub fn style_for_status(status: &str, color: bool) -> Style {
     maybe(s, color)
 }
 
-/// Single-char state glyph for a row, with the style it should be rendered in.
+/// Unified state glyph + label for the STATE column in `ps`.
 ///
-/// Used as a leading column in `ps` so each row has a quick visual indicator.
-pub fn glyph_for_state(state: &str, color: bool) -> (&'static str, Style) {
-    let (g, s) = match state {
-        "running" | "exited" => ("\u{2713}", GREEN), // ✓
-        "pending" | "starting" | "restarting" => ("\u{2026}", YELLOW), // …
-        "failed" | "failed_to_start" => ("\u{2717}", RED), // ✗
-        "stopped" | "disabled" | "not_started" => ("\u{2014}", DIM), // —
-        _ => ("\u{00b7}", Style::new()),             // ·
+/// Combines process status and health into a single scannable representation:
+/// - not_started / stopped / disabled / exited(0): `-` dim
+/// - pending / restarting: `◌` yellow
+/// - running + healthy (or no probe): `●` green
+/// - running + probe failing: `○` yellow
+/// - failed / failed_to_start: `✕` red
+pub fn unified_state(
+    state: &str,
+    has_readiness_probe: bool,
+    healthy: bool,
+    color: bool,
+) -> (&'static str, &'static str, Style) {
+    let (g, label, s) = match state {
+        "running" if !has_readiness_probe || healthy => ("\u{25cf}", "healthy", GREEN), // ●
+        "running" => ("\u{25cb}", "running", YELLOW),                                   // ○
+        "pending" => ("\u{25cc}", "pending", YELLOW),                                   // ◌
+        "restarting" => ("\u{25cc}", "restarting", YELLOW),                             // ◌
+        "failed" | "failed_to_start" => ("\u{2715}", "failed", RED),                    // ✕
+        "exited" => ("-", "exited", DIM),
+        "stopped" => ("-", "stopped", DIM),
+        "disabled" => ("-", "disabled", DIM),
+        "not_started" => ("-", "", DIM),
+        _ => ("-", "", Style::new()),
     };
-    (g, maybe(s, color))
-}
-
-/// Renders the HEALTH column as a glyph plus style, given (has_probe, healthy).
-///
-/// - has probe + healthy   → ✓ green
-/// - has probe + failing   → ✗ red
-/// - no probe configured   → — dim
-pub fn glyph_for_health(has_probe: bool, healthy: bool, color: bool) -> (&'static str, Style) {
-    let (g, s) = match (has_probe, healthy) {
-        (true, true) => ("\u{2713}", GREEN), // ✓
-        (true, false) => ("\u{2717}", RED),  // ✗
-        (false, _) => ("\u{2014}", DIM),     // —
-    };
-    (g, maybe(s, color))
+    (g, label, maybe(s, color))
 }
 
 /// A small wrapper so we can write colored strings via `format!` / `write!`.
@@ -296,32 +297,63 @@ mod tests {
     }
 
     #[test]
-    fn glyph_for_state_maps_correctly() {
-        assert_eq!(glyph_for_state("running", true), ("\u{2713}", GREEN));
-        assert_eq!(glyph_for_state("exited", true), ("\u{2713}", GREEN));
-        assert_eq!(glyph_for_state("pending", true), ("\u{2026}", YELLOW));
-        assert_eq!(glyph_for_state("starting", true), ("\u{2026}", YELLOW));
-        assert_eq!(glyph_for_state("failed", true), ("\u{2717}", RED));
-        assert_eq!(glyph_for_state("failed_to_start", true), ("\u{2717}", RED));
-        assert_eq!(glyph_for_state("stopped", true), ("\u{2014}", DIM));
-        assert_eq!(glyph_for_state("disabled", true), ("\u{2014}", DIM));
+    fn unified_state_maps_correctly() {
+        // running + no probe = healthy (green)
+        assert_eq!(
+            unified_state("running", false, false, true),
+            ("\u{25cf}", "healthy", GREEN)
+        );
+        // running + probe + healthy = healthy (green)
+        assert_eq!(
+            unified_state("running", true, true, true),
+            ("\u{25cf}", "healthy", GREEN)
+        );
+        // running + probe + not healthy = running (yellow)
+        assert_eq!(
+            unified_state("running", true, false, true),
+            ("\u{25cb}", "running", YELLOW)
+        );
+        // pending = yellow
+        assert_eq!(
+            unified_state("pending", false, false, true),
+            ("\u{25cc}", "pending", YELLOW)
+        );
+        // restarting = yellow
+        assert_eq!(
+            unified_state("restarting", false, false, true),
+            ("\u{25cc}", "restarting", YELLOW)
+        );
+        // failed = red
+        assert_eq!(
+            unified_state("failed", false, false, true),
+            ("\u{2715}", "failed", RED)
+        );
+        assert_eq!(
+            unified_state("failed_to_start", false, false, true),
+            ("\u{2715}", "failed", RED)
+        );
+        // stopped / disabled / not_started = dim
+        assert_eq!(
+            unified_state("stopped", false, false, true),
+            ("-", "stopped", DIM)
+        );
+        assert_eq!(
+            unified_state("disabled", false, false, true),
+            ("-", "disabled", DIM)
+        );
+        assert_eq!(
+            unified_state("not_started", false, false, true),
+            ("-", "", DIM)
+        );
+        // exited = dim
+        assert_eq!(
+            unified_state("exited", false, false, true),
+            ("-", "exited", DIM)
+        );
         // color=false strips ansi style
         assert_eq!(
-            glyph_for_state("running", false),
-            ("\u{2713}", Style::new())
-        );
-    }
-
-    #[test]
-    fn glyph_for_health_covers_all_cases() {
-        assert_eq!(glyph_for_health(true, true, true), ("\u{2713}", GREEN));
-        assert_eq!(glyph_for_health(true, false, true), ("\u{2717}", RED));
-        assert_eq!(glyph_for_health(false, false, true), ("\u{2014}", DIM));
-        assert_eq!(glyph_for_health(false, true, true), ("\u{2014}", DIM));
-        // color=false
-        assert_eq!(
-            glyph_for_health(true, true, false),
-            ("\u{2713}", Style::new())
+            unified_state("running", false, false, false),
+            ("\u{25cf}", "healthy", Style::new())
         );
     }
 
