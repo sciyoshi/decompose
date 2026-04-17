@@ -552,6 +552,8 @@ pub(crate) fn dependencies_met(
 }
 
 async fn start_process(name: String, state: SharedState) {
+    // Pull the spec for a pending process. Non-pending (or missing) entries
+    // are silent no-ops — callers may fire start_process opportunistically.
     let spec = {
         let mut guard = state.lock().await;
         let Some(runtime) = guard.processes.get_mut(&name) else {
@@ -563,51 +565,11 @@ async fn start_process(name: String, state: SharedState) {
         runtime.spec.clone()
     };
 
-    // Compile ready_log_line pattern
     let ready_pattern: Option<Regex> = spec.ready_log_line.as_deref().map(compile_ready_pattern);
 
-    let mut cmd = match build_shell_command(&spec.command).with_context(|| {
-        format!(
-            "[{name}] failed to build shell command for {:?}",
-            spec.command
-        )
-    }) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[{name}] {e:#}");
-            let mut guard = state.lock().await;
-            if let Some(runtime) = guard.processes.get_mut(&name) {
-                runtime.status = ProcessStatus::FailedToStart {
-                    reason: format!("{e:#}"),
-                };
-            }
-            return;
-        }
-    };
-    cmd.current_dir(&spec.working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .envs(&spec.environment);
-
-    let spawn_res = cmd.spawn().with_context(|| {
-        format!(
-            "[{name}] failed to spawn process (command={:?}, cwd={})",
-            spec.command,
-            spec.working_dir.display()
-        )
-    });
-    let mut child = match spawn_res {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[{name}] {e:#}");
-            let mut guard = state.lock().await;
-            if let Some(runtime) = guard.processes.get_mut(&name) {
-                runtime.status = ProcessStatus::FailedToStart {
-                    reason: format!("{e:#}"),
-                };
-            }
-            return;
-        }
+    let Some(mut child) = spawn_process_child(&name, &spec, &state, SpawnContext::Initial).await
+    else {
+        return;
     };
 
     let pid = child.id().unwrap_or(0);
@@ -619,186 +581,254 @@ async fn start_process(name: String, state: SharedState) {
         }
     }
 
-    // Spawn health check probes
-    spawn_probe_if_present(
-        spec.readiness_probe.as_ref(),
-        ProbeKind::Readiness,
-        &name,
-        &spec.working_dir,
-        &spec.environment,
-        &state,
-    );
-    spawn_probe_if_present(
-        spec.liveness_probe.as_ref(),
-        ProbeKind::Liveness,
-        &name,
-        &spec.working_dir,
-        &spec.environment,
-        &state,
-    );
-
+    spawn_health_probes(&name, &spec, &state);
     attach_output_readers(&mut child, &name, ready_pattern, state.clone());
 
-    let (kill_tx, mut kill_rx) = watch::channel(false);
+    let (kill_tx, kill_rx) = watch::channel(false);
     {
         let mut guard = state.lock().await;
         guard.controllers.insert(name.clone(), kill_tx);
     }
 
-    // Process lifecycle task: handles exit, restart, and shutdown
-    tokio::spawn({
-        let state = state.clone();
-        let name = name.clone();
-        async move {
-            loop {
-                let final_status = tokio::select! {
-                    _ = kill_rx.changed() => {
-                        if *kill_rx.borrow() {
-                            let timeout_override = {
-                                let guard = state.lock().await;
-                                guard.shutdown_timeout_override
-                            };
-                            shutdown_child(&mut child, &spec, timeout_override).await;
-                            ProcessStatus::Stopped
-                        } else {
-                            ProcessStatus::Stopped
-                        }
-                    }
-                    wait_res = child.wait() => {
-                        match wait_res {
-                            Ok(exit_status) => ProcessStatus::Exited {
-                                code: exit_status.code().unwrap_or(-1),
-                            },
-                            Err(e) => ProcessStatus::FailedToStart {
-                                reason: format!("wait failed: {e}"),
-                            },
-                        }
-                    }
-                };
+    tokio::spawn(process_lifecycle(name, spec, child, kill_rx, state.clone()));
+}
 
-                // Check if we should restart
-                let should_restart = {
-                    let mut guard = state.lock().await;
-                    if let Some(runtime) = guard.processes.get_mut(&name) {
-                        let do_restart = match (&final_status, runtime.spec.restart_policy) {
-                            (ProcessStatus::Stopped, _) => false,
-                            (_, RestartPolicy::No) => false,
-                            (ProcessStatus::Exited { code: 0 }, RestartPolicy::OnFailure) => false,
-                            (_, RestartPolicy::OnFailure) | (_, RestartPolicy::Always) => {
-                                match runtime.spec.max_restarts {
-                                    Some(max) => runtime.restart_count < max,
-                                    None => true,
-                                }
-                            }
-                        };
-                        if do_restart {
-                            runtime.status = ProcessStatus::Restarting;
-                            runtime.restart_count += 1;
-                            true
-                        } else {
-                            runtime.status = final_status;
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
+/// Identifies whether we're doing the initial spawn or a restart attempt,
+/// for shaping the error-context messages emitted on spawn failure.
+#[derive(Clone, Copy)]
+enum SpawnContext {
+    Initial,
+    Restart,
+}
 
-                if !should_restart {
-                    let mut guard = state.lock().await;
-                    guard.controllers.remove(&name);
-                    break;
-                }
+impl SpawnContext {
+    fn build_label(self) -> &'static str {
+        match self {
+            SpawnContext::Initial => "failed to build shell command",
+            SpawnContext::Restart => "failed to build shell command on restart",
+        }
+    }
 
-                // Backoff delay
-                let backoff = {
-                    let guard = state.lock().await;
-                    guard
-                        .processes
-                        .get(&name)
-                        .map(|r| r.spec.backoff_seconds)
-                        .unwrap_or(1)
-                };
-                sleep(Duration::from_secs(backoff)).await;
+    fn spawn_label(self) -> &'static str {
+        match self {
+            SpawnContext::Initial => "failed to spawn process",
+            SpawnContext::Restart => "failed to spawn process on restart",
+        }
+    }
+}
 
-                // Re-spawn
-                let spec = {
-                    let guard = state.lock().await;
-                    guard.processes.get(&name).map(|r| r.spec.clone())
-                };
-                let Some(spec) = spec else { break };
+/// Build a shell command from `spec`, apply the common stdio/env setup, and
+/// spawn the child. On failure, log the error, transition the process to
+/// `FailedToStart`, and return `None`. The `ctx` parameter only affects the
+/// phrasing of error messages (initial spawn vs. restart).
+async fn spawn_process_child(
+    name: &str,
+    spec: &crate::model::ProcessInstanceSpec,
+    state: &SharedState,
+    ctx: SpawnContext,
+) -> Option<tokio::process::Child> {
+    let mut cmd = match build_shell_command(&spec.command)
+        .with_context(|| format!("[{name}] {} for {:?}", ctx.build_label(), spec.command))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            mark_failed_to_start(name, state, &e).await;
+            return None;
+        }
+    };
+    cmd.current_dir(&spec.working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(&spec.environment);
 
-                let mut cmd = match build_shell_command(&spec.command).with_context(|| {
-                    format!(
-                        "[{name}] failed to build shell command on restart for {:?}",
-                        spec.command
-                    )
-                }) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("[{name}] {e:#}");
-                        let mut guard = state.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&name) {
-                            runtime.status = ProcessStatus::FailedToStart {
-                                reason: format!("{e:#}"),
-                            };
-                        }
-                        guard.controllers.remove(&name);
-                        break;
-                    }
-                };
-                cmd.current_dir(&spec.working_dir)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .envs(&spec.environment);
+    match cmd.spawn().with_context(|| {
+        format!(
+            "[{name}] {} (command={:?}, cwd={})",
+            ctx.spawn_label(),
+            spec.command,
+            spec.working_dir.display()
+        )
+    }) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            mark_failed_to_start(name, state, &e).await;
+            None
+        }
+    }
+}
 
-                match cmd.spawn().with_context(|| {
-                    format!(
-                        "[{name}] failed to spawn process on restart (command={:?}, cwd={})",
-                        spec.command,
-                        spec.working_dir.display()
-                    )
-                }) {
-                    Ok(new_child) => {
-                        child = new_child;
-                        let pid = child.id().unwrap_or(0);
-                        {
-                            let mut guard = state.lock().await;
-                            if let Some(runtime) = guard.processes.get_mut(&name) {
-                                runtime.status = ProcessStatus::Running { pid };
-                                runtime.log_ready = false;
-                                runtime.healthy = false;
-                            }
-                        }
+/// Log the (already-contextualised) spawn error and transition the process
+/// to `FailedToStart`. Does not remove the controller — the caller decides
+/// what cleanup is appropriate for its phase.
+async fn mark_failed_to_start(name: &str, state: &SharedState, err: &anyhow::Error) {
+    eprintln!("[{name}] {err:#}");
+    let mut guard = state.lock().await;
+    if let Some(runtime) = guard.processes.get_mut(name) {
+        runtime.status = ProcessStatus::FailedToStart {
+            reason: format!("{err:#}"),
+        };
+    }
+}
 
-                        // Re-attach stdout/stderr readers
-                        let ready_pattern: Option<Regex> =
-                            spec.ready_log_line.as_deref().map(compile_ready_pattern);
-                        attach_output_readers(&mut child, &name, ready_pattern, state.clone());
+/// Spawn readiness and liveness probe tasks if configured on the spec.
+fn spawn_health_probes(name: &str, spec: &crate::model::ProcessInstanceSpec, state: &SharedState) {
+    spawn_probe_if_present(
+        spec.readiness_probe.as_ref(),
+        ProbeKind::Readiness,
+        name,
+        &spec.working_dir,
+        &spec.environment,
+        state,
+    );
+    spawn_probe_if_present(
+        spec.liveness_probe.as_ref(),
+        ProbeKind::Liveness,
+        name,
+        &spec.working_dir,
+        &spec.environment,
+        state,
+    );
+}
 
-                        // Create new kill channel for this restart iteration
-                        let (new_kill_tx, new_kill_rx) = watch::channel(false);
-                        {
-                            let mut guard = state.lock().await;
-                            guard.controllers.insert(name.clone(), new_kill_tx);
-                        }
-                        kill_rx = new_kill_rx;
-                    }
-                    Err(e) => {
-                        eprintln!("[{name}] {e:#}");
-                        let mut guard = state.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&name) {
-                            runtime.status = ProcessStatus::FailedToStart {
-                                reason: format!("{e:#}"),
-                            };
-                        }
-                        guard.controllers.remove(&name);
-                        break;
-                    }
-                }
+/// Wait for either a kill signal or the child to exit, returning the
+/// resulting terminal [`ProcessStatus`]. On kill, this also runs the
+/// spec-driven shutdown sequence (command, signal, SIGKILL).
+async fn wait_for_child_exit(
+    name: &str,
+    spec: &crate::model::ProcessInstanceSpec,
+    child: &mut tokio::process::Child,
+    kill_rx: &mut watch::Receiver<bool>,
+    state: &SharedState,
+) -> ProcessStatus {
+    tokio::select! {
+        _ = kill_rx.changed() => {
+            let timeout_override = {
+                let guard = state.lock().await;
+                guard.shutdown_timeout_override
+            };
+            shutdown_child(child, spec, timeout_override).await;
+            let _ = name; // name retained for future logging hooks
+            ProcessStatus::Stopped
+        }
+        wait_res = child.wait() => {
+            match wait_res {
+                Ok(exit_status) => ProcessStatus::Exited {
+                    code: exit_status.code().unwrap_or(-1),
+                },
+                Err(e) => ProcessStatus::FailedToStart {
+                    reason: format!("wait failed: {e}"),
+                },
             }
         }
-    });
+    }
+}
+
+/// Given the terminal status of the most recent child instance, decide
+/// whether to restart and update the shared state accordingly. Returns
+/// `true` if the caller should respawn, or `false` if the lifecycle task
+/// should exit.
+async fn apply_restart_decision(
+    name: &str,
+    state: &SharedState,
+    final_status: ProcessStatus,
+) -> bool {
+    let mut guard = state.lock().await;
+    let Some(runtime) = guard.processes.get_mut(name) else {
+        return false;
+    };
+    let do_restart = match (&final_status, runtime.spec.restart_policy) {
+        (ProcessStatus::Stopped, _) => false,
+        (_, RestartPolicy::No) => false,
+        (ProcessStatus::Exited { code: 0 }, RestartPolicy::OnFailure) => false,
+        (_, RestartPolicy::OnFailure) | (_, RestartPolicy::Always) => {
+            match runtime.spec.max_restarts {
+                Some(max) => runtime.restart_count < max,
+                None => true,
+            }
+        }
+    };
+    if do_restart {
+        runtime.status = ProcessStatus::Restarting;
+        runtime.restart_count += 1;
+        true
+    } else {
+        runtime.status = final_status;
+        false
+    }
+}
+
+/// Main lifecycle loop for a running process: waits for exit, applies the
+/// restart policy, backs off, and re-spawns. Runs as its own task; exits
+/// when the process reaches a non-restarting terminal state.
+async fn process_lifecycle(
+    name: String,
+    mut spec: crate::model::ProcessInstanceSpec,
+    mut child: tokio::process::Child,
+    mut kill_rx: watch::Receiver<bool>,
+    state: SharedState,
+) {
+    loop {
+        let final_status =
+            wait_for_child_exit(&name, &spec, &mut child, &mut kill_rx, &state).await;
+
+        let should_restart = apply_restart_decision(&name, &state, final_status).await;
+        if !should_restart {
+            let mut guard = state.lock().await;
+            guard.controllers.remove(&name);
+            break;
+        }
+
+        // Backoff delay. Look up the current spec under the lock, since a
+        // reload could have swapped it out while we were waiting.
+        let backoff = {
+            let guard = state.lock().await;
+            guard
+                .processes
+                .get(&name)
+                .map(|r| r.spec.backoff_seconds)
+                .unwrap_or(1)
+        };
+        sleep(Duration::from_secs(backoff)).await;
+
+        // Pick up any new spec the reload may have installed.
+        let next_spec = {
+            let guard = state.lock().await;
+            guard.processes.get(&name).map(|r| r.spec.clone())
+        };
+        let Some(next_spec) = next_spec else { break };
+        spec = next_spec;
+
+        let Some(new_child) =
+            spawn_process_child(&name, &spec, &state, SpawnContext::Restart).await
+        else {
+            let mut guard = state.lock().await;
+            guard.controllers.remove(&name);
+            break;
+        };
+        child = new_child;
+        let pid = child.id().unwrap_or(0);
+        {
+            let mut guard = state.lock().await;
+            if let Some(runtime) = guard.processes.get_mut(&name) {
+                runtime.status = ProcessStatus::Running { pid };
+                runtime.log_ready = false;
+                runtime.healthy = false;
+            }
+        }
+
+        let ready_pattern: Option<Regex> =
+            spec.ready_log_line.as_deref().map(compile_ready_pattern);
+        attach_output_readers(&mut child, &name, ready_pattern, state.clone());
+
+        // Fresh kill channel for this restart iteration, replacing the one
+        // whose sender was dropped when `broadcast_stop` last fired.
+        let (new_kill_tx, new_kill_rx) = watch::channel(false);
+        {
+            let mut guard = state.lock().await;
+            guard.controllers.insert(name.clone(), new_kill_tx);
+        }
+        kill_rx = new_kill_rx;
+    }
 }
 
 /// Spawn tasks that read lines from the child's stdout and stderr pipes,

@@ -75,7 +75,6 @@ enum ServiceOp {
 async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     let output_mode = args.output.resolve();
     let attached = !args.detach;
-    let mut got_ctrl_c = false;
     let ctrl_c_task = if attached {
         Some(tokio::spawn(async {
             let _ = ctrl_c().await;
@@ -83,110 +82,25 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     } else {
         None
     };
-    let cwd = env::current_dir().context("failed to read current directory")?;
-    let config_files = resolve_config_paths(&global.config_files, &cwd)?;
-    let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
-    let instance = build_instance_id(global.session.as_deref(), &config_dir, &config_files);
-    let paths = runtime_paths_for(&instance)?;
-    let mut daemon_pid = None;
-    let mut state = "already_running";
 
-    if let Ok(Response::Pong { pid, .. }) = send_request(&paths, Request::Ping).await {
-        daemon_pid = Some(pid);
-        // Daemon is already running — first trigger a reload so any config
-        // edits made since `up` last ran are reconciled (added/changed/removed
-        // services). Orphan removal, force-/no-recreate, and no-start are
-        // folded into the reload request so the daemon handles them atomically
-        // inside the reconcile loop. On parse/validation failure, bail before
-        // touching Start.
-        let reload_resp = send_request(
-            &paths,
-            Request::Reload {
-                force_recreate: args.force_recreate,
-                no_recreate: args.no_recreate,
-                remove_orphans: args.remove_orphans,
-                no_start: args.no_start,
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to reload daemon config: {e}"))?;
-        let reload_message = expect_ack(reload_resp)?;
-        emit_message(output_mode, "ok", &reload_message);
+    let UpContext {
+        cwd,
+        config_files,
+        instance,
+        paths,
+    } = resolve_up_context(&global)?;
 
-        // Then send a Start request to incrementally bring up the requested
-        // services (or all services if none specified). Start is idempotent
-        // on already-running processes and picks up any newly-added ones
-        // that reload inserted as Pending. Skipped under --no-start: the
-        // user explicitly asked us to register-but-not-launch.
-        if !args.no_start {
-            let start_resp = send_request(
-                &paths,
-                Request::Start {
-                    services: args.processes.clone(),
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to start services on running daemon: {e}"))?;
-            let _ = expect_ack(start_resp)?;
-        }
-    } else {
-        // Clean up stale socket/pid from a previously killed daemon so the
-        // new daemon can bind the socket without interference.
-        cleanup_stale_files(&paths);
-
-        // Pre-flight: validate the merged config before spawning the daemon,
-        // so users see errors like dependency cycles directly instead of a
-        // generic "daemon did not become ready" timeout.
-        let preflight = load_and_merge_configs(&config_files)
-            .context("config validation failed before starting daemon")?;
-
-        // Validate requested process names exist in config.
-        if !args.processes.is_empty() {
-            let known: std::collections::HashSet<&str> =
-                preflight.processes.keys().map(|k| k.as_str()).collect();
-            let unknown: Vec<&str> = args
-                .processes
-                .iter()
-                .filter(|p| !known.contains(p.as_str()))
-                .map(|p| p.as_str())
-                .collect();
-            if !unknown.is_empty() {
-                bail!("unknown service(s): {}", unknown.join(", "));
-            }
-        }
-
-        spawn_daemon_process(
-            &cwd,
-            &config_files,
-            &instance,
-            &paths,
-            &global.env_files,
-            global.disable_dotenv,
-            &args.processes,
-            args.no_deps,
-        )?;
-        state = "started";
-
-        for _ in 0..80 {
-            if let Ok(Response::Pong { pid, .. }) = send_request(&paths, Request::Ping).await {
-                daemon_pid = Some(pid);
-                break;
-            }
-            if let Some(task) = ctrl_c_task.as_ref() {
-                if task.is_finished() {
-                    got_ctrl_c = true;
-                }
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    let Some(pid) = daemon_pid else {
-        bail!(
-            "daemon did not become ready; inspect {}",
-            paths.daemon_log.display()
-        );
-    };
+    let (pid, state, got_ctrl_c) = ensure_daemon_running(
+        &global,
+        &args,
+        &cwd,
+        &config_files,
+        &instance,
+        &paths,
+        output_mode,
+        ctrl_c_task.as_ref(),
+    )
+    .await?;
 
     // Orphan removal is folded into the Reload request on the already-running
     // branch. On the freshly-spawned daemon branch there are no orphans yet —
@@ -195,27 +109,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     // Request::RemoveOrphans variant is still used by other code paths.
 
     emit_up_status(output_mode, state, pid);
-
-    // Print footer block (table mode only).
-    if output_mode == OutputMode::Table {
-        if let Ok(Response::Ps { processes, .. }) = send_request(&paths, Request::Ps).await {
-            let service_count = {
-                let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                for p in &processes {
-                    bases.insert(&p.base);
-                }
-                bases.len()
-            };
-            let process_count = processes.len();
-            print_footer(&FooterInfo {
-                service_count,
-                process_count,
-                session_name: global.session.as_deref(),
-                socket_path: &paths.socket,
-                attached,
-            });
-        }
-    }
+    maybe_print_footer(output_mode, &paths, &global, attached).await;
 
     if !attached {
         if args.wait {
@@ -228,11 +122,200 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         return Ok(());
     }
 
+    stream_logs_until_ctrl_c(&paths, output_mode, state == "already_running", ctrl_c_task).await
+}
+
+/// Resolved paths + config inputs used across the `up` flow.
+struct UpContext {
+    cwd: PathBuf,
+    config_files: Vec<PathBuf>,
+    instance: String,
+    paths: crate::model::RuntimePaths,
+}
+
+fn resolve_up_context(global: &GlobalConfig) -> Result<UpContext> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let config_files = resolve_config_paths(&global.config_files, &cwd)?;
+    let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
+    let instance = build_instance_id(global.session.as_deref(), &config_dir, &config_files);
+    let paths = runtime_paths_for(&instance)?;
+    Ok(UpContext {
+        cwd,
+        config_files,
+        instance,
+        paths,
+    })
+}
+
+/// Ensure a daemon is running for this project: either reload/start against
+/// an existing daemon, or spawn a fresh one. Returns the daemon PID, the
+/// textual state ("started" or "already_running"), and a flag indicating
+/// whether the user hit Ctrl-C while we were waiting for the new daemon.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_daemon_running(
+    global: &GlobalConfig,
+    args: &UpArgs,
+    cwd: &std::path::Path,
+    config_files: &[PathBuf],
+    instance: &str,
+    paths: &crate::model::RuntimePaths,
+    output_mode: OutputMode,
+    ctrl_c_task: Option<&tokio::task::JoinHandle<()>>,
+) -> Result<(u32, &'static str, bool)> {
+    if let Ok(Response::Pong { pid, .. }) = send_request(paths, Request::Ping).await {
+        reload_and_start_existing_daemon(args, paths, output_mode).await?;
+        Ok((pid, "already_running", false))
+    } else {
+        // Clean up stale socket/pid from a previously killed daemon so the
+        // new daemon can bind the socket without interference.
+        cleanup_stale_files(paths);
+        preflight_validate_config(config_files, &args.processes)?;
+        spawn_daemon_process(
+            cwd,
+            config_files,
+            instance,
+            paths,
+            &global.env_files,
+            global.disable_dotenv,
+            &args.processes,
+            args.no_deps,
+        )?;
+        let (pid, got_ctrl_c) = wait_for_daemon_ready(paths, ctrl_c_task).await?;
+        Ok((pid, "started", got_ctrl_c))
+    }
+}
+
+/// Reload and (optionally) start services against an already-running daemon.
+/// On parse/validation failure the reload request errors out before the
+/// start call, so users see config errors directly.
+async fn reload_and_start_existing_daemon(
+    args: &UpArgs,
+    paths: &crate::model::RuntimePaths,
+    output_mode: OutputMode,
+) -> Result<()> {
+    let reload_resp = send_request(
+        paths,
+        Request::Reload {
+            force_recreate: args.force_recreate,
+            no_recreate: args.no_recreate,
+            remove_orphans: args.remove_orphans,
+            no_start: args.no_start,
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to reload daemon config: {e}"))?;
+    let reload_message = expect_ack(reload_resp)?;
+    emit_message(output_mode, "ok", &reload_message);
+
+    // Start is idempotent on already-running processes and picks up any
+    // newly-added ones that reload inserted as Pending. Skipped under
+    // --no-start: the user asked to register-but-not-launch.
+    if !args.no_start {
+        let start_resp = send_request(
+            paths,
+            Request::Start {
+                services: args.processes.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start services on running daemon: {e}"))?;
+        let _ = expect_ack(start_resp)?;
+    }
+    Ok(())
+}
+
+/// Validate the merged config and the requested service names before
+/// spawning the daemon, so users see structured errors (dependency cycles,
+/// unknown services) instead of a generic "daemon did not become ready"
+/// timeout.
+fn preflight_validate_config(config_files: &[PathBuf], processes: &[String]) -> Result<()> {
+    let preflight = load_and_merge_configs(config_files)
+        .context("config validation failed before starting daemon")?;
+    if processes.is_empty() {
+        return Ok(());
+    }
+    let known: std::collections::HashSet<&str> =
+        preflight.processes.keys().map(|k| k.as_str()).collect();
+    let unknown: Vec<&str> = processes
+        .iter()
+        .filter(|p| !known.contains(p.as_str()))
+        .map(|p| p.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        bail!("unknown service(s): {}", unknown.join(", "));
+    }
+    Ok(())
+}
+
+/// Poll the freshly-spawned daemon until it responds to Ping. Returns the
+/// PID and whether the Ctrl-C listener fired while we were waiting. Bails
+/// if the daemon never becomes ready within the poll budget.
+async fn wait_for_daemon_ready(
+    paths: &crate::model::RuntimePaths,
+    ctrl_c_task: Option<&tokio::task::JoinHandle<()>>,
+) -> Result<(u32, bool)> {
+    let mut got_ctrl_c = false;
+    for _ in 0..80 {
+        if let Ok(Response::Pong { pid, .. }) = send_request(paths, Request::Ping).await {
+            return Ok((pid, got_ctrl_c));
+        }
+        if let Some(task) = ctrl_c_task {
+            if task.is_finished() {
+                got_ctrl_c = true;
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    bail!(
+        "daemon did not become ready; inspect {}",
+        paths.daemon_log.display()
+    );
+}
+
+/// Print the table-mode footer describing service/process counts, session,
+/// and socket. Silently no-ops in JSON mode or if the daemon doesn't reply.
+async fn maybe_print_footer(
+    output_mode: OutputMode,
+    paths: &crate::model::RuntimePaths,
+    global: &GlobalConfig,
+    attached: bool,
+) {
+    if output_mode != OutputMode::Table {
+        return;
+    }
+    let Ok(Response::Ps { processes, .. }) = send_request(paths, Request::Ps).await else {
+        return;
+    };
+    let service_count = {
+        let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in &processes {
+            bases.insert(&p.base);
+        }
+        bases.len()
+    };
+    let process_count = processes.len();
+    print_footer(&FooterInfo {
+        service_count,
+        process_count,
+        session_name: global.session.as_deref(),
+        socket_path: &paths.socket,
+        attached,
+    });
+}
+
+/// Stream the daemon log until the Ctrl-C task fires, then stop the log
+/// streamer and emit the "detached" marker. Consumes `ctrl_c_task`.
+async fn stream_logs_until_ctrl_c(
+    paths: &crate::model::RuntimePaths,
+    output_mode: OutputMode,
+    start_at_end: bool,
+    ctrl_c_task: Option<tokio::task::JoinHandle<()>>,
+) -> Result<()> {
     let (log_stop_tx, log_stop_rx) = watch::channel(false);
     let log_handle = tokio::spawn(stream_daemon_logs(
         paths.daemon_log.clone(),
         log_stop_rx,
-        state == "already_running",
+        start_at_end,
     ));
     emit_attach(output_mode);
     if let Some(task) = ctrl_c_task {
