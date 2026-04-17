@@ -2058,8 +2058,8 @@ processes:
     readiness_probe:
       exec:
         command: "test -f {marker_str}"
-      period_seconds: 1
-      timeout_seconds: 2
+      period_seconds: 2
+      timeout_seconds: 1
       success_threshold: 1
       failure_threshold: 1
 "#
@@ -2169,8 +2169,8 @@ processes:
         host: "127.0.0.1"
         port: 18931
         path: "/"
-      period_seconds: 1
-      timeout_seconds: 2
+      period_seconds: 2
+      timeout_seconds: 1
       success_threshold: 1
       failure_threshold: 1
 "#,
@@ -2258,8 +2258,8 @@ processes:
     readiness_probe:
       exec:
         command: "test -f {marker_str}"
-      period_seconds: 1
-      timeout_seconds: 2
+      period_seconds: 2
+      timeout_seconds: 1
       success_threshold: 1
       failure_threshold: 1
   frontend:
@@ -2370,8 +2370,8 @@ processes:
     liveness_probe:
       exec:
         command: "false"
-      period_seconds: 1
-      timeout_seconds: 2
+      period_seconds: 2
+      timeout_seconds: 1
       failure_threshold: 2
       initial_delay_seconds: 1
 "#,
@@ -2451,8 +2451,8 @@ processes:
     readiness_probe:
       exec:
         command: "test -f {marker_str}"
-      period_seconds: 1
-      timeout_seconds: 2
+      period_seconds: 2
+      timeout_seconds: 1
       success_threshold: 1
       failure_threshold: 1
 "#

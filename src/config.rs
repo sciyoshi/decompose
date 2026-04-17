@@ -155,6 +155,15 @@ pub fn load_and_merge_configs(paths: &[PathBuf]) -> Result<ProjectConfig> {
     Ok(cfg)
 }
 
+/// Upper bound on `replicas` per process. Much higher than any sane local-dev
+/// workload; designed to catch typos (e.g. `replicas: 1000`) before they fork
+/// a thousand children.
+pub const MAX_REPLICAS: u16 = 100;
+
+/// Upper bound on `depends_on` DAG depth. Catches pathological configs where
+/// the supervisor would walk an absurdly deep chain on every tick.
+pub const MAX_DEPENDENCY_DEPTH: usize = 32;
+
 pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
     if cfg.processes.is_empty() {
         bail!("config has no processes");
@@ -166,6 +175,18 @@ pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
         }
         if proc_cfg.replicas == 0 {
             bail!("process `{name}` has replicas=0");
+        }
+        if proc_cfg.replicas > MAX_REPLICAS {
+            bail!(
+                "process `{name}` has replicas={}, which exceeds the limit of {MAX_REPLICAS}",
+                proc_cfg.replicas
+            );
+        }
+        if let Some(ref probe) = proc_cfg.readiness_probe {
+            validate_probe(name, "readiness_probe", probe)?;
+        }
+        if let Some(ref probe) = proc_cfg.liveness_probe {
+            validate_probe(name, "liveness_probe", probe)?;
         }
         for (dep, dep_cfg) in &proc_cfg.depends_on {
             if !cfg.processes.contains_key(dep) {
@@ -185,7 +206,73 @@ pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
     }
 
     detect_dependency_cycles(cfg)?;
+    check_dependency_depth(cfg)?;
 
+    Ok(())
+}
+
+/// Shared sanity checks for `readiness_probe` and `liveness_probe`.
+///
+/// Zero-valued periods/timeouts are nonsensical (the probe would fire every
+/// tick and never succeed). `timeout_seconds > period_seconds` means a probe
+/// could still be running when the next scheduling tick wants to start
+/// another — reject outright. `timeout == period` is allowed but warned
+/// because it leaves no slack for clock drift.
+fn validate_probe(process: &str, kind: &str, probe: &HealthProbe) -> Result<()> {
+    if probe.period_seconds == 0 {
+        bail!("process `{process}` {kind}.period_seconds must be > 0");
+    }
+    if probe.timeout_seconds == 0 {
+        bail!("process `{process}` {kind}.timeout_seconds must be > 0");
+    }
+    if probe.timeout_seconds > probe.period_seconds {
+        bail!(
+            "process `{process}` {kind}.timeout_seconds ({}) must be <= period_seconds ({})",
+            probe.timeout_seconds,
+            probe.period_seconds
+        );
+    }
+    if probe.timeout_seconds == probe.period_seconds {
+        eprintln!(
+            "warning: process `{process}` {kind}.timeout_seconds == period_seconds ({}) \
+             leaves no slack between probe attempts",
+            probe.timeout_seconds
+        );
+    }
+    if probe.success_threshold == 0 {
+        bail!("process `{process}` {kind}.success_threshold must be > 0");
+    }
+    if probe.failure_threshold == 0 {
+        bail!("process `{process}` {kind}.failure_threshold must be > 0");
+    }
+    Ok(())
+}
+
+/// Walk the dependency DAG and bail if any path exceeds [`MAX_DEPENDENCY_DEPTH`].
+/// Assumes cycle detection has already run — so recursion terminates.
+fn check_dependency_depth(cfg: &ProjectConfig) -> Result<()> {
+    fn walk(node: &str, cfg: &ProjectConfig, depth: usize, stack: &mut Vec<String>) -> Result<()> {
+        if depth > MAX_DEPENDENCY_DEPTH {
+            stack.push(node.to_string());
+            bail!(
+                "dependency depth exceeds limit of {MAX_DEPENDENCY_DEPTH}: {}",
+                stack.join(" -> ")
+            );
+        }
+        stack.push(node.to_string());
+        if let Some(proc) = cfg.processes.get(node) {
+            for dep in proc.depends_on.keys() {
+                walk(dep, cfg, depth + 1, stack)?;
+            }
+        }
+        stack.pop();
+        Ok(())
+    }
+
+    for start in cfg.processes.keys() {
+        let mut stack: Vec<String> = Vec::new();
+        walk(start, cfg, 0, &mut stack)?;
+    }
     Ok(())
 }
 
@@ -929,6 +1016,141 @@ processes:
 "#;
         let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         validate_config(&cfg).expect("dag should validate");
+    }
+
+    #[test]
+    fn validate_rejects_replicas_over_limit() {
+        let yaml = format!(
+            r#"
+processes:
+  a:
+    command: "echo hi"
+    replicas: {n}
+"#,
+            n = MAX_REPLICAS + 1
+        );
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(&yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject over-limit replicas");
+        assert!(
+            err.to_string().contains("exceeds the limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_replicas_at_limit() {
+        let yaml = format!(
+            r#"
+processes:
+  a:
+    command: "echo hi"
+    replicas: {n}
+"#,
+            n = MAX_REPLICAS
+        );
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(&yaml).expect("parse config");
+        validate_config(&cfg).expect("exactly at the limit is allowed");
+    }
+
+    #[test]
+    fn validate_rejects_zero_probe_period() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo"
+    readiness_probe:
+      exec:
+        command: "true"
+      period_seconds: 0
+      timeout_seconds: 1
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("zero period rejected");
+        assert!(
+            err.to_string().contains("period_seconds must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_probe_timeout_greater_than_period() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo"
+    liveness_probe:
+      exec:
+        command: "true"
+      period_seconds: 5
+      timeout_seconds: 10
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("timeout > period rejected");
+        assert!(
+            err.to_string().contains("must be <= period_seconds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_probe_with_sane_period_and_timeout() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo"
+    readiness_probe:
+      exec:
+        command: "true"
+      period_seconds: 10
+      timeout_seconds: 2
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
+        validate_config(&cfg).expect("sane probe accepted");
+    }
+
+    #[test]
+    fn validate_rejects_zero_probe_thresholds() {
+        let yaml = r#"
+processes:
+  a:
+    command: "echo"
+    readiness_probe:
+      exec:
+        command: "true"
+      period_seconds: 5
+      timeout_seconds: 1
+      success_threshold: 0
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("zero success threshold rejected");
+        assert!(
+            err.to_string().contains("success_threshold must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overly_deep_dependency_chain() {
+        // Build a linear chain p0 -> p1 -> ... -> p(MAX+2) so depth exceeds
+        // the limit. Every process depends on the next, no cycles.
+        let total = MAX_DEPENDENCY_DEPTH + 3;
+        let mut yaml = String::from("processes:\n");
+        for i in 0..total {
+            yaml.push_str(&format!("  p{i}:\n    command: \"echo\"\n"));
+            if i + 1 < total {
+                yaml.push_str("    depends_on:\n");
+                yaml.push_str(&format!(
+                    "      p{next}:\n        condition: process_started\n",
+                    next = i + 1
+                ));
+            }
+        }
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(&yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("deep chain rejected");
+        assert!(
+            err.to_string().contains("dependency depth exceeds limit"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

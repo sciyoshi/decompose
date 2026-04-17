@@ -463,7 +463,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
             break;
         }
 
-        sleep(Duration::from_millis(150)).await;
+        sleep(crate::tuning::supervisor_tick()).await;
     }
 }
 

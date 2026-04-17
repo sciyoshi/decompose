@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod model;
 pub mod output;
 pub mod paths;
+pub mod tuning;
 
 use std::env;
 use std::io::Write as _;
@@ -777,15 +778,17 @@ fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
 }
 
 /// Poll the daemon until all non-disabled processes are started (or healthy,
-/// if a readiness probe is configured).  Times out after 5 minutes.
+/// if a readiness probe is configured). Times out after
+/// [`tuning::daemon_ready_timeout`] (5 minutes by default; override with
+/// `DECOMPOSE_DAEMON_READY_TIMEOUT_MS`).
 async fn wait_for_services_ready(
     paths: &crate::model::RuntimePaths,
     output_mode: OutputMode,
 ) -> Result<()> {
-    const POLL_INTERVAL: Duration = Duration::from_millis(500);
-    const TIMEOUT: Duration = Duration::from_secs(300);
+    let poll_interval = crate::tuning::daemon_ready_poll();
+    let timeout = crate::tuning::daemon_ready_timeout();
 
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -829,7 +832,7 @@ async fn wait_for_services_ready(
             }
         }
 
-        sleep(POLL_INTERVAL).await;
+        sleep(poll_interval).await;
     }
 }
 
