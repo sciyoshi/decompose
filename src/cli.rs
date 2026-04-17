@@ -101,6 +101,15 @@ pub struct UpArgs {
     /// Remove processes not defined in the current config.
     #[arg(long = "remove-orphans")]
     pub remove_orphans: bool,
+    /// Recreate every process regardless of whether its config hash changed.
+    #[arg(long = "force-recreate", conflicts_with = "no_recreate")]
+    pub force_recreate: bool,
+    /// Keep existing processes even if their config hash differs.
+    #[arg(long = "no-recreate")]
+    pub no_recreate: bool,
+    /// Create/register new/changed processes but don't start them.
+    #[arg(long = "no-start")]
+    pub no_start: bool,
     /// Start only these processes (and their dependencies, unless --no-deps).
     pub processes: Vec<String>,
 }

@@ -95,8 +95,20 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         daemon_pid = Some(pid);
         // Daemon is already running — first trigger a reload so any config
         // edits made since `up` last ran are reconciled (added/changed/removed
-        // services). On parse/validation failure, bail before touching Start.
-        let reload_resp = send_request(&paths, Request::Reload).await;
+        // services). Orphan removal, force-/no-recreate, and no-start are
+        // folded into the reload request so the daemon handles them atomically
+        // inside the reconcile loop. On parse/validation failure, bail before
+        // touching Start.
+        let reload_resp = send_request(
+            &paths,
+            Request::Reload {
+                force_recreate: args.force_recreate,
+                no_recreate: args.no_recreate,
+                remove_orphans: args.remove_orphans,
+                no_start: args.no_start,
+            },
+        )
+        .await;
         match reload_resp {
             Ok(Response::Ack { message }) => {
                 emit_message(output_mode, "ok", &message);
@@ -109,19 +121,22 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         // Then send a Start request to incrementally bring up the requested
         // services (or all services if none specified). Start is idempotent
         // on already-running processes and picks up any newly-added ones
-        // that reload inserted as Pending.
-        let start_resp = send_request(
-            &paths,
-            Request::Start {
-                services: args.processes.clone(),
-            },
-        )
-        .await;
-        match start_resp {
-            Ok(Response::Ack { .. }) => {}
-            Ok(Response::Error { message }) => bail!("{message}"),
-            Err(e) => bail!("failed to start services on running daemon: {e}"),
-            _ => {}
+        // that reload inserted as Pending. Skipped under --no-start: the
+        // user explicitly asked us to register-but-not-launch.
+        if !args.no_start {
+            let start_resp = send_request(
+                &paths,
+                Request::Start {
+                    services: args.processes.clone(),
+                },
+            )
+            .await;
+            match start_resp {
+                Ok(Response::Ack { .. }) => {}
+                Ok(Response::Error { message }) => bail!("{message}"),
+                Err(e) => bail!("failed to start services on running daemon: {e}"),
+                _ => {}
+            }
         }
     } else {
         // Clean up stale socket/pid from a previously killed daemon so the
@@ -182,19 +197,11 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         );
     };
 
-    if args.remove_orphans {
-        let config = load_and_merge_configs(&config_files)
-            .context("failed to load config for orphan removal")?;
-        let keep: Vec<String> = config.processes.keys().cloned().collect();
-        match send_request(&paths, Request::RemoveOrphans { keep }).await {
-            Ok(Response::Ack { message }) if !message.contains("no orphan") => {
-                emit_message(output_mode, "ok", &message);
-            }
-            Ok(Response::Error { message }) => bail!("{message}"),
-            Err(e) => bail!("failed to remove orphans: {e}"),
-            _ => {}
-        }
-    }
+    // Orphan removal is folded into the Reload request on the already-running
+    // branch. On the freshly-spawned daemon branch there are no orphans yet —
+    // the daemon was just initialised from the current config — so a separate
+    // RemoveOrphans call here would be a no-op. The standalone
+    // Request::RemoveOrphans variant is still used by other code paths.
 
     emit_up_status(output_mode, state, pid);
 

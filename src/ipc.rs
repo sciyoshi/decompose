@@ -41,11 +41,21 @@ pub enum Request {
     },
     /// Re-read the daemon's config files from disk and reconcile running
     /// processes against the new definition. Stops and re-spawns services
-    /// whose `config_hash` has changed, spawns newly-added services, and
-    /// warns about services that have been removed from the config (orphans
-    /// are left running by default; `--remove-orphans` handling lands in a
-    /// follow-up bead).
-    Reload,
+    /// whose `config_hash` has changed, spawns newly-added services, and —
+    /// when `remove_orphans` is set — stops and drops services that have
+    /// been removed from the config. Without `remove_orphans`, removed
+    /// services are left running and logged as orphans. `force_recreate`
+    /// classifies every still-present service as `changed` regardless of
+    /// hash; `no_recreate` does the opposite, keeping hash-diverged
+    /// services untouched. `no_start` inserts new/changed process entries
+    /// but leaves them in `NotStarted` instead of `Pending` so the
+    /// supervisor won't auto-spawn them.
+    Reload {
+        force_recreate: bool,
+        no_recreate: bool,
+        remove_orphans: bool,
+        no_start: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

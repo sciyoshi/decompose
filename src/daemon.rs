@@ -1206,18 +1206,41 @@ pub(crate) struct ServiceFingerprint {
 /// is still referenced by a service that remains, returns an error describing
 /// the violation — the caller must abort without touching any running
 /// processes.
+///
+/// `force_recreate` promotes every service present in both snapshots to
+/// `changed` regardless of hash equality. `no_recreate` demotes every
+/// hash-diverged service to `unchanged` (the existing instances keep
+/// running). Added and removed services are unaffected by either flag.
+/// The caller is expected to enforce that the two flags are mutually
+/// exclusive; this function asserts it in debug builds.
 pub(crate) fn compute_reload_plan(
     old: &BTreeMap<String, ServiceFingerprint>,
     new: &BTreeMap<String, ServiceFingerprint>,
     deps: &BTreeMap<String, Vec<String>>,
+    force_recreate: bool,
+    no_recreate: bool,
 ) -> std::result::Result<ReloadPlan, String> {
+    debug_assert!(
+        !(force_recreate && no_recreate),
+        "force_recreate and no_recreate are mutually exclusive"
+    );
+
     let mut plan = ReloadPlan::default();
 
     for (name, new_fp) in new {
         match old.get(name) {
             None => plan.added.push(name.clone()),
             Some(old_fp) => {
-                if old_fp.config_hash != new_fp.config_hash || old_fp.replicas != new_fp.replicas {
+                let hash_differs =
+                    old_fp.config_hash != new_fp.config_hash || old_fp.replicas != new_fp.replicas;
+                let treat_as_changed = if force_recreate {
+                    true
+                } else if no_recreate {
+                    false
+                } else {
+                    hash_differs
+                };
+                if treat_as_changed {
                     plan.changed.push(name.clone());
                 } else {
                     plan.unchanged.push(name.clone());
@@ -1528,7 +1551,21 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             };
             Response::Ack { message: msg }
         }
-        Request::Reload => handle_reload(state.clone()).await,
+        Request::Reload {
+            force_recreate,
+            no_recreate,
+            remove_orphans,
+            no_start,
+        } => {
+            handle_reload(
+                state.clone(),
+                force_recreate,
+                no_recreate,
+                remove_orphans,
+                no_start,
+            )
+            .await
+        }
     };
 
     let payload = serde_json::to_string(&response)?;
@@ -1544,11 +1581,28 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
 /// On parse/validate failure: returns `Response::Error` and leaves running
 /// processes untouched. On a removed-but-still-depended-on violation: same.
 /// Otherwise: stops `changed` instances (they'll be respawned with the new
-/// spec by the supervisor), logs a warning about `removed` services (default
-/// behaviour matches Docker Compose: orphans stay running until the user
-/// asks to remove them), and inserts `added`/`changed` Pending entries so
-/// the supervisor loop launches them in dependency order.
-async fn handle_reload(state: SharedState) -> Response {
+/// spec by the supervisor), optionally stops+removes `removed` services
+/// when `remove_orphans` is true (otherwise they're left running with a
+/// warning, matching Docker Compose default behaviour), and inserts
+/// `added`/`changed` entries as `Pending` — or `NotStarted` when
+/// `no_start` is true — so the supervisor loop launches them in
+/// dependency order (or leaves them parked for a later `start`).
+async fn handle_reload(
+    state: SharedState,
+    force_recreate: bool,
+    no_recreate: bool,
+    remove_orphans: bool,
+    no_start: bool,
+) -> Response {
+    // Defence-in-depth: clap enforces this, but if a malformed IPC request
+    // slips through with both flags set, refuse rather than silently picking
+    // one interpretation.
+    if force_recreate && no_recreate {
+        return Response::Error {
+            message: "reload: --force-recreate and --no-recreate are mutually exclusive"
+                .to_string(),
+        };
+    }
     // Snapshot the daemon-launch args so we don't hold the state lock across
     // disk I/O.
     let (cwd, config_files, env_files, disable_dotenv) = {
@@ -1644,16 +1698,25 @@ async fn handle_reload(state: SharedState) -> Response {
 
     // 4. Diff. A removed-but-still-depended-on violation returns early with
     //    an error; nothing has been touched yet.
-    let plan = match compute_reload_plan(&old_fingerprints, &new_fingerprints, &new_deps) {
+    let plan = match compute_reload_plan(
+        &old_fingerprints,
+        &new_fingerprints,
+        &new_deps,
+        force_recreate,
+        no_recreate,
+    ) {
         Ok(p) => p,
         Err(msg) => return Response::Error { message: msg },
     };
 
     // 5. Execute the plan. We only touch running state past this point.
 
-    // 5a. Signal `changed` instances to stop. Their lifecycle tasks handle
-    //     the graceful shutdown per the existing `shutdown_timeout_seconds`
-    //     path reused by the `Stop` IPC.
+    // 5a. Collect the instance names whose lifecycle we're about to disrupt:
+    //     the `changed` set always, plus the `removed` set when the caller
+    //     asked us to clean orphans up. Both groups go through the same
+    //     stop-then-wait pattern so we can splice in replacements (or drop
+    //     the entries entirely, for removed orphans) without racing a
+    //     still-shutting-down child.
     let changed_instances: Vec<String> = {
         let guard = state.lock().await;
         guard
@@ -1664,25 +1727,51 @@ async fn handle_reload(state: SharedState) -> Response {
             .collect()
     };
 
-    if !changed_instances.is_empty() {
+    let removed_instances: Vec<String> = if remove_orphans {
         let guard = state.lock().await;
-        for name in &changed_instances {
+        guard
+            .processes
+            .iter()
+            .filter(|(_, r)| plan.removed.contains(&r.spec.base_name))
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let to_stop: Vec<String> = changed_instances
+        .iter()
+        .chain(removed_instances.iter())
+        .cloned()
+        .collect();
+
+    if !to_stop.is_empty() {
+        let mut guard = state.lock().await;
+        for name in &to_stop {
+            // Pending instances have no controller yet — transition them
+            // straight to a terminal state, matching the `Stop` IPC path.
+            if let Some(runtime) = guard.processes.get(name) {
+                if matches!(runtime.status, ProcessStatus::Pending) {
+                    guard.processes.get_mut(name).unwrap().status = ProcessStatus::Stopped;
+                    continue;
+                }
+            }
             if let Some(tx) = guard.controllers.get(name) {
                 let _ = tx.send(true);
             }
         }
     }
 
-    // 5b. Wait for the changed instances to reach a terminal state so the
+    // 5b. Wait for the stopped instances to reach a terminal state so the
     //     replacement spawn isn't racing a still-shutting-down child. Poll
     //     briefly; the per-process shutdown timeout applies inside each
     //     controller's lifecycle task, so the outer wait bound just needs to
     //     exceed the worst-case shutdown.
-    if !changed_instances.is_empty() {
+    if !to_stop.is_empty() {
         for _ in 0..1200 {
             let all_stopped = {
                 let guard = state.lock().await;
-                changed_instances.iter().all(|name| {
+                to_stop.iter().all(|name| {
                     guard
                         .processes
                         .get(name)
@@ -1697,12 +1786,18 @@ async fn handle_reload(state: SharedState) -> Response {
         }
     }
 
-    // 5c. Under the lock: drop old changed entries + controllers, splice in
-    //     new `added`/`changed` Pending entries from `new_process_map`. The
-    //     supervisor's tick will pick these up in dep order.
+    // 5c. Under the lock: drop old changed + orphaned entries and their
+    //     controllers, splice in new `added`/`changed` entries from
+    //     `new_process_map`. With `no_start`, park them in `NotStarted` so
+    //     the supervisor leaves them alone; otherwise they land as `Pending`
+    //     and the supervisor's next tick picks them up in dep order.
     let (n_added, n_changed, n_removed) = {
         let mut guard = state.lock().await;
         for name in &changed_instances {
+            guard.processes.remove(name);
+            guard.controllers.remove(name);
+        }
+        for name in &removed_instances {
             guard.processes.remove(name);
             guard.controllers.remove(name);
         }
@@ -1710,34 +1805,42 @@ async fn handle_reload(state: SharedState) -> Response {
         let mut new_instances_added = 0usize;
         let mut new_instances_changed = 0usize;
         for (instance_name, runtime) in &new_process_map {
-            if plan.added.contains(&runtime.spec.base_name) {
-                guard
-                    .processes
-                    .insert(instance_name.clone(), runtime.clone());
+            let is_added = plan.added.contains(&runtime.spec.base_name);
+            let is_changed = plan.changed.contains(&runtime.spec.base_name);
+            if !(is_added || is_changed) {
+                continue;
+            }
+            let mut runtime = runtime.clone();
+            if no_start && matches!(runtime.status, ProcessStatus::Pending) {
+                runtime.status = ProcessStatus::NotStarted;
+            }
+            guard.processes.insert(instance_name.clone(), runtime);
+            if is_added {
                 new_instances_added += 1;
-            } else if plan.changed.contains(&runtime.spec.base_name) {
-                guard
-                    .processes
-                    .insert(instance_name.clone(), runtime.clone());
+            } else {
                 new_instances_changed += 1;
             }
         }
-        (
-            new_instances_added,
-            new_instances_changed,
-            plan.removed.len(),
-        )
+        let removed_count = if remove_orphans {
+            removed_instances.len()
+        } else {
+            plan.removed.len()
+        };
+        (new_instances_added, new_instances_changed, removed_count)
     };
 
-    if !plan.removed.is_empty() {
+    if !plan.removed.is_empty() && !remove_orphans {
         eprintln!(
             "reload: orphan service(s) no longer in config (left running): [{}]",
             plan.removed.join(", ")
         );
     }
 
+    let removed_label = if remove_orphans { "removed" } else { "orphan" };
     Response::Ack {
-        message: format!("reloaded: +{n_added} added, {n_changed} changed, {n_removed} removed",),
+        message: format!(
+            "reloaded: +{n_added} added, {n_changed} changed, {n_removed} {removed_label}",
+        ),
     }
 }
 
@@ -1877,7 +1980,7 @@ mod tests {
         // "cache" absent from new -> removed
 
         let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let plan = compute_reload_plan(&old, &new, &deps).expect("no dep violations");
+        let plan = compute_reload_plan(&old, &new, &deps, false, false).expect("no dep violations");
 
         assert_eq!(plan.added, vec!["worker".to_string()]);
         assert_eq!(plan.removed, vec!["cache".to_string()]);
@@ -1893,7 +1996,8 @@ mod tests {
         let mut new = BTreeMap::new();
         new.insert("worker".to_string(), fp("same_hash", 3));
 
-        let plan = compute_reload_plan(&old, &new, &BTreeMap::new()).expect("no dep violations");
+        let plan = compute_reload_plan(&old, &new, &BTreeMap::new(), false, false)
+            .expect("no dep violations");
         assert_eq!(plan.changed, vec!["worker".to_string()]);
         assert!(plan.unchanged.is_empty());
     }
@@ -1912,7 +2016,7 @@ mod tests {
         let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
         deps.insert("api".to_string(), vec!["db".to_string()]);
 
-        let err = compute_reload_plan(&old, &new, &deps)
+        let err = compute_reload_plan(&old, &new, &deps, false, false)
             .expect_err("must reject removed-but-still-depended-on");
         assert!(err.contains("api"), "error mentions dependent: {err}");
         assert!(err.contains("db"), "error mentions removed dep: {err}");
@@ -1929,7 +2033,85 @@ mod tests {
 
         // api does not depend on legacy — removing legacy is fine.
         let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let plan = compute_reload_plan(&old, &new, &deps).expect("removal is allowed");
+        let plan =
+            compute_reload_plan(&old, &new, &deps, false, false).expect("removal is allowed");
         assert_eq!(plan.removed, vec!["legacy".to_string()]);
+    }
+
+    #[test]
+    fn reload_plan_force_recreate_promotes_unchanged_to_changed() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp("same_hash", 1));
+        old.insert("db".to_string(), fp("h_db", 1));
+
+        let mut new = BTreeMap::new();
+        // hash-equal in both — without force_recreate this would be unchanged.
+        new.insert("api".to_string(), fp("same_hash", 1));
+        new.insert("db".to_string(), fp("h_db", 1));
+
+        let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let plan = compute_reload_plan(&old, &new, &deps, true, false)
+            .expect("force_recreate is a valid option");
+
+        assert_eq!(
+            plan.changed,
+            vec!["api".to_string(), "db".to_string()],
+            "force_recreate promotes every still-present service to changed"
+        );
+        assert!(
+            plan.unchanged.is_empty(),
+            "force_recreate should leave nothing in unchanged"
+        );
+    }
+
+    #[test]
+    fn reload_plan_no_recreate_demotes_hash_diverged_to_unchanged() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp("h_api_v1", 1));
+        old.insert("db".to_string(), fp("h_db", 1));
+
+        let mut new = BTreeMap::new();
+        // api's hash differs — normally changed, but no_recreate keeps it.
+        new.insert("api".to_string(), fp("h_api_v2", 1));
+        new.insert("db".to_string(), fp("h_db", 1));
+        // newly-added service should still be added regardless of no_recreate.
+        new.insert("worker".to_string(), fp("h_worker", 1));
+
+        let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let plan = compute_reload_plan(&old, &new, &deps, false, true)
+            .expect("no_recreate is a valid option");
+
+        assert!(
+            plan.changed.is_empty(),
+            "no_recreate should keep every still-present service as unchanged"
+        );
+        assert_eq!(
+            plan.unchanged,
+            vec!["api".to_string(), "db".to_string()],
+            "hash-diverged api was demoted to unchanged"
+        );
+        assert_eq!(
+            plan.added,
+            vec!["worker".to_string()],
+            "added services aren't affected by no_recreate"
+        );
+    }
+
+    #[test]
+    fn reload_plan_default_flags_preserve_existing_behavior() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp("h_api_v1", 1));
+        old.insert("db".to_string(), fp("h_db", 1));
+
+        let mut new = BTreeMap::new();
+        new.insert("api".to_string(), fp("h_api_v2", 1));
+        new.insert("db".to_string(), fp("h_db", 1));
+
+        let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let plan =
+            compute_reload_plan(&old, &new, &deps, false, false).expect("default flags are valid");
+
+        assert_eq!(plan.changed, vec!["api".to_string()]);
+        assert_eq!(plan.unchanged, vec!["db".to_string()]);
     }
 }
