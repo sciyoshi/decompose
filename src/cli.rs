@@ -205,4 +205,10 @@ pub struct DaemonArgs {
     pub processes: Vec<String>,
     #[arg(long = "no-deps")]
     pub no_deps: bool,
+    /// PID to watch for orphan detection. When the PID exits and no IPC
+    /// client has talked to the daemon for the configured grace period,
+    /// the daemon self-terminates. Omitted in detached mode so the daemon
+    /// survives its launching process by design.
+    #[arg(long = "parent-pid")]
+    pub parent_pid: Option<u32>,
 }

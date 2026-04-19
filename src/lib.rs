@@ -267,6 +267,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         &paths,
         output_mode,
         ctrl_c_task.as_ref(),
+        attached,
     )
     .await?;
 
@@ -329,6 +330,7 @@ async fn ensure_daemon_running(
     paths: &crate::model::RuntimePaths,
     output_mode: OutputMode,
     ctrl_c_task: Option<&tokio::task::JoinHandle<()>>,
+    attached: bool,
 ) -> Result<(u32, &'static str, bool)> {
     if let Ok(Response::Pong { pid, .. }) = send_request(paths, Request::Ping).await {
         reload_and_start_existing_daemon(args, paths, output_mode).await?;
@@ -338,6 +340,15 @@ async fn ensure_daemon_running(
         // new daemon can bind the socket without interference.
         cleanup_stale_files(paths);
         preflight_validate_config(config_files, &args.processes)?;
+        // Attached `up` stays tethered to its daemon: if the user Ctrl-C's
+        // out or the terminal is closed, the daemon should auto-exit rather
+        // than leak. Detached `up -d` explicitly opts into a daemon that
+        // outlives its launcher, so we pass `None` there.
+        let parent_pid = if attached {
+            Some(std::process::id())
+        } else {
+            None
+        };
         spawn_daemon_process(
             cwd,
             config_files,
@@ -347,6 +358,7 @@ async fn ensure_daemon_running(
             global.disable_dotenv,
             &args.processes,
             args.no_deps,
+            parent_pid,
         )?;
         let (pid, got_ctrl_c) = wait_for_daemon_ready(paths, ctrl_c_task).await?;
         Ok((pid, "started", got_ctrl_c))

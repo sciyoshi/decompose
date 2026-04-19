@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use interprocess::local_socket::ListenerOptions;
@@ -126,6 +126,11 @@ struct DaemonState {
     config_files: Vec<std::path::PathBuf>,
     env_files: Vec<std::path::PathBuf>,
     disable_dotenv: bool,
+    /// Timestamp of the most recent IPC request. The orphan watchdog uses
+    /// this to decide whether the daemon still has active clients talking to
+    /// it after its parent process exits. Seeded at daemon start, then
+    /// updated at the top of every `handle_client` call.
+    last_client_activity: Instant,
 }
 
 impl DaemonState {
@@ -239,6 +244,7 @@ pub fn spawn_daemon_process(
     disable_dotenv: bool,
     processes: &[String],
     no_deps: bool,
+    parent_pid: Option<u32>,
 ) -> Result<()> {
     let exe = env::current_exe().context("failed to locate current executable")?;
     if let Some(parent) = paths.daemon_log.parent() {
@@ -282,6 +288,10 @@ pub fn spawn_daemon_process(
 
     if no_deps {
         cmd.arg("--no-deps");
+    }
+
+    if let Some(pid) = parent_pid {
+        cmd.arg("--parent-pid").arg(pid.to_string());
     }
 
     cmd.stdin(Stdio::null())
@@ -385,10 +395,19 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         config_files: args.config_files.clone(),
         env_files: args.env_files.clone(),
         disable_dotenv: args.disable_dotenv,
+        last_client_activity: Instant::now(),
     }));
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
     tokio::spawn(supervisor_loop(state.clone(), stop_tx));
+
+    // Orphan watchdog: when the launching process goes away without calling
+    // `down`, auto-exit after a grace period of no IPC activity. Inert when
+    // no parent PID was passed (i.e. `up -d`, where the daemon is intended
+    // to survive its caller).
+    if let Some(parent_pid) = args.parent_pid {
+        tokio::spawn(orphan_watchdog(state.clone(), parent_pid));
+    }
 
     loop {
         tokio::select! {
@@ -512,6 +531,77 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
         }
 
         sleep(crate::tuning::supervisor_tick()).await;
+    }
+}
+
+/// Return `true` if the given PID is still alive (or we can't tell).
+/// On Unix, uses `kill(pid, 0)`: returns `Ok` if the process exists or we
+/// lack permission to signal it (still alive), and `ESRCH` if the PID is
+/// unused. PID 0 and 1 are treated as "alive" (PID 1 is init/launchd, which
+/// `getppid()` returns on macOS after the real parent exits — we detect
+/// orphan state via the caller-supplied PID, not `getppid`).
+#[cfg(unix)]
+fn parent_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        // EPERM means the process exists but we can't signal it.
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn parent_alive(_pid: u32) -> bool {
+    // Best-effort: on non-Unix platforms we skip the check entirely.
+    true
+}
+
+/// Periodically check whether the caller that launched this daemon is still
+/// alive. Once the parent PID is gone AND no IPC client has spoken to us in
+/// the configured grace period, initiate a graceful shutdown. The grace
+/// period lets transient tools (`ps`, `logs`, `start`) keep a daemon alive
+/// even after the original terminal disappeared — only a truly abandoned
+/// daemon self-exits.
+async fn orphan_watchdog(state: SharedState, parent_pid: u32) {
+    let tick = crate::tuning::orphan_check_interval();
+    let grace = crate::tuning::orphan_timeout();
+    loop {
+        sleep(tick).await;
+
+        {
+            let guard = state.lock().await;
+            if guard.shutdown_requested {
+                return;
+            }
+        }
+
+        if parent_alive(parent_pid) {
+            continue;
+        }
+
+        // Parent is gone. Check whether any client has been in touch
+        // recently; if so, defer.
+        let should_exit = {
+            let guard = state.lock().await;
+            guard.last_client_activity.elapsed() >= grace
+        };
+
+        if should_exit {
+            eprintln!(
+                "daemon: parent pid {parent_pid} is gone and no IPC activity for \
+                 {}s; initiating shutdown",
+                grace.as_secs()
+            );
+            let mut guard = state.lock().await;
+            guard.request_shutdown();
+            return;
+        }
     }
 }
 
@@ -1439,6 +1529,15 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
     }
 
     let req: Request = serde_json::from_str(line.trim()).context("invalid request json")?;
+
+    // Refresh the orphan-watchdog activity clock on every request (not on
+    // connection accept), so long-lived connections that drip-feed requests
+    // also keep the daemon alive.
+    {
+        let mut guard = state.lock().await;
+        guard.last_client_activity = Instant::now();
+    }
+
     let response = match req {
         Request::Ping => {
             let guard = state.lock().await;

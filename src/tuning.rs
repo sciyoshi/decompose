@@ -19,6 +19,8 @@
 //! | `DECOMPOSE_DAEMON_READY_POLL_MS`     |     500 | Poll interval while waiting for daemon startup                     |
 //! | `DECOMPOSE_IPC_TIMEOUT_MS`           |    5000 | Per-request IPC round-trip timeout                                 |
 //! | `DECOMPOSE_SUPERVISOR_TICK_MS`       |     150 | Supervisor loop tick interval inside the daemon                    |
+//! | `DECOMPOSE_ORPHAN_TIMEOUT`           |      30 | Grace period (seconds) after parent death before auto-exit         |
+//! | `DECOMPOSE_ORPHAN_CHECK_MS`          |    1000 | Orphan watchdog tick interval inside the daemon                    |
 
 use std::time::Duration;
 
@@ -26,11 +28,15 @@ pub const ENV_DAEMON_READY_TIMEOUT_MS: &str = "DECOMPOSE_DAEMON_READY_TIMEOUT_MS
 pub const ENV_DAEMON_READY_POLL_MS: &str = "DECOMPOSE_DAEMON_READY_POLL_MS";
 pub const ENV_IPC_TIMEOUT_MS: &str = "DECOMPOSE_IPC_TIMEOUT_MS";
 pub const ENV_SUPERVISOR_TICK_MS: &str = "DECOMPOSE_SUPERVISOR_TICK_MS";
+pub const ENV_ORPHAN_TIMEOUT_SECS: &str = "DECOMPOSE_ORPHAN_TIMEOUT";
+pub const ENV_ORPHAN_CHECK_MS: &str = "DECOMPOSE_ORPHAN_CHECK_MS";
 
 pub const DEFAULT_DAEMON_READY_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_DAEMON_READY_POLL_MS: u64 = 500;
 pub const DEFAULT_IPC_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_SUPERVISOR_TICK_MS: u64 = 150;
+pub const DEFAULT_ORPHAN_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_ORPHAN_CHECK_MS: u64 = 1_000;
 
 /// Read a `u64` millisecond value from the given env var, falling back to
 /// `default_ms` if the var is unset. Malformed or zero values are logged to
@@ -76,6 +82,19 @@ pub fn ipc_timeout() -> Duration {
 
 pub fn supervisor_tick() -> Duration {
     duration_ms_from_env(ENV_SUPERVISOR_TICK_MS, DEFAULT_SUPERVISOR_TICK_MS)
+}
+
+/// Grace period between parent-death detection and daemon auto-exit, during
+/// which any IPC client activity resets the clock. Specified in seconds to
+/// match user expectations (`DECOMPOSE_ORPHAN_TIMEOUT=5`).
+pub fn orphan_timeout() -> Duration {
+    let secs = millis_from_env(ENV_ORPHAN_TIMEOUT_SECS, DEFAULT_ORPHAN_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// How often the orphan watchdog polls the parent PID.
+pub fn orphan_check_interval() -> Duration {
+    duration_ms_from_env(ENV_ORPHAN_CHECK_MS, DEFAULT_ORPHAN_CHECK_MS)
 }
 
 #[cfg(test)]

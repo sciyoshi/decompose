@@ -4839,3 +4839,283 @@ fn run_workdir_override() {
         "pwd should be {alt_str}, got {trimmed}"
     );
 }
+
+/// Check whether the daemon is currently responsive via a `ps` IPC
+/// round-trip. The CLI's `ps` returns exit 0 either way — `{"running":
+/// false, "processes": []}` when no daemon answers, a plain
+/// `{"processes":[...]}` when one does — so we distinguish by payload.
+fn is_daemon_live_ipc(
+    project: &Path,
+    runtime: &Path,
+    state: &Path,
+    home: &Path,
+    cfg: &str,
+) -> bool {
+    let out = run_cmd(
+        project,
+        runtime,
+        state,
+        home,
+        &["--file", cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    if !out.status.success() {
+        return false;
+    }
+    let parsed: Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match parsed.get("running") {
+        Some(Value::Bool(b)) => *b,
+        _ => parsed.get("processes").is_some(),
+    }
+}
+
+/// Observe daemon liveness without generating IPC traffic. Every IPC
+/// request resets the orphan-watchdog clock, so the auto-exit tests need a
+/// zero-touch probe — we read the PID file the daemon writes at startup
+/// and send `kill(pid, 0)` to check whether the process is still alive.
+/// Returns `true` if the PID file exists and the referenced process is
+/// running.
+fn is_daemon_live_no_ipc(state: &Path) -> bool {
+    // We don't know the instance hash here, so scan the state dir for any
+    // `*.pid` file the daemon may have written under this test's
+    // XDG_STATE_HOME.
+    let state_dir = state.join("decompose");
+    let Ok(entries) = fs::read_dir(&state_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            continue;
+        };
+        // `kill -0` on Unix: exit 0 = alive (or permission denied),
+        // non-zero = ESRCH or similar. We want "alive".
+        let status = Command::new("kill").arg("-0").arg(pid.to_string()).status();
+        if let Ok(s) = status
+            && s.success()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Poll the IPC probe until the daemon becomes responsive or the deadline
+/// expires. Returns whether the daemon was reachable in time.
+fn wait_for_daemon_up_ipc(
+    project: &Path,
+    runtime: &Path,
+    state: &Path,
+    home: &Path,
+    cfg: &str,
+    deadline: Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if is_daemon_live_ipc(project, runtime, state, home, cfg) {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Poll the non-IPC liveness probe (PID file + `kill -0`) until the
+/// daemon exits or the deadline expires. Does NOT issue IPC requests, so
+/// it won't falsely bump the orphan-watchdog clock.
+fn wait_for_daemon_exit_no_ipc(state: &Path, deadline: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if !is_daemon_live_no_ipc(state) {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn detached_up_daemon_survives_without_parent_pid() {
+    // `up -d` should not set up orphan-watchdog — the daemon is meant to
+    // outlive the launching process. We verify that even with an
+    // aggressively-short DECOMPOSE_ORPHAN_TIMEOUT, the daemon sticks around
+    // after the `up` invocation that started it has already exited.
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[("DECOMPOSE_ORPHAN_TIMEOUT", "2")],
+        &[],
+    );
+    assert_success(&up, "up --detach");
+
+    // Wait well past the grace period. A misconfigured detached daemon
+    // would auto-exit here.
+    thread::sleep(Duration::from_secs(5));
+
+    assert!(
+        is_daemon_live_no_ipc(&state),
+        "detached daemon must survive after orphan-timeout window (parent_pid should be unset)",
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down detached");
+}
+
+#[test]
+fn attached_up_killed_triggers_daemon_auto_exit() {
+    // Attached `up` (no --detach) launches the daemon with --parent-pid.
+    // If we SIGKILL the `up` parent (so it can't call down), the daemon
+    // should observe the orphaned state and self-exit after the grace
+    // period elapses with no IPC activity.
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let mut up = Command::new(bin_path());
+    up.current_dir(&project)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("HOME", &home)
+        .env("DECOMPOSE_ORPHAN_TIMEOUT", "2")
+        .arg("--file")
+        .arg(&cfg)
+        .arg("up")
+        .arg("--table")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = up.spawn().expect("spawn attached up");
+
+    // Give the daemon a chance to come up.
+    assert!(
+        wait_for_daemon_up_ipc(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &cfg,
+            Duration::from_secs(10),
+        ),
+        "daemon never became responsive",
+    );
+
+    // SIGKILL the attached `up` so it can't call down. The `up` process is
+    // the declared parent-pid; once it's gone, no further IPC requests
+    // should arrive, and the watchdog should trip. Note: from here on we
+    // must NOT issue IPC against the daemon, because every request resets
+    // the orphan activity clock and defeats the test.
+    let kill_status = Command::new("kill")
+        .arg("-KILL")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send sigkill");
+    assert!(kill_status.success(), "failed to SIGKILL up");
+    let _ = child.wait();
+
+    // Grace is 2s, watchdog tick is 1s. Allow generous slack.
+    let exited = wait_for_daemon_exit_no_ipc(&state, Duration::from_secs(15));
+    assert!(
+        exited,
+        "daemon should self-exit after orphan grace period elapsed",
+    );
+}
+
+#[test]
+fn client_activity_keeps_orphaned_daemon_alive() {
+    // An orphaned daemon (parent dead) should remain alive as long as IPC
+    // clients keep talking to it. Once activity stops, it exits after the
+    // grace period.
+    let (_root, project, runtime, state, config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg = config.to_string_lossy().to_string();
+
+    let mut up = Command::new(bin_path());
+    up.current_dir(&project)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("HOME", &home)
+        // Use a slightly longer grace than test B so polling slop doesn't
+        // race against the watchdog.
+        .env("DECOMPOSE_ORPHAN_TIMEOUT", "3")
+        .arg("--file")
+        .arg(&cfg)
+        .arg("up")
+        .arg("--table")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = up.spawn().expect("spawn attached up");
+
+    assert!(
+        wait_for_daemon_up_ipc(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &cfg,
+            Duration::from_secs(10),
+        ),
+        "daemon never became responsive",
+    );
+
+    // Kill the launching `up` so the daemon is orphaned.
+    let kill_status = Command::new("kill")
+        .arg("-KILL")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send sigkill");
+    assert!(kill_status.success(), "failed to SIGKILL up");
+    let _ = child.wait();
+
+    // For ~8 seconds (well past the 3s grace), keep hitting the daemon at
+    // 500ms intervals. Each request should reset the activity clock, so
+    // the daemon must still be alive at the end. We use the IPC probe
+    // here deliberately — the whole point is that IPC activity keeps the
+    // daemon alive.
+    let hold_start = std::time::Instant::now();
+    while hold_start.elapsed() < Duration::from_secs(8) {
+        assert!(
+            is_daemon_live_ipc(&project, &runtime, &state, &home, &cfg),
+            "daemon exited while IPC activity was ongoing at {:?}",
+            hold_start.elapsed(),
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    // Stop poking it. Switch to the no-IPC probe so we don't reset the
+    // watchdog clock while waiting for it to fire.
+    let exited = wait_for_daemon_exit_no_ipc(&state, Duration::from_secs(15));
+    assert!(
+        exited,
+        "daemon should self-exit after IPC activity stops and grace elapses",
+    );
+}
