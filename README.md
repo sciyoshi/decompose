@@ -68,6 +68,62 @@ cargo build --release
 
 The binary will be at `target/release/decompose`. You can also use `cargo install --path .` to install it directly into your Cargo bin directory.
 
+### Shell completions
+
+`decompose completion <shell>` prints a ready-to-source completion script for
+`bash`, `zsh`, `fish`, `powershell`, or `elvish`. The bash and zsh scripts
+also do dynamic service-name completion: on `start`, `stop`, `restart`,
+`kill`, `logs`, `exec`, `run`, and `up`, tab-completion pulls service names
+from `decompose config --json` (uses `jq` if available, falls back to a
+`sed` parser otherwise).
+
+**bash** — add to your `~/.bashrc`:
+
+```bash
+source <(decompose completion bash)
+```
+
+Or install system-wide once (e.g. under `bash-completion`):
+
+```bash
+decompose completion bash | sudo tee /etc/bash_completion.d/decompose > /dev/null
+```
+
+**zsh** — drop the script somewhere in your `$fpath`:
+
+```bash
+mkdir -p ~/.zfunc
+decompose completion zsh > ~/.zfunc/_decompose
+# then, in ~/.zshrc, before `compinit`:
+#   fpath=(~/.zfunc $fpath)
+#   autoload -U compinit && compinit
+```
+
+Or source directly in `~/.zshrc`:
+
+```bash
+source <(decompose completion zsh)
+```
+
+**fish**:
+
+```bash
+decompose completion fish > ~/.config/fish/completions/decompose.fish
+```
+
+**PowerShell** — add to your `$PROFILE`:
+
+```powershell
+decompose completion powershell | Out-String | Invoke-Expression
+```
+
+**elvish** — write to a module file and `use` it from `rc.elv`:
+
+```bash
+decompose completion elvish > ~/.config/elvish/lib/decompose.elv
+# then add `use decompose` to ~/.config/elvish/rc.elv
+```
+
 ## Why this is better for day-to-day coding
 
 - **Native performance**: run directly on host processes and filesystems.

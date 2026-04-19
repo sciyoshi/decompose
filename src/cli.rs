@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::output::OutputArgs;
 
@@ -75,8 +75,30 @@ pub enum Commands {
     /// service. Requires the daemon to be running and at least one replica of
     /// SERVICE to be in the Running state. Otherwise behaves like `run`.
     Exec(ExecArgs),
+    /// Generate a shell completion script for the given shell.
+    ///
+    /// Example: `decompose completion zsh > ~/.zfunc/_decompose`
+    Completion(CompletionArgs),
     #[command(hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CompletionArgs {
+    /// Target shell. One of: bash, zsh, fish, powershell, elvish.
+    pub shell: CompletionShell,
+}
+
+/// Wrapper around `clap_complete::Shell` so we can add a `ValueEnum` impl
+/// that doesn't force callers to depend on `clap_complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    #[value(name = "powershell")]
+    PowerShell,
+    Elvish,
 }
 
 #[derive(Args, Debug, Clone)]

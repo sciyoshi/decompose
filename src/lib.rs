@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod completion;
 pub mod config;
 pub mod daemon;
 pub mod ipc;
@@ -66,6 +67,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Ls(args) => run_ls(args.output.resolve()).await,
         Commands::Run(args) => run_run(global, args).await,
         Commands::Exec(args) => run_exec(global, args).await,
+        Commands::Completion(args) => crate::completion::run_completion(args.shell),
         Commands::Daemon(args) => run_daemon(args).await,
     }
 }

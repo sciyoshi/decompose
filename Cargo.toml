@@ -26,6 +26,7 @@ exclude = [
 anstyle = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 humantime = "2"
 interprocess = { version = "2", features = ["tokio"] }
 libc = "0.2"

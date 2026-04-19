@@ -5336,3 +5336,143 @@ fn client_activity_keeps_orphaned_daemon_alive() {
         "daemon should self-exit after IPC activity stops and grace elapses",
     );
 }
+
+#[test]
+fn completion_subcommand_emits_shell_scripts() {
+    // No project/daemon needed — `completion` just prints to stdout.
+    let tmp = tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    let runtime = tmp.path().join("runtime");
+    let state = tmp.path().join("state");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&runtime).expect("create runtime");
+    fs::create_dir_all(&state).expect("create state");
+    fs::create_dir_all(&home).expect("create home");
+
+    // Bash: should contain the clap-generated `_decompose` function and our
+    // injected `complete -F __decompose_wrap ... decompose` registration.
+    let bash = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["completion", "bash"],
+        &[],
+        &[],
+    );
+    assert_success(&bash, "completion bash");
+    let bash_out = String::from_utf8(bash.stdout).expect("bash utf8");
+    assert!(!bash_out.is_empty(), "bash completion must be non-empty");
+    assert!(
+        bash_out.contains("_decompose()"),
+        "bash completion should define _decompose(): {bash_out}"
+    );
+    assert!(
+        bash_out.contains("complete -F __decompose_wrap"),
+        "bash completion should register the dynamic wrapper",
+    );
+    assert!(
+        bash_out.contains("__decompose_services"),
+        "bash completion should include the dynamic service helper",
+    );
+
+    // Zsh: should contain `#compdef decompose` and our `compdef
+    // __decompose_dyn_wrap decompose` re-registration.
+    let zsh = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["completion", "zsh"],
+        &[],
+        &[],
+    );
+    assert_success(&zsh, "completion zsh");
+    let zsh_out = String::from_utf8(zsh.stdout).expect("zsh utf8");
+    assert!(
+        zsh_out.contains("#compdef decompose"),
+        "zsh completion should declare #compdef",
+    );
+    assert!(
+        zsh_out.contains("compdef __decompose_dyn_wrap decompose"),
+        "zsh completion should re-register with the dynamic wrapper",
+    );
+
+    // Fish: should contain `complete -c decompose ...` entries.
+    let fish = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["completion", "fish"],
+        &[],
+        &[],
+    );
+    assert_success(&fish, "completion fish");
+    let fish_out = String::from_utf8(fish.stdout).expect("fish utf8");
+    assert!(
+        fish_out.contains("complete -c decompose"),
+        "fish completion should contain decompose completions",
+    );
+
+    // PowerShell + elvish: just assert non-empty + expected marker.
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["completion", "powershell"],
+        &[],
+        &[],
+    );
+    assert_success(&ps, "completion powershell");
+    let ps_out = String::from_utf8(ps.stdout).expect("ps utf8");
+    assert!(
+        ps_out.contains("Register-ArgumentCompleter"),
+        "powershell completion should use Register-ArgumentCompleter",
+    );
+
+    let elv = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["completion", "elvish"],
+        &[],
+        &[],
+    );
+    assert_success(&elv, "completion elvish");
+    let elv_out = String::from_utf8(elv.stdout).expect("elvish utf8");
+    assert!(
+        elv_out.contains("edit:completion:arg-completer[decompose]"),
+        "elvish completion should wire decompose arg-completer",
+    );
+}
+
+#[test]
+fn completion_rejects_unknown_shell() {
+    let tmp = tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    let runtime = tmp.path().join("runtime");
+    let state = tmp.path().join("state");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&project).expect("create project");
+    fs::create_dir_all(&runtime).expect("create runtime");
+    fs::create_dir_all(&state).expect("create state");
+    fs::create_dir_all(&home).expect("create home");
+
+    let out = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["completion", "tcsh"],
+        &[],
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "completion with unknown shell should fail"
+    );
+}
