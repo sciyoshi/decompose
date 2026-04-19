@@ -219,7 +219,23 @@ pub struct ProcessRuntime {
     pub started_once: bool,
     pub log_ready: bool,
     pub restart_count: u32,
-    pub healthy: bool,
+    /// Readiness flag: set by the readiness probe's success threshold,
+    /// cleared by the failure threshold or on process (re)start. This is
+    /// what `depends_on: process_healthy` gates on and what `ps` reports
+    /// as the HEALTH/STATE indicator.
+    ///
+    /// Starts `false` on a fresh process; without a configured readiness
+    /// probe it remains `false` (see `dependencies_met` for how the
+    /// dependency condition handles that case).
+    pub ready: bool,
+    /// Liveness flag: set by the liveness probe's success threshold, and
+    /// cleared when the failure threshold trips (at which point the daemon
+    /// SIGKILLs the process so the restart policy re-launches it).
+    ///
+    /// Defaults to `true` — a process with no liveness probe is assumed
+    /// alive. Reset to `true` on (re)start so a new instance starts its
+    /// probe cycle with a clean slate.
+    pub alive: bool,
     /// Shared-by-reference current instance name. Daemon tasks spawned for
     /// this runtime hold `Arc` clones of this handle. When the daemon
     /// renames an instance in place during a scale 1↔N transition, it
@@ -248,8 +264,24 @@ pub struct ProcessSnapshot {
     pub description: Option<String>,
     pub restart_count: u32,
     pub log_ready: bool,
+    /// Kept for JSON backward compatibility: mirrors `ready` (readiness was
+    /// the gating signal this field has always represented). New consumers
+    /// should prefer `ready` and `alive` explicitly.
     pub healthy: bool,
+    /// Readiness-probe pass/fail flag. Drives `depends_on: process_healthy`
+    /// and the `ps` HEALTH/STATE column. Without a readiness probe the
+    /// daemon leaves this `false`; see `has_readiness_probe` for whether
+    /// the service actually has one configured.
+    pub ready: bool,
+    /// Liveness-probe pass/fail flag. A failing liveness probe triggers a
+    /// process restart via SIGKILL. Services without a liveness probe
+    /// default to `true` (assumed alive).
+    pub alive: bool,
     pub has_readiness_probe: bool,
+    /// Whether a liveness probe is configured on the service. Exposed so
+    /// downstream consumers can distinguish "no probe, assumed alive" from
+    /// "probe configured and passing".
+    pub has_liveness_probe: bool,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
 }

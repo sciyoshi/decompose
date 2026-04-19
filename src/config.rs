@@ -906,7 +906,8 @@ pub fn build_process_instances(
                     started_once: false,
                     log_ready: false,
                     restart_count: 0,
-                    healthy: false,
+                    ready: false,
+                    alive: true,
                     name_handle,
                 },
             );

@@ -2504,6 +2504,148 @@ processes:
 }
 
 #[test]
+fn readiness_and_liveness_probes_track_independent_flags() {
+    // Regression test for the ready/alive flag split. A service with both
+    // readiness and liveness probes must report each flag independently in
+    // ps JSON. The readiness probe passes (marker file present), so
+    // `ready=true`; the liveness probe fails (`false`), so after the
+    // failure_threshold the daemon marks `alive=false` and SIGKILLs the
+    // process — causing `restart_count` to tick up via on_failure policy.
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let marker = project.join("ready_marker");
+    fs::write(&marker, "ok").expect("write marker");
+    let marker_str = marker.to_string_lossy().to_string();
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        format!(
+            r#"
+processes:
+  svc:
+    command: "sleep 120"
+    restart_policy: on_failure
+    backoff_seconds: 1
+    readiness_probe:
+      exec:
+        command: "test -f {marker_str}"
+      period_seconds: 1
+      timeout_seconds: 1
+      success_threshold: 1
+      failure_threshold: 1
+      initial_delay_seconds: 0
+    liveness_probe:
+      exec:
+        command: "false"
+      period_seconds: 1
+      timeout_seconds: 1
+      failure_threshold: 2
+      initial_delay_seconds: 1
+"#
+        ),
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Poll until we observe ready=true && alive=false simultaneously. The
+    // readiness probe flips `ready` on the first tick (~1s); the liveness
+    // probe waits the initial_delay (1s) + 2 failures at 1s each (~3s) and
+    // then kills the process — which resets `alive` to true on the next
+    // spawn. So we must catch it in that narrow window, or rely on seeing
+    // restart_count > 0 as evidence the liveness path fired.
+    let mut saw_ready_and_not_alive = false;
+    let mut saw_restart = false;
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(500));
+        let ps = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "ps", "--json"],
+            &[],
+            &[],
+        );
+        if !ps.status.success() {
+            continue;
+        }
+        let Ok(ps_json) = serde_json::from_slice::<Value>(&ps.stdout) else {
+            continue;
+        };
+        let Some(svc) = ps_json["processes"]
+            .as_array()
+            .and_then(|a| a.iter().find(|p| p["base"].as_str() == Some("svc")))
+        else {
+            continue;
+        };
+
+        // Additive JSON fields must be present and typed correctly.
+        assert!(
+            svc.get("ready").and_then(Value::as_bool).is_some(),
+            "ProcessSnapshot must expose bool 'ready', got: {svc}"
+        );
+        assert!(
+            svc.get("alive").and_then(Value::as_bool).is_some(),
+            "ProcessSnapshot must expose bool 'alive', got: {svc}"
+        );
+        // Backward-compat: `healthy` stays and mirrors `ready`.
+        assert_eq!(
+            svc["healthy"].as_bool(),
+            svc["ready"].as_bool(),
+            "legacy 'healthy' must mirror 'ready'"
+        );
+        assert_eq!(
+            svc["has_liveness_probe"].as_bool(),
+            Some(true),
+            "has_liveness_probe must be exposed and true"
+        );
+
+        if svc["ready"].as_bool() == Some(true) && svc["alive"].as_bool() == Some(false) {
+            saw_ready_and_not_alive = true;
+        }
+        if svc["restart_count"].as_u64().unwrap_or(0) >= 1 {
+            saw_restart = true;
+        }
+        if saw_ready_and_not_alive && saw_restart {
+            break;
+        }
+    }
+
+    assert!(
+        saw_ready_and_not_alive,
+        "expected to observe ready=true && alive=false in some ps snapshot — flags stomp each other"
+    );
+    assert!(
+        saw_restart,
+        "liveness probe failure must still trigger a restart after the flag split"
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
+#[test]
 fn healthy_resets_on_process_restart() {
     let (_root, project, runtime, state, _config) = setup_project();
     let home = project.parent().expect("parent").join("home");

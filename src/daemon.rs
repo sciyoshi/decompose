@@ -620,7 +620,13 @@ pub(crate) fn dependencies_met(
 
         let satisfied = match cond {
             DependencyCondition::ProcessStarted => dep_instances.iter().all(|p| p.started_once),
-            DependencyCondition::ProcessHealthy => dep_instances.iter().all(|p| p.healthy),
+            // `process_healthy` gates on readiness (the readiness probe's
+            // pass/fail state). Liveness intentionally does not participate:
+            // a process with no readiness probe configured can never satisfy
+            // this condition — use `process_started` or `process_log_ready`
+            // when that's the desired semantics. See model.rs for the
+            // `ready`/`alive` split.
+            DependencyCondition::ProcessHealthy => dep_instances.iter().all(|p| p.ready),
             DependencyCondition::ProcessLogReady => dep_instances.iter().all(|p| p.log_ready),
             DependencyCondition::ProcessCompleted => dep_instances.iter().all(|p| {
                 matches!(
@@ -1030,7 +1036,11 @@ async fn process_lifecycle(
             if let Some(runtime) = guard.processes.get_mut(&name) {
                 runtime.status = ProcessStatus::Running { pid };
                 runtime.log_ready = false;
-                runtime.healthy = false;
+                runtime.ready = false;
+                // A freshly spawned process is assumed alive until its
+                // liveness probe (if any) proves otherwise — matches the
+                // `ProcessRuntime::alive` default documented in model.rs.
+                runtime.alive = true;
             }
         }
 
@@ -1202,10 +1212,13 @@ async fn shutdown_child(
 
 #[derive(Debug, Clone, Copy)]
 enum ProbeKind {
-    /// Flips the `healthy` flag on success/failure thresholds.
+    /// Flips the `ready` flag on success/failure thresholds. This is the
+    /// signal `depends_on: process_healthy` gates on.
     Readiness,
-    /// On reaching `failure_threshold`, SIGKILLs the process so the restart
-    /// policy can re-launch it.
+    /// Flips the `alive` flag on success/failure thresholds, and on
+    /// reaching `failure_threshold` SIGKILLs the process so the restart
+    /// policy can re-launch it. Independent of `ready` — a service may
+    /// configure both probes and each writes to its own flag.
     Liveness,
 }
 
@@ -1269,13 +1282,14 @@ async fn run_probe(
         if success {
             consecutive_successes += 1;
             consecutive_failures = 0;
-            if matches!(kind, ProbeKind::Readiness)
-                && consecutive_successes >= probe.success_threshold
-            {
+            if consecutive_successes >= probe.success_threshold {
                 let name = crate::model::read_name(&name_handle);
                 let mut guard = state.lock().await;
                 if let Some(runtime) = guard.processes.get_mut(&name) {
-                    runtime.healthy = true;
+                    match kind {
+                        ProbeKind::Readiness => runtime.ready = true,
+                        ProbeKind::Liveness => runtime.alive = true,
+                    }
                 }
             }
         } else {
@@ -1287,14 +1301,18 @@ async fn run_probe(
                         let name = crate::model::read_name(&name_handle);
                         let mut guard = state.lock().await;
                         if let Some(runtime) = guard.processes.get_mut(&name) {
-                            runtime.healthy = false;
+                            runtime.ready = false;
                         }
                     }
                     ProbeKind::Liveness => {
-                        // Kill the process so the restart policy can re-launch it.
+                        // Clear the liveness flag and kill the process so
+                        // the restart policy can re-launch it. A fresh spawn
+                        // resets `alive` back to `true` (see the Running
+                        // transition in process_lifecycle / start_process).
                         let name = crate::model::read_name(&name_handle);
-                        let guard = state.lock().await;
-                        if let Some(runtime) = guard.processes.get(&name) {
+                        let mut guard = state.lock().await;
+                        if let Some(runtime) = guard.processes.get_mut(&name) {
+                            runtime.alive = false;
                             if let ProcessStatus::Running { pid } = runtime.status {
                                 #[cfg(unix)]
                                 {
@@ -1671,8 +1689,15 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                         description: proc_runtime.spec.description.clone(),
                         restart_count: proc_runtime.restart_count,
                         log_ready: proc_runtime.log_ready,
-                        healthy: proc_runtime.healthy,
+                        // `healthy` is kept for backward compatibility with
+                        // existing JSON consumers — it mirrors `ready`,
+                        // which was the readiness-gated signal this field
+                        // represented before the flag split.
+                        healthy: proc_runtime.ready,
+                        ready: proc_runtime.ready,
+                        alive: proc_runtime.alive,
                         has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),
+                        has_liveness_probe: proc_runtime.spec.liveness_probe.is_some(),
                         pid,
                         exit_code,
                     }
@@ -1743,7 +1768,10 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                             if runtime.status.is_terminal() {
                                 runtime.status = ProcessStatus::Pending;
                                 runtime.log_ready = false;
-                                runtime.healthy = false;
+                                runtime.ready = false;
+                                // `alive` defaults to true for a fresh
+                                // instance — see ProcessRuntime docs.
+                                runtime.alive = true;
                                 started += 1;
                             }
                         }
@@ -1808,7 +1836,8 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                             if let Some(runtime) = guard.processes.get_mut(name) {
                                 runtime.status = ProcessStatus::Pending;
                                 runtime.log_ready = false;
-                                runtime.healthy = false;
+                                runtime.ready = false;
+                                runtime.alive = true;
                             }
                         }
                     });
@@ -2292,7 +2321,8 @@ mod tests {
             started_once,
             log_ready: false,
             restart_count: 0,
-            healthy: false,
+            ready: false,
+            alive: true,
             name_handle: crate::model::make_name_handle(base.to_string()),
         }
     }
@@ -2346,6 +2376,46 @@ mod tests {
             db.status = ProcessStatus::Running { pid: 42 };
         }
         assert!(dependencies_met(&candidate, &snapshot));
+    }
+
+    #[test]
+    fn process_healthy_condition_uses_ready_flag_not_alive() {
+        // Regression: when a service configures both readiness and liveness
+        // probes, the flags must be independent. `process_healthy` gates on
+        // readiness alone, so a process that is `alive` but not `ready`
+        // must NOT satisfy the dependency.
+        let mut snapshot = BTreeMap::new();
+        let mut db = runtime_with("db", ProcessStatus::Running { pid: 42 }, true);
+        db.ready = false;
+        db.alive = true;
+        snapshot.insert("db".to_string(), db);
+
+        let mut candidate = runtime_with("api", ProcessStatus::Pending, false);
+        candidate
+            .spec
+            .depends_on
+            .insert("db".to_string(), DependencyCondition::ProcessHealthy);
+        assert!(
+            !dependencies_met(&candidate, &snapshot),
+            "alive-but-not-ready must not satisfy process_healthy"
+        );
+
+        // Flip readiness on; liveness unchanged — should now satisfy.
+        if let Some(db) = snapshot.get_mut("db") {
+            db.ready = true;
+        }
+        assert!(dependencies_met(&candidate, &snapshot));
+
+        // And the inverse: ready but not alive (liveness probe failing)
+        // still satisfies `process_healthy` — liveness drives restarts, not
+        // dependency gating.
+        if let Some(db) = snapshot.get_mut("db") {
+            db.alive = false;
+        }
+        assert!(
+            dependencies_met(&candidate, &snapshot),
+            "process_healthy must ignore alive; only readiness gates it"
+        );
     }
 
     #[test]
