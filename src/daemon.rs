@@ -800,16 +800,51 @@ fn spawn_health_probes(
     );
 }
 
+/// How a child process ended, carrying enough information to render a
+/// human-readable restart separator. `Code` is the normal-exit path;
+/// `Signal` is a Unix signal (or `-1` exit code when the platform didn't
+/// provide one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitReason {
+    Code(i32),
+    Signal(i32),
+}
+
+impl ExitReason {
+    fn describe(self) -> String {
+        match self {
+            ExitReason::Code(code) => format!("exit code {code}"),
+            ExitReason::Signal(sig) => {
+                let name = signal_name(sig);
+                match name {
+                    Some(n) => format!("signal {n}"),
+                    None => format!("signal {sig}"),
+                }
+            }
+        }
+    }
+}
+
+/// Return the canonical `SIG*` name for a signal number, or `None` if
+/// `nix` doesn't know about it. Keeps the restart separator readable
+/// without requiring a full libc signal table.
+fn signal_name(sig: i32) -> Option<&'static str> {
+    use nix::sys::signal::Signal;
+    Signal::try_from(sig).ok().map(|s| s.as_str())
+}
+
 /// Wait for either a kill signal or the child to exit, returning the
-/// resulting terminal [`ProcessStatus`]. On kill, this also runs the
-/// spec-driven shutdown sequence (command, signal, SIGKILL).
+/// resulting terminal [`ProcessStatus`] along with an [`ExitReason`]
+/// describing the child's outcome (used for the restart separator).
+/// On kill, this also runs the spec-driven shutdown sequence (command,
+/// signal, SIGKILL).
 async fn wait_for_child_exit(
     name_handle: &crate::model::NameHandle,
     spec: &crate::model::ProcessInstanceSpec,
     child: &mut tokio::process::Child,
     kill_rx: &mut watch::Receiver<bool>,
     state: &SharedState,
-) -> ProcessStatus {
+) -> (ProcessStatus, Option<ExitReason>) {
     tokio::select! {
         _ = kill_rx.changed() => {
             let timeout_override = {
@@ -818,19 +853,67 @@ async fn wait_for_child_exit(
             };
             shutdown_child(child, spec, timeout_override).await;
             let _ = name_handle; // handle retained for future logging hooks
-            ProcessStatus::Stopped
+            (ProcessStatus::Stopped, None)
         }
         wait_res = child.wait() => {
             match wait_res {
-                Ok(exit_status) => ProcessStatus::Exited {
-                    code: exit_status.code().unwrap_or(-1),
-                },
-                Err(e) => ProcessStatus::FailedToStart {
-                    reason: format!("wait failed: {e}"),
-                },
+                Ok(exit_status) => {
+                    let reason = exit_reason_from_status(&exit_status);
+                    let status = match reason {
+                        ExitReason::Code(code) => ProcessStatus::Exited { code },
+                        // ProcessStatus doesn't distinguish signal vs. code
+                        // today; collapse to `code=-1` matching prior
+                        // behavior, but keep the richer reason for logging.
+                        ExitReason::Signal(_) => ProcessStatus::Exited { code: -1 },
+                    };
+                    (status, Some(reason))
+                }
+                Err(e) => (
+                    ProcessStatus::FailedToStart {
+                        reason: format!("wait failed: {e}"),
+                    },
+                    None,
+                ),
             }
         }
     }
+}
+
+/// Map a child `ExitStatus` into an [`ExitReason`], preferring the
+/// numeric exit code when available and falling back to the signal
+/// number on Unix.
+fn exit_reason_from_status(status: &std::process::ExitStatus) -> ExitReason {
+    if let Some(code) = status.code() {
+        return ExitReason::Code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return ExitReason::Signal(sig);
+        }
+    }
+    ExitReason::Code(-1)
+}
+
+/// Format the separator line that is written to the daemon log between
+/// consecutive runs of a process. The line is already prefixed with
+/// `[name]` so that `decompose logs <name>` filtering picks it up,
+/// matching the format the stdout/stderr readers emit.
+fn format_restart_separator(
+    name: &str,
+    reason: ExitReason,
+    attempt: u32,
+    max: Option<u32>,
+) -> String {
+    let attempt_part = match max {
+        Some(m) => format!("attempt {attempt}/{m}"),
+        None => format!("attempt {attempt}"),
+    };
+    format!(
+        "[{name}] --- restarted ({reason}, {attempt_part}) ---",
+        reason = reason.describe()
+    )
 }
 
 /// Given the terminal status of the most recent child instance, decide
@@ -879,7 +962,7 @@ async fn process_lifecycle(
     state: SharedState,
 ) {
     loop {
-        let final_status =
+        let (final_status, exit_reason) =
             wait_for_child_exit(&name_handle, &spec, &mut child, &mut kill_rx, &state).await;
 
         let should_restart = apply_restart_decision(&name_handle, &state, final_status).await;
@@ -888,6 +971,25 @@ async fn process_lifecycle(
             let mut guard = state.lock().await;
             guard.controllers.remove(&name);
             break;
+        }
+
+        // Emit a separator line into the daemon log so that humans (and
+        // `decompose logs svc`) can visually distinguish the previous run
+        // from the next attempt. The separator flows through the same
+        // stdout stream the child line-readers use, so name-prefix
+        // filtering picks it up unchanged.
+        if let Some(reason) = exit_reason {
+            let (attempt, max) = {
+                let name = crate::model::read_name(&name_handle);
+                let guard = state.lock().await;
+                guard
+                    .processes
+                    .get(&name)
+                    .map(|r| (r.restart_count, r.spec.max_restarts))
+                    .unwrap_or((0, None))
+            };
+            let name = crate::model::read_name(&name_handle);
+            println!("{}", format_restart_separator(&name, reason, attempt, max));
         }
 
         // Backoff delay. Look up the current spec under the lock, since a
@@ -2516,5 +2618,45 @@ mod tests {
 
         assert_eq!(plan.changed, vec!["api".to_string()]);
         assert_eq!(plan.unchanged, vec!["db".to_string()]);
+    }
+
+    #[test]
+    fn restart_separator_formats_exit_code_with_max() {
+        let line = format_restart_separator("api", ExitReason::Code(1), 2, Some(5));
+        assert_eq!(line, "[api] --- restarted (exit code 1, attempt 2/5) ---");
+    }
+
+    #[test]
+    fn restart_separator_formats_exit_code_without_max() {
+        let line = format_restart_separator("api", ExitReason::Code(1), 2, None);
+        assert_eq!(line, "[api] --- restarted (exit code 1, attempt 2) ---");
+    }
+
+    #[test]
+    fn restart_separator_formats_signal_with_known_name() {
+        // SIGTERM is 15 on every Unix platform we care about.
+        let line = format_restart_separator("api", ExitReason::Signal(15), 1, None);
+        assert_eq!(line, "[api] --- restarted (signal SIGTERM, attempt 1) ---");
+    }
+
+    #[test]
+    fn restart_separator_formats_unknown_signal() {
+        // A signal number nix doesn't know about falls back to the number.
+        let line = format_restart_separator("worker", ExitReason::Signal(999), 3, Some(10));
+        assert_eq!(
+            line,
+            "[worker] --- restarted (signal 999, attempt 3/10) ---"
+        );
+    }
+
+    #[test]
+    fn restart_separator_preserves_process_name_prefix_for_filtering() {
+        // The `[name]` prefix is what `decompose logs NAME` uses to filter,
+        // so it must exactly match the stdout/stderr reader format.
+        let line = format_restart_separator("my-service", ExitReason::Code(0), 1, None);
+        assert!(
+            line.starts_with("[my-service] "),
+            "expected name-prefixed line, got {line:?}"
+        );
     }
 }

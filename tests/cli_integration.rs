@@ -1004,6 +1004,81 @@ processes:
 }
 
 #[test]
+fn restart_separator_appears_in_logs_between_runs() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  flaky:
+    command: "sh -c 'echo TICK; exit 1'"
+    restart_policy: always
+    backoff_seconds: 1
+    max_restarts: 2
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up");
+
+    // Initial run + backoff 1s + restart 1 + backoff 1s + restart 2 = ~2-3s.
+    // Give a generous buffer for CI noise.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_separator = false;
+    let mut last_logs = String::new();
+    while std::time::Instant::now() < deadline {
+        let logs = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "logs", "--no-pager"],
+            &[("DECOMPOSE_PAGER", "false")],
+            &[],
+        );
+        assert_success(&logs, "logs --no-pager");
+        last_logs = String::from_utf8_lossy(&logs.stdout).to_string();
+        // Look for the separator line with the expected shape.
+        if last_logs.contains("[flaky] --- restarted (exit code 1, attempt 1/2) ---")
+            || last_logs.contains("[flaky] --- restarted (exit code 1, attempt 2/2) ---")
+        {
+            saw_separator = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+
+    assert!(
+        saw_separator,
+        "expected a `[flaky] --- restarted (exit code 1, attempt N/2) ---` line in the daemon log, got:\n{last_logs}"
+    );
+}
+
+#[test]
 fn no_restart_on_successful_exit() {
     let (_root, project, runtime, state, _config) = setup_project();
     let home = project.parent().expect("parent").join("home");
