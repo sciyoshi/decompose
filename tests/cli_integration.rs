@@ -4481,8 +4481,25 @@ processes:
     assert_success(&out_b, "concurrent up B");
 
     // Both responses should agree on the daemon pid — there's only one.
-    let a_json: Value = serde_json::from_slice(&out_a.stdout).expect("a json");
-    let b_json: Value = serde_json::from_slice(&out_b.stdout).expect("b json");
+    // `up --detach --json` may emit a progress line followed by the final
+    // result JSON when it's the invocation that spawns the daemon, so parse
+    // the last complete JSON value from stdout rather than expecting one.
+    let parse_last_json = |stdout: &[u8], label: &str| -> Value {
+        let text = std::str::from_utf8(stdout).expect("utf8");
+        text.lines()
+            .rev()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str::<Value>(trimmed).ok()
+                }
+            })
+            .unwrap_or_else(|| panic!("{label}: no JSON object in stdout: {text}"))
+    };
+    let a_json = parse_last_json(&out_a.stdout, "a json");
+    let b_json = parse_last_json(&out_b.stdout, "b json");
     let pid_a = a_json.get("pid").and_then(Value::as_u64);
     let pid_b = b_json.get("pid").and_then(Value::as_u64);
     assert!(pid_a.is_some(), "a must report a daemon pid");
