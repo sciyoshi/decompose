@@ -602,6 +602,52 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
     };
 
     if args.follow {
+        // Mirror `docker compose logs -f` / `tail -f`: print the existing
+        // backlog first, then stream new output. Read the file once and
+        // remember its length so the follower resumes at exactly the byte
+        // offset where the backlog ended — no drops, no duplicates.
+        //
+        // `args.tail` controls how much backlog to show:
+        //   * None         — all existing lines
+        //   * Some(0)      — explicit opt-out (start streaming from now)
+        //   * Some(n)      — last n filtered lines
+        let skip_backlog = matches!(args.tail, Some(0));
+        let start_offset = match tokio::fs::read(&paths.daemon_log).await {
+            Ok(bytes) => {
+                let len = bytes.len() as u64;
+                if !skip_backlog {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let lines: Vec<&str> = text.lines().collect();
+                    let filtered = filter_log_lines(&lines, &args.processes);
+                    let backlog = match args.tail {
+                        Some(n) => {
+                            let start = filtered.len().saturating_sub(n);
+                            &filtered[start..]
+                        }
+                        None => &filtered[..],
+                    };
+                    // Print directly to stdout (no pager) so the user sees
+                    // backlog immediately and new lines stream in live.
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    for line in backlog {
+                        let _ = writeln!(out, "{line}");
+                    }
+                    let _ = out.flush();
+                }
+                len
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read daemon log at {}",
+                        paths.daemon_log.display()
+                    )
+                });
+            }
+        };
+
         let (log_stop_tx, log_stop_rx) = watch::channel(false);
         let proc_filter = args.processes.clone();
         let log_handle = tokio::spawn(stream_filtered_logs(
@@ -609,6 +655,7 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
             paths.clone(),
             log_stop_rx,
             proc_filter,
+            Some(start_offset),
         ));
         ctrl_c().await.context("failed to listen for Ctrl-C")?;
         let _ = log_stop_tx.send(true);
@@ -1283,10 +1330,17 @@ async fn stream_filtered_logs(
     paths: crate::model::RuntimePaths,
     mut stop_rx: watch::Receiver<bool>,
     processes: Vec<String>,
+    // `Some(offset)` starts tailing at the given byte offset (used after a
+    // backlog print so we resume exactly where that read ended). `None`
+    // preserves the old behaviour of starting at the current end-of-file.
+    start_offset: Option<u64>,
 ) {
-    let mut offset = match tokio::fs::metadata(&log_path).await {
-        Ok(meta) => meta.len(),
-        Err(_) => 0,
+    let mut offset = match start_offset {
+        Some(off) => off,
+        None => match tokio::fs::metadata(&log_path).await {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        },
     };
     let mut poll_counter: u32 = 0;
 

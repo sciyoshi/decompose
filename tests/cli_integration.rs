@@ -4911,6 +4911,152 @@ processes:
     assert_success(&down, "down talker");
 }
 
+/// `logs -f` must print the existing backlog before streaming new output,
+/// matching `docker compose logs -f` / `tail -f` semantics (decompose-sn7).
+/// Regression: previously it tailed from EOF, so any lines emitted before the
+/// command ran were invisible.
+#[test]
+fn logs_follow_prints_backlog_then_streams_new_lines() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    // A service that emits a distinctive backlog line, pauses to let us see
+    // that line hit disk, then emits ticks so we can prove the follower is
+    // still streaming after draining the backlog.
+    let cfg_path = project.join("decompose.yaml");
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  ticker:
+    command: "sh -c 'echo BACKLOG_LINE_Z9; sleep 1; i=0; while :; do i=$((i+1)); echo TICK_$i; sleep 1; done'"
+"#,
+    )
+    .expect("write config");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up ticker");
+
+    // Wait for BACKLOG_LINE_Z9 to land on disk via a non-follow `logs` read
+    // — that guarantees it truly is "backlog" from the follower's viewpoint.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut backlog_on_disk = false;
+    while std::time::Instant::now() < deadline {
+        let out = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "logs", "--no-pager"],
+            &[],
+            &[],
+        );
+        assert_success(&out, "logs --no-pager");
+        if String::from_utf8_lossy(&out.stdout).contains("BACKLOG_LINE_Z9") {
+            backlog_on_disk = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(backlog_on_disk, "backlog line never appeared on disk");
+
+    // Spawn `decompose logs -f` as a child and capture its stdout line-by-line
+    // on a background thread into a shared buffer.
+    let mut follower = Command::new(bin_path())
+        .current_dir(&project)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("HOME", &home)
+        .args(["--file", &cfg, "logs", "-f"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn logs -f");
+
+    let stdout = follower.stdout.take().expect("follower stdout");
+    let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected_reader = Arc::clone(&collected);
+    let reader_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            collected_reader.lock().expect("lock").push(line);
+        }
+    });
+
+    // First assertion: backlog line appears in follower output.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_backlog = false;
+    while std::time::Instant::now() < deadline {
+        if collected
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|l| l.contains("BACKLOG_LINE_Z9"))
+        {
+            saw_backlog = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Second assertion: a TICK_N emitted *after* the follower started shows up
+    // — proves streaming continues past the backlog replay.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_tick = false;
+    while std::time::Instant::now() < deadline {
+        if collected
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|l| l.contains("TICK_"))
+        {
+            saw_tick = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = follower.kill();
+    let _ = follower.wait();
+    let _ = reader_thread.join();
+
+    let snapshot = collected.lock().expect("lock").clone();
+
+    assert!(
+        saw_backlog,
+        "expected BACKLOG_LINE_Z9 in follower stdout (backlog replay).\nlines:\n{}",
+        snapshot.join("\n")
+    );
+    assert!(
+        saw_tick,
+        "expected a TICK_N line in follower stdout (live streaming).\nlines:\n{}",
+        snapshot.join("\n")
+    );
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down ticker");
+}
+
 // ---------------------------------------------------------------------------
 // `run` and `exec` (decompose-s2g)
 // ---------------------------------------------------------------------------
