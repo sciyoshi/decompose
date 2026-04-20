@@ -1689,11 +1689,6 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                         description: proc_runtime.spec.description.clone(),
                         restart_count: proc_runtime.restart_count,
                         log_ready: proc_runtime.log_ready,
-                        // `healthy` is kept for backward compatibility with
-                        // existing JSON consumers — it mirrors `ready`,
-                        // which was the readiness-gated signal this field
-                        // represented before the flag split.
-                        healthy: proc_runtime.ready,
                         ready: proc_runtime.ready,
                         alive: proc_runtime.alive,
                         has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),

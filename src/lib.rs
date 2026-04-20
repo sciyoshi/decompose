@@ -1014,7 +1014,7 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 .iter()
                 .map(|p| {
                     let (g, label, _) =
-                        unified_state(&p.state, p.has_readiness_probe, p.healthy, false);
+                        unified_state(&p.state, p.has_readiness_probe, p.ready, false);
                     if label.is_empty() {
                         g.to_string()
                     } else {
@@ -1056,7 +1056,7 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 );
                 for (i, p) in processes.iter().enumerate() {
                     let (glyph, label, st) =
-                        unified_state(&p.state, p.has_readiness_probe, p.healthy, color);
+                        unified_state(&p.state, p.has_readiness_probe, p.ready, color);
                     let cell = if label.is_empty() {
                         glyph.to_string()
                     } else {
@@ -1077,7 +1077,7 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 );
                 for (i, p) in processes.iter().enumerate() {
                     let (glyph, label, st) =
-                        unified_state(&p.state, p.has_readiness_probe, p.healthy, color);
+                        unified_state(&p.state, p.has_readiness_probe, p.ready, color);
                     let cell = if label.is_empty() {
                         glyph.to_string()
                     } else {
@@ -1167,7 +1167,7 @@ async fn wait_for_services_ready(
                             return true;
                         }
                         if p.has_readiness_probe {
-                            p.healthy
+                            p.ready
                         } else {
                             p.state == "running" || p.state == "exited"
                         }

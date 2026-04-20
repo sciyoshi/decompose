@@ -264,10 +264,6 @@ pub struct ProcessSnapshot {
     pub description: Option<String>,
     pub restart_count: u32,
     pub log_ready: bool,
-    /// Kept for JSON backward compatibility: mirrors `ready` (readiness was
-    /// the gating signal this field has always represented). New consumers
-    /// should prefer `ready` and `alive` explicitly.
-    pub healthy: bool,
     /// Readiness-probe pass/fail flag. Drives `depends_on: process_healthy`
     /// and the `ps` HEALTH/STATE column. Without a readiness probe the
     /// daemon leaves this `false`; see `has_readiness_probe` for whether

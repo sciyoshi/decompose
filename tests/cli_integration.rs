@@ -1670,10 +1670,6 @@ fn ps_json_structure_has_all_expected_fields() {
 
         // Required boolean fields.
         assert!(
-            obj.get("healthy").and_then(Value::as_bool).is_some(),
-            "process must have bool 'healthy', got: {proc}"
-        );
-        assert!(
             obj.get("log_ready").and_then(Value::as_bool).is_some(),
             "process must have bool 'log_ready', got: {proc}"
         );
@@ -2175,9 +2171,9 @@ processes:
         .find(|p| p["name"].as_str() == Some("web"))
         .expect("web process");
     assert_eq!(
-        web1["healthy"].as_bool(),
+        web1["ready"].as_bool(),
         Some(false),
-        "healthy should be false before marker exists"
+        "ready should be false before marker exists"
     );
     assert_eq!(
         web1["has_readiness_probe"].as_bool(),
@@ -2209,9 +2205,9 @@ processes:
         .find(|p| p["name"].as_str() == Some("web"))
         .expect("web process");
     assert_eq!(
-        web2["healthy"].as_bool(),
+        web2["ready"].as_bool(),
         Some(true),
-        "healthy should be true after marker is created"
+        "ready should be true after marker is created"
     );
 
     let down = run_cmd(
@@ -2285,7 +2281,7 @@ processes:
                 .as_array()
                 .and_then(|a| a.iter().find(|p| p["name"].as_str() == Some("server")))
             {
-                if server["healthy"].as_bool() == Some(true) {
+                if server["ready"].as_bool() == Some(true) {
                     assert_eq!(
                         server["has_readiness_probe"].as_bool(),
                         Some(true),
@@ -2601,12 +2597,6 @@ processes:
             svc.get("alive").and_then(Value::as_bool).is_some(),
             "ProcessSnapshot must expose bool 'alive', got: {svc}"
         );
-        // Backward-compat: `healthy` stays and mirrors `ready`.
-        assert_eq!(
-            svc["healthy"].as_bool(),
-            svc["ready"].as_bool(),
-            "legacy 'healthy' must mirror 'ready'"
-        );
         assert_eq!(
             svc["has_liveness_probe"].as_bool(),
             Some(true),
@@ -2713,9 +2703,9 @@ processes:
         .find(|p| p["name"].as_str() == Some("svc"))
         .expect("svc process");
     assert_eq!(
-        svc1["healthy"].as_bool(),
+        svc1["ready"].as_bool(),
         Some(true),
-        "healthy should be true before restart"
+        "ready should be true before restart"
     );
 
     // Remove marker and trigger a restart
@@ -2753,9 +2743,9 @@ processes:
         .find(|p| p["name"].as_str() == Some("svc"))
         .expect("svc process");
     assert_eq!(
-        svc2["healthy"].as_bool(),
+        svc2["ready"].as_bool(),
         Some(false),
-        "healthy should be false after restart when marker is gone"
+        "ready should be false after restart when marker is gone"
     );
 
     let down = run_cmd(
