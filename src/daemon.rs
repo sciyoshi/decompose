@@ -206,6 +206,42 @@ async fn wait_for_terminal(state: &SharedState, names: &[String], tick: Duration
 
 type SharedState = Arc<Mutex<DaemonState>>;
 
+/// Resolve `handle` to the current name, take the state mutex, and run `f`
+/// against the matching [`ProcessRuntime`] if one exists. Returns the closure's
+/// result, or `None` if the runtime entry is gone (e.g. after a rename).
+///
+/// This is a thin wrapper over the lock→resolve→`get_mut` pattern repeated
+/// throughout the daemon; it exists purely to cut down on ceremony at call
+/// sites. Behaviour matches the hand-written form exactly.
+async fn with_process_mut<F, R>(
+    state: &SharedState,
+    handle: &crate::model::NameHandle,
+    f: F,
+) -> Option<R>
+where
+    F: FnOnce(&mut ProcessRuntime) -> R,
+{
+    let name = crate::model::read_name(handle);
+    let mut guard = state.lock().await;
+    guard.processes.get_mut(&name).map(f)
+}
+
+/// Read-only counterpart to [`with_process_mut`]: resolves the name, takes the
+/// lock for reading, and runs `f` against `&ProcessRuntime`. Returns `None` if
+/// the entry is gone.
+async fn with_process<F, R>(
+    state: &SharedState,
+    handle: &crate::model::NameHandle,
+    f: F,
+) -> Option<R>
+where
+    F: FnOnce(&ProcessRuntime) -> R,
+{
+    let name = crate::model::read_name(handle);
+    let guard = state.lock().await;
+    guard.processes.get(&name).map(f)
+}
+
 /// Acquire an exclusive, non-blocking advisory lock for this daemon instance.
 ///
 /// Returns the open lock file handle — the caller must keep it alive for the
@@ -671,14 +707,11 @@ async fn start_process(name: String, state: SharedState) {
     };
 
     let pid = child.id().unwrap_or(0);
-    {
-        let current = crate::model::read_name(&name_handle);
-        let mut guard = state.lock().await;
-        if let Some(runtime) = guard.processes.get_mut(&current) {
-            runtime.status = ProcessStatus::Running { pid };
-            runtime.started_once = true;
-        }
-    }
+    with_process_mut(&state, &name_handle, |runtime| {
+        runtime.status = ProcessStatus::Running { pid };
+        runtime.started_once = true;
+    })
+    .await;
 
     spawn_health_probes(&name_handle, &spec, &state);
     attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
@@ -774,12 +807,12 @@ async fn mark_failed_to_start(
 ) {
     let name = crate::model::read_name(name_handle);
     eprintln!("[{name}] {err:#}");
-    let mut guard = state.lock().await;
-    if let Some(runtime) = guard.processes.get_mut(&name) {
+    with_process_mut(state, name_handle, |runtime| {
         runtime.status = ProcessStatus::FailedToStart {
             reason: format!("{err:#}"),
         };
-    }
+    })
+    .await;
 }
 
 /// Spawn readiness and liveness probe tasks if configured on the spec.
@@ -931,30 +964,29 @@ async fn apply_restart_decision(
     state: &SharedState,
     final_status: ProcessStatus,
 ) -> bool {
-    let name = crate::model::read_name(name_handle);
-    let mut guard = state.lock().await;
-    let Some(runtime) = guard.processes.get_mut(&name) else {
-        return false;
-    };
-    let do_restart = match (&final_status, runtime.spec.restart_policy) {
-        (ProcessStatus::Stopped, _) => false,
-        (_, RestartPolicy::No) => false,
-        (ProcessStatus::Exited { code: 0 }, RestartPolicy::OnFailure) => false,
-        (_, RestartPolicy::OnFailure) | (_, RestartPolicy::Always) => {
-            match runtime.spec.max_restarts {
-                Some(max) => runtime.restart_count < max,
-                None => true,
+    with_process_mut(state, name_handle, |runtime| {
+        let do_restart = match (&final_status, runtime.spec.restart_policy) {
+            (ProcessStatus::Stopped, _) => false,
+            (_, RestartPolicy::No) => false,
+            (ProcessStatus::Exited { code: 0 }, RestartPolicy::OnFailure) => false,
+            (_, RestartPolicy::OnFailure) | (_, RestartPolicy::Always) => {
+                match runtime.spec.max_restarts {
+                    Some(max) => runtime.restart_count < max,
+                    None => true,
+                }
             }
+        };
+        if do_restart {
+            runtime.status = ProcessStatus::Restarting;
+            runtime.restart_count += 1;
+            true
+        } else {
+            runtime.status = final_status;
+            false
         }
-    };
-    if do_restart {
-        runtime.status = ProcessStatus::Restarting;
-        runtime.restart_count += 1;
-        true
-    } else {
-        runtime.status = final_status;
-        false
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Main lifecycle loop for a running process: waits for exit, applies the
@@ -985,38 +1017,24 @@ async fn process_lifecycle(
         // stdout stream the child line-readers use, so name-prefix
         // filtering picks it up unchanged.
         if let Some(reason) = exit_reason {
-            let (attempt, max) = {
-                let name = crate::model::read_name(&name_handle);
-                let guard = state.lock().await;
-                guard
-                    .processes
-                    .get(&name)
-                    .map(|r| (r.restart_count, r.spec.max_restarts))
-                    .unwrap_or((0, None))
-            };
+            let (attempt, max) = with_process(&state, &name_handle, |r| {
+                (r.restart_count, r.spec.max_restarts)
+            })
+            .await
+            .unwrap_or((0, None));
             let name = crate::model::read_name(&name_handle);
             println!("{}", format_restart_separator(&name, reason, attempt, max));
         }
 
         // Backoff delay. Look up the current spec under the lock, since a
         // reload could have swapped it out while we were waiting.
-        let backoff = {
-            let name = crate::model::read_name(&name_handle);
-            let guard = state.lock().await;
-            guard
-                .processes
-                .get(&name)
-                .map(|r| r.spec.backoff_seconds)
-                .unwrap_or(1)
-        };
+        let backoff = with_process(&state, &name_handle, |r| r.spec.backoff_seconds)
+            .await
+            .unwrap_or(1);
         sleep(Duration::from_secs(backoff)).await;
 
         // Pick up any new spec the reload may have installed.
-        let next_spec = {
-            let name = crate::model::read_name(&name_handle);
-            let guard = state.lock().await;
-            guard.processes.get(&name).map(|r| r.spec.clone())
-        };
+        let next_spec = with_process(&state, &name_handle, |r| r.spec.clone()).await;
         let Some(next_spec) = next_spec else { break };
         spec = next_spec;
 
@@ -1030,19 +1048,16 @@ async fn process_lifecycle(
         };
         child = new_child;
         let pid = child.id().unwrap_or(0);
-        {
-            let name = crate::model::read_name(&name_handle);
-            let mut guard = state.lock().await;
-            if let Some(runtime) = guard.processes.get_mut(&name) {
-                runtime.status = ProcessStatus::Running { pid };
-                runtime.log_ready = false;
-                runtime.ready = false;
-                // A freshly spawned process is assumed alive until its
-                // liveness probe (if any) proves otherwise — matches the
-                // `ProcessRuntime::alive` default documented in model.rs.
-                runtime.alive = true;
-            }
-        }
+        with_process_mut(&state, &name_handle, |runtime| {
+            runtime.status = ProcessStatus::Running { pid };
+            runtime.log_ready = false;
+            runtime.ready = false;
+            // A freshly spawned process is assumed alive until its
+            // liveness probe (if any) proves otherwise — matches the
+            // `ProcessRuntime::alive` default documented in model.rs.
+            runtime.alive = true;
+        })
+        .await;
 
         let ready_pattern: Option<Regex> =
             spec.ready_log_line.as_deref().map(compile_ready_pattern);
@@ -1084,10 +1099,10 @@ fn attach_output_readers(
                 if let Some(ref re) = pattern {
                     if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
                         flag.store(true, Ordering::Relaxed);
-                        let mut guard = state_clone.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&proc_name) {
+                        with_process_mut(&state_clone, &handle, |runtime| {
                             runtime.log_ready = true;
-                        }
+                        })
+                        .await;
                     }
                 }
             }
@@ -1107,10 +1122,10 @@ fn attach_output_readers(
                 if let Some(ref re) = pattern {
                     if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
                         flag.store(true, Ordering::Relaxed);
-                        let mut guard = state_clone.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&proc_name) {
+                        with_process_mut(&state_clone, &handle, |runtime| {
                             runtime.log_ready = true;
-                        }
+                        })
+                        .await;
                     }
                 }
             }
@@ -1265,16 +1280,11 @@ async fn run_probe(
 
     loop {
         // Check if process is still running
-        {
-            let name = crate::model::read_name(&name_handle);
-            let guard = state.lock().await;
-            if let Some(runtime) = guard.processes.get(&name) {
-                if runtime.status.is_terminal() {
-                    break;
-                }
-            } else {
-                break;
-            }
+        let keep_going = with_process(&state, &name_handle, |r| !r.status.is_terminal())
+            .await
+            .unwrap_or(false);
+        if !keep_going {
+            break;
         }
 
         let success = run_single_check(&probe, &working_dir, &environment).await;
@@ -1283,14 +1293,11 @@ async fn run_probe(
             consecutive_successes += 1;
             consecutive_failures = 0;
             if consecutive_successes >= probe.success_threshold {
-                let name = crate::model::read_name(&name_handle);
-                let mut guard = state.lock().await;
-                if let Some(runtime) = guard.processes.get_mut(&name) {
-                    match kind {
-                        ProbeKind::Readiness => runtime.ready = true,
-                        ProbeKind::Liveness => runtime.alive = true,
-                    }
-                }
+                with_process_mut(&state, &name_handle, |runtime| match kind {
+                    ProbeKind::Readiness => runtime.ready = true,
+                    ProbeKind::Liveness => runtime.alive = true,
+                })
+                .await;
             }
         } else {
             consecutive_failures += 1;
@@ -1298,20 +1305,17 @@ async fn run_probe(
             if consecutive_failures >= probe.failure_threshold {
                 match kind {
                     ProbeKind::Readiness => {
-                        let name = crate::model::read_name(&name_handle);
-                        let mut guard = state.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&name) {
+                        with_process_mut(&state, &name_handle, |runtime| {
                             runtime.ready = false;
-                        }
+                        })
+                        .await;
                     }
                     ProbeKind::Liveness => {
                         // Clear the liveness flag and kill the process so
                         // the restart policy can re-launch it. A fresh spawn
                         // resets `alive` back to `true` (see the Running
                         // transition in process_lifecycle / start_process).
-                        let name = crate::model::read_name(&name_handle);
-                        let mut guard = state.lock().await;
-                        if let Some(runtime) = guard.processes.get_mut(&name) {
+                        with_process_mut(&state, &name_handle, |runtime| {
                             runtime.alive = false;
                             if let ProcessStatus::Running { pid } = runtime.status {
                                 #[cfg(unix)]
@@ -1326,8 +1330,8 @@ async fn run_probe(
                                     let _ = pid; // suppress unused warning
                                 }
                             }
-                        }
-                        drop(guard);
+                        })
+                        .await;
 
                         // Reset counter — the restart policy will re-launch
                         // the process and the probe will re-evaluate from
