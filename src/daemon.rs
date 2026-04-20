@@ -1716,32 +1716,7 @@ async fn handle_ps(state: &SharedState) -> Response {
     let processes = guard
         .processes
         .values()
-        .map(|proc_runtime| {
-            let exit_code = match &proc_runtime.status {
-                ProcessStatus::Exited { code } => Some(*code),
-                _ => None,
-            };
-            let pid = match &proc_runtime.status {
-                ProcessStatus::Running { pid } => Some(*pid),
-                _ => None,
-            };
-            ProcessSnapshot {
-                name: proc_runtime.spec.name.clone(),
-                base: proc_runtime.spec.base_name.clone(),
-                replica: proc_runtime.spec.replica,
-                status: proc_runtime.status.to_human(),
-                state: proc_runtime.status.to_json_status().to_string(),
-                description: proc_runtime.spec.description.clone(),
-                restart_count: proc_runtime.restart_count,
-                log_ready: proc_runtime.log_ready,
-                ready: proc_runtime.ready,
-                alive: proc_runtime.alive,
-                has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),
-                has_liveness_probe: proc_runtime.spec.liveness_probe.is_some(),
-                pid,
-                exit_code,
-            }
-        })
+        .map(ProcessSnapshot::from)
         .collect::<Vec<_>>();
 
     Response::Ps {

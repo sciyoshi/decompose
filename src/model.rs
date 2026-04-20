@@ -281,3 +281,37 @@ pub struct ProcessSnapshot {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
 }
+
+impl From<&ProcessRuntime> for ProcessSnapshot {
+    /// Project a `ProcessRuntime` into its serializable `ProcessSnapshot`
+    /// form. Both structs share every overlapping field (including the
+    /// `has_readiness_probe` / `has_liveness_probe` bits derived from
+    /// `spec`), so this mapping is fully mechanical. Keeping it in one
+    /// place prevents drift when fields are added to either side.
+    fn from(runtime: &ProcessRuntime) -> Self {
+        let exit_code = match &runtime.status {
+            ProcessStatus::Exited { code } => Some(*code),
+            _ => None,
+        };
+        let pid = match &runtime.status {
+            ProcessStatus::Running { pid } => Some(*pid),
+            _ => None,
+        };
+        ProcessSnapshot {
+            name: runtime.spec.name.clone(),
+            base: runtime.spec.base_name.clone(),
+            replica: runtime.spec.replica,
+            status: runtime.status.to_human(),
+            state: runtime.status.to_json_status().to_string(),
+            description: runtime.spec.description.clone(),
+            restart_count: runtime.restart_count,
+            log_ready: runtime.log_ready,
+            ready: runtime.ready,
+            alive: runtime.alive,
+            has_readiness_probe: runtime.spec.readiness_probe.is_some(),
+            has_liveness_probe: runtime.spec.liveness_probe.is_some(),
+            pid,
+            exit_code,
+        }
+    }
+}
