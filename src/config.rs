@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    DependencyCondition, ExecCheck, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime,
-    ProcessStatus, RestartPolicy,
+    DependencyCondition, ExecCheck, ExitMode, HealthProbe, HttpCheck, ProcessInstanceSpec,
+    ProcessRuntime, ProcessStatus, RestartPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -721,11 +721,26 @@ impl Interpolate for ExecCheck {
     }
 }
 
+impl Interpolate for HttpCheck {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        self.host.interpolate(vars);
+        self.scheme.interpolate(vars);
+        self.path.interpolate(vars);
+    }
+}
+
+impl<T: Interpolate> Interpolate for Vec<T> {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        for item in self.iter_mut() {
+            item.interpolate(vars);
+        }
+    }
+}
+
 impl Interpolate for HealthProbe {
     fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
         self.exec.interpolate(vars);
-        // `http_get` has no interpolated fields today; if it gains one
-        // (e.g. `path`), add it here.
+        self.http_get.interpolate(vars);
     }
 }
 
@@ -740,6 +755,7 @@ impl Interpolate for ProcessConfig {
         self.command.interpolate(vars);
         self.description.interpolate(vars);
         self.working_dir.interpolate(vars);
+        self.env_file.interpolate(vars);
         self.ready_log_line.interpolate(vars);
         self.shutdown.interpolate(vars);
         self.readiness_probe.interpolate(vars);
@@ -2001,6 +2017,42 @@ processes:
                 .command,
             "alive --port 4222"
         );
+    }
+
+    #[test]
+    fn apply_interpolation_on_http_probe_and_env_file() {
+        let yaml = r#"
+environment:
+  HOST: "example.internal"
+  CFG_DIR: "configs"
+processes:
+  svc:
+    command: "run"
+    env_file:
+      - "${CFG_DIR}/extra.env"
+    readiness_probe:
+      http_get:
+        host: "${HOST}"
+        scheme: "https"
+        path: "/healthz/${HOST}"
+        port: 8080
+      period_seconds: 5
+"#;
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        apply_interpolation(&mut cfg);
+
+        let svc = cfg.processes.get("svc").unwrap();
+        assert_eq!(svc.env_file, vec!["configs/extra.env".to_string()]);
+        let http = svc
+            .readiness_probe
+            .as_ref()
+            .unwrap()
+            .http_get
+            .as_ref()
+            .unwrap();
+        assert_eq!(http.host, "example.internal");
+        assert_eq!(http.scheme, "https");
+        assert_eq!(http.path, "/healthz/example.internal");
     }
 
     #[test]
