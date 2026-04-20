@@ -1595,6 +1595,13 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
                         // `alive` defaults to true for a fresh
                         // instance — see ProcessRuntime docs.
                         runtime.alive = true;
+                        // Explicit `start` overrides the disabled flag for
+                        // this instance; otherwise the supervisor filter
+                        // would immediately skip the Pending runtime and
+                        // the service would never launch. Transitive deps
+                        // pulled in above are overridden too so `start A`
+                        // can bring up a disabled dep.
+                        runtime.spec.disabled = false;
                         started += 1;
                     }
                 }
