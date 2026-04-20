@@ -2,6 +2,7 @@ pub mod cli;
 pub mod completion;
 pub mod config;
 pub mod daemon;
+pub mod health_probes;
 pub mod ipc;
 pub mod model;
 pub mod output;
