@@ -355,12 +355,18 @@ mod tests {
 
     #[test]
     fn check_socket_path_length_rejects_deeply_nested_runtime_dir() {
-        // Simulate a real-world offender: long $HOME + long XDG_RUNTIME_DIR.
-        let long_runtime =
-            "/Users/averyverylongusername/Library/Application Support/xdg-runtime-dir/decompose";
+        // Simulate a real-world offender: long $HOME + long XDG_RUNTIME_DIR +
+        // a session-scoped subdir. Path is constructed to exceed the usable
+        // limit on both macOS (103) and Linux (107).
+        let long_runtime = "/Users/averyverylongusernamewithmanycharacters/Library/Application Support/xdg-runtime-dir/decompose/session-scope";
         let mut p = PathBuf::from(long_runtime);
         p.push("0123456789abcdef.sock");
-        assert!(p.as_os_str().len() > SOCKET_PATH_MAX - 1);
+        assert!(
+            p.as_os_str().len() > SOCKET_PATH_MAX - 1,
+            "path len {} must exceed usable limit {}",
+            p.as_os_str().len(),
+            SOCKET_PATH_MAX - 1
+        );
         assert!(check_socket_path_length(&p).is_err());
     }
 
