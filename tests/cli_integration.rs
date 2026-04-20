@@ -4708,18 +4708,10 @@ processes:
 }
 
 #[test]
-#[ignore = "process-group handling not yet implemented — see bd issue"]
 fn shutdown_terminates_grandchild_processes() {
     // A shell command that forks off a long-lived grandchild. On `down`
-    // the daemon should signal the whole process group so the grandchild
-    // dies with its parent — otherwise we leak a `sleep` for the caller
-    // to notice later.
-    //
-    // Currently the daemon sends SIGTERM to the direct child pid only, so
-    // backgrounded grandchildren are orphaned. This test is `#[ignore]`d
-    // until the daemon spawns children into their own process group (via
-    // `setsid`/`pre_exec`) and signals the group on shutdown. Runs with
-    // `cargo test -- --ignored` for local verification once fixed.
+    // the daemon signals the whole process group so the grandchild dies
+    // with its parent.
     let (_root, project, runtime, state, _config) = setup_project();
     let home = project.parent().expect("parent").join("home");
 

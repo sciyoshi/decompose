@@ -781,6 +781,12 @@ async fn spawn_process_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .envs(&spec.environment);
+    // Put each service in its own process group so that a signal sent to
+    // the pgid reaches any backgrounded grandchildren too (the shell
+    // forks them out, e.g. `foo & bar`). Without this, `down` only stops
+    // the immediate child and leaks grandchildren.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     match cmd.spawn().with_context(|| {
         format!(
@@ -1192,7 +1198,9 @@ async fn shutdown_child(
         }
     }
 
-    // Step 2: Send signal
+    // Step 2: Send signal to the process group so backgrounded grandchildren
+    // exit too. Each spawned service has its own pgid (set via
+    // `cmd.process_group(0)`), and the leader's pid doubles as the pgid.
     let signal = spec.shutdown_signal.unwrap_or(15);
     if let Some(pid) = child.id() {
         #[cfg(unix)]
@@ -1200,7 +1208,7 @@ async fn shutdown_child(
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
             if let Ok(sig) = Signal::try_from(signal) {
-                let _ = signal::kill(Pid::from_raw(pid as i32), sig);
+                let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
             }
         }
         #[cfg(not(unix))]
@@ -1221,7 +1229,15 @@ async fn shutdown_child(
     };
 
     if !terminated {
-        // Step 4: Force kill
+        // Step 4: Force kill the group (covers grandchildren).
+        #[cfg(unix)]
+        {
+            if let Some(pid) = child.id() {
+                use nix::sys::signal::{self, Signal};
+                use nix::unistd::Pid;
+                let _ = signal::kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+            }
+        }
         let _ = child.start_kill();
         let _ = child.wait().await;
     }
@@ -1662,7 +1678,9 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
                             use nix::sys::signal::{self, Signal};
                             use nix::unistd::Pid;
                             if let Ok(sig) = Signal::try_from(signal) {
-                                let _ = signal::kill(Pid::from_raw(pid as i32), sig);
+                                // Signal the whole process group so
+                                // backgrounded grandchildren exit too.
+                                let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
                             }
                         }
                     }
