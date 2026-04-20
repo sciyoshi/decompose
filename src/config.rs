@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    DependencyCondition, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime, ProcessStatus,
-    RestartPolicy,
+    DependencyCondition, ExecCheck, ExitMode, HealthProbe, ProcessInstanceSpec, ProcessRuntime,
+    ProcessStatus, RestartPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -672,11 +672,79 @@ fn lookup_var(name: &str, vars: &BTreeMap<String, String>) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// Walks the tree of interpolated config fields, substituting `${VAR}` and
+/// `$VAR` references against `vars`. Each impl is responsible only for its
+/// own string-valued fields and for recursing into children; containers like
+/// `Option<T>` and `Vec<T>` are handled by blanket impls. Cross-cutting
+/// concerns (building the global/per-process var sets, global-env sequential
+/// evaluation, the `disable_env_expansion` short-circuit) live in
+/// `apply_interpolation` rather than in the trait.
+trait Interpolate {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>);
+}
+
+impl Interpolate for String {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        *self = interpolate_vars(self, vars);
+    }
+}
+
+impl Interpolate for PathBuf {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        *self = PathBuf::from(interpolate_vars(&self.to_string_lossy(), vars));
+    }
+}
+
+impl<T: Interpolate> Interpolate for Option<T> {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        if let Some(inner) = self {
+            inner.interpolate(vars);
+        }
+    }
+}
+
+impl Interpolate for ExecCheck {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        self.command.interpolate(vars);
+    }
+}
+
+impl Interpolate for HealthProbe {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        self.exec.interpolate(vars);
+        // `http_get` has no interpolated fields today; if it gains one
+        // (e.g. `path`), add it here.
+    }
+}
+
+impl Interpolate for ShutdownConfig {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        self.command.interpolate(vars);
+    }
+}
+
+impl Interpolate for ProcessConfig {
+    fn interpolate(&mut self, vars: &BTreeMap<String, String>) {
+        self.command.interpolate(vars);
+        self.description.interpolate(vars);
+        self.working_dir.interpolate(vars);
+        self.ready_log_line.interpolate(vars);
+        self.shutdown.interpolate(vars);
+        self.readiness_probe.interpolate(vars);
+        self.liveness_probe.interpolate(vars);
+        // `environment` is interpolated by `apply_interpolation` after its
+        // caller has assembled the process-scoped var set; doing it here
+        // would double-apply.
+    }
+}
+
 pub fn apply_interpolation(cfg: &mut ProjectConfig) {
     if cfg.disable_env_expansion {
         return;
     }
 
+    // Global env is interpolated sequentially so each entry can reference
+    // keys that were declared earlier in the map.
     let mut global_vars = BTreeMap::new();
     let keys: Vec<String> = cfg.environment.0.keys().cloned().collect();
     for key in &keys {
@@ -691,39 +759,11 @@ pub fn apply_interpolation(cfg: &mut ProjectConfig) {
         let mut vars = global_vars.clone();
         vars.extend(proc_cfg.environment.0.clone());
 
-        proc_cfg.command = interpolate_vars(&proc_cfg.command, &vars);
+        proc_cfg.interpolate(&vars);
 
-        if let Some(ref desc) = proc_cfg.description {
-            proc_cfg.description = Some(interpolate_vars(desc, &vars));
-        }
-
-        if let Some(ref wd) = proc_cfg.working_dir {
-            let interpolated = interpolate_vars(&wd.to_string_lossy(), &vars);
-            proc_cfg.working_dir = Some(PathBuf::from(interpolated));
-        }
-
-        if let Some(ref line) = proc_cfg.ready_log_line {
-            proc_cfg.ready_log_line = Some(interpolate_vars(line, &vars));
-        }
-
-        if let Some(ref mut shutdown) = proc_cfg.shutdown {
-            if let Some(ref cmd) = shutdown.command {
-                shutdown.command = Some(interpolate_vars(cmd, &vars));
-            }
-        }
-
-        if let Some(ref mut probe) = proc_cfg.readiness_probe {
-            if let Some(ref mut exec) = probe.exec {
-                exec.command = interpolate_vars(&exec.command, &vars);
-            }
-        }
-
-        if let Some(ref mut probe) = proc_cfg.liveness_probe {
-            if let Some(ref mut exec) = probe.exec {
-                exec.command = interpolate_vars(&exec.command, &vars);
-            }
-        }
-
+        // Per-process env entries resolve against a frozen snapshot that
+        // already includes their own (uninterpolated) values, matching the
+        // previous hand-written behavior.
         let env_keys: Vec<String> = proc_cfg.environment.0.keys().cloned().collect();
         for key in &env_keys {
             if let Some(raw) = proc_cfg.environment.0.get(key) {
