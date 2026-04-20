@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -617,70 +619,50 @@ pub fn load_dotenv_files(
 // Variable interpolation
 // ---------------------------------------------------------------------------
 
+/// Matches, in priority order:
+///   1. `$$` — literal `$` escape (consumes both dollars)
+///   2. `${...}` — braced expansion (greedy up to the FIRST `}`)
+///   3. `$IDENT` — unbraced expansion (alpha/underscore then
+///      alphanumeric/underscore)
+///   4. `$` — lone `$` with no valid follower; emitted as-is
+///
+/// The braced form intentionally uses `[^}]*` so a nested `${B:-c}` inside a
+/// default is NOT parsed recursively — the scanner grabs the first close brace
+/// and emits the default literally. This behavior is locked in by
+/// `interpolate_nested_default_is_not_recursive`; do not "fix" it here.
+static INTERPOLATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\$|\$\{([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$").unwrap());
+
 pub fn interpolate_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
-    let mut result = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        if chars[i] != '$' {
-            result.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        if i + 1 < len && chars[i + 1] == '$' {
-            result.push('$');
-            i += 2;
-            continue;
-        }
-
-        if i + 1 < len && chars[i + 1] == '{' {
-            if let Some(close) = chars[i + 2..].iter().position(|&c| c == '}') {
-                let inner: String = chars[i + 2..i + 2 + close].iter().collect();
-                let (var_name, default) = if let Some((name, def)) = inner.split_once(":-") {
-                    (name, Some(def.to_string()))
-                } else {
-                    (inner.as_str(), None)
+    INTERPOLATE_RE
+        .replace_all(input, |caps: &Captures<'_>| {
+            let whole = &caps[0];
+            if whole == "$$" {
+                return "$".to_string();
+            }
+            if whole == "$" {
+                // Lone `$` with no valid follower — emit verbatim.
+                return "$".to_string();
+            }
+            if let Some(inner) = caps.get(1) {
+                // `${...}` form — optionally with `:-default`.
+                let (name, default) = match inner.as_str().split_once(":-") {
+                    Some((n, d)) => (n, Some(d)),
+                    None => (inner.as_str(), None),
                 };
-
-                let value = lookup_var(var_name, vars);
-                match value {
-                    Some(v) => result.push_str(&v),
-                    None => {
-                        if let Some(def) = default {
-                            result.push_str(&def);
-                        }
-                    }
-                }
-                i = i + 2 + close + 1;
-                continue;
+                return match lookup_var(name, vars) {
+                    Some(v) => v,
+                    None => default.unwrap_or("").to_string(),
+                };
             }
-            result.push('$');
-            i += 1;
-            continue;
-        }
-
-        if i + 1 < len && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
-            let start = i + 1;
-            let mut end = start;
-            while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
-                end += 1;
+            if let Some(name) = caps.get(2) {
+                // `$IDENT` form — undefined becomes empty.
+                return lookup_var(name.as_str(), vars).unwrap_or_default();
             }
-            let var_name: String = chars[start..end].iter().collect();
-            if let Some(v) = lookup_var(&var_name, vars) {
-                result.push_str(&v);
-            }
-            i = end;
-            continue;
-        }
-
-        result.push('$');
-        i += 1;
-    }
-
-    result
+            // Unreachable given the regex above, but fall back to the raw match.
+            whole.to_string()
+        })
+        .into_owned()
 }
 
 fn lookup_var(name: &str, vars: &BTreeMap<String, String>) -> Option<String> {
@@ -1839,6 +1821,43 @@ processes:
         // invisible and it behaves normally.
         vars.insert("A".to_string(), "ay".to_string());
         assert_eq!(interpolate_vars("${A:-${B}}", &vars), "ay}");
+    }
+
+    #[test]
+    fn interpolate_adjacent_substitutions() {
+        // No separator between two variables — each resolves independently.
+        let mut vars = BTreeMap::new();
+        vars.insert("A".to_string(), "foo".to_string());
+        vars.insert("B".to_string(), "bar".to_string());
+        assert_eq!(interpolate_vars("${A}${B}", &vars), "foobar");
+        assert_eq!(interpolate_vars("$A$B", &vars), "foobar");
+    }
+
+    #[test]
+    fn interpolate_empty_default() {
+        // `${VAR:-}` with VAR unset should produce the empty string (not
+        // something like a literal `${VAR:-}`).
+        let vars = BTreeMap::new();
+        assert_eq!(interpolate_vars("x${UNSET:-}y", &vars), "xy");
+    }
+
+    #[test]
+    fn interpolate_unterminated_brace() {
+        // `${FOO` with no closing brace is not a valid expansion; the `$` is
+        // emitted literally and the rest of the text is left untouched so the
+        // user can see what they wrote.
+        let mut vars = BTreeMap::new();
+        vars.insert("FOO".to_string(), "ignored".to_string());
+        assert_eq!(interpolate_vars("hi ${FOO", &vars), "hi ${FOO");
+    }
+
+    #[test]
+    fn interpolate_var_at_end_of_string() {
+        // Expansion that goes right up to the end of the input.
+        let mut vars = BTreeMap::new();
+        vars.insert("NAME".to_string(), "world".to_string());
+        assert_eq!(interpolate_vars("hello ${NAME}", &vars), "hello world");
+        assert_eq!(interpolate_vars("hello $NAME", &vars), "hello world");
     }
 
     #[test]
