@@ -5877,19 +5877,9 @@ processes:
 
 /// Reload toggling `disabled: true → false` via a second `up`.
 ///
-/// Because `compute_config_hash` excludes the `disabled` field, a pure
-/// disabled-toggle doesn't mark the service as `changed` in
-/// `compute_reload_plan`. The reload path therefore keeps the existing
-/// runtime (with `spec.disabled == true`) in place, and the post-reload
-/// `Start` flips its terminal status to `Pending` — only to be skipped by
-/// the supervisor's `spec.disabled` filter. Net effect: toggling disabled
-/// on a live daemon is a no-op.
-///
-/// Reverse toggle (`false → true`) has the opposite problem: the running
-/// process's `spec.disabled` was false when created, so even after the
-/// reload it keeps running — no stop is issued.
-///
-/// Both are surprising; bd decompose-xhv tracks the fix.
+/// Reload handles a pure `disabled` toggle as its own dimension: the
+/// existing runtime is stopped (true → ...) or flipped to Pending
+/// (... → false) without a recreate.
 #[test]
 fn disabled_reload_toggles_true_to_false() {
     let mut env = TestEnv::new();
@@ -5922,26 +5912,19 @@ processes:
     let up2 = env.run(&["up", "-d", "--json"]);
     assert_success(&up2, "second up with disabled: false");
 
-    // Current behaviour: reload classifies `toggler` as unchanged (hash
-    // excludes disabled), so the runtime keeps spec.disabled=true. Start
-    // flips status → Pending but supervisor skips. No pid ever appears.
-    let (final_state, final_pid) =
-        wait_for_state(&env, "toggler", Duration::from_millis(800), |s, p| {
+    // Reload flips Disabled → Pending; supervisor launches it.
+    let (state_after, pid_after) =
+        wait_for_state(&env, "toggler", Duration::from_secs(3), |s, p| {
             s == "running" && p.is_some()
         });
-    assert!(
-        final_pid.is_none(),
-        "toggling disabled true→false on a live daemon is currently a \
-         no-op: reload doesn't pick up the change and the supervisor \
-         filter blocks launch. Observed state={final_state:?}, \
-         pid={final_pid:?}. Flip this assertion once bd decompose-xhv \
-         lands the fix."
+    assert_eq!(
+        state_after, "running",
+        "toggler should be running after disabled=false reload, got {state_after:?}"
     );
+    let first_pid = pid_after.expect("running service must have a pid");
 
-    // Now toggle back to disabled: true and run up once more. The service
-    // was never actually running, so this has no observable effect beyond
-    // re-asserting disabled state in config. We're really probing that
-    // reload doesn't blow up on the reverse toggle either.
+    // Now toggle back to disabled: true. Reload stops the running instance
+    // and flips it to Disabled.
     env.with_config(
         r#"
 processes:
@@ -5953,7 +5936,16 @@ processes:
     let up3 = env.run(&["up", "-d", "--json"]);
     assert_success(&up3, "third up back to disabled: true");
 
-    let parsed = env.ps_json_value();
-    let (_, pid) = state_and_pid_of(&parsed, "toggler");
-    assert!(pid.is_none(), "still never launched, got pid={pid:?}");
+    let (state_final, pid_final) =
+        wait_for_state(&env, "toggler", Duration::from_secs(3), |s, _| {
+            s == "disabled"
+        });
+    assert_eq!(
+        state_final, "disabled",
+        "toggler should be disabled after reload, got {state_final:?}"
+    );
+    assert!(
+        pid_final.is_none(),
+        "disabled service must have no pid after toggle (had pid {first_pid} before)"
+    );
 }

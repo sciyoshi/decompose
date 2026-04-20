@@ -1332,6 +1332,11 @@ pub(crate) struct ReloadPlan {
     /// Maps base-name → `(old_count, new_count)`. Handled by the daemon as
     /// spawn-up / stop-highest-index rather than a full recreate.
     pub scaled: BTreeMap<String, (u16, u16)>,
+    /// Services whose only change across the reload is the `disabled` flag.
+    /// Maps base-name → new `disabled` value. Handled without a recreate:
+    /// true → stop the running instance and park it; false → flip Disabled
+    /// to Pending so the supervisor launches it.
+    pub disabled_toggled: BTreeMap<String, bool>,
 }
 
 /// Summary of a single service's hash and replica count, keyed by the stable
@@ -1341,6 +1346,7 @@ pub(crate) struct ReloadPlan {
 pub(crate) struct ServiceFingerprint {
     pub config_hash: String,
     pub replicas: u16,
+    pub disabled: bool,
 }
 
 /// Diff an old set of service fingerprints against a new one. `deps` maps
@@ -1392,6 +1398,7 @@ pub(crate) fn compute_reload_plan(
             Some(old_fp) => {
                 let hash_differs = old_fp.config_hash != new_fp.config_hash;
                 let replicas_differ = old_fp.replicas != new_fp.replicas;
+                let disabled_toggled = old_fp.disabled != new_fp.disabled;
 
                 if force_recreate {
                     // `--force-recreate` overrides everything: recreate all.
@@ -1417,6 +1424,13 @@ pub(crate) fn compute_reload_plan(
                     // `handle_reload` for the re-keying under the state lock.
                     plan.scaled
                         .insert(name.clone(), (old_fp.replicas, new_fp.replicas));
+                    if disabled_toggled {
+                        plan.disabled_toggled.insert(name.clone(), new_fp.disabled);
+                    }
+                } else if disabled_toggled {
+                    // Only the disabled flag moved. Handled without a recreate:
+                    // the daemon stops or un-parks existing instances in place.
+                    plan.disabled_toggled.insert(name.clone(), new_fp.disabled);
                 } else {
                     plan.unchanged.push(name.clone());
                 }
@@ -1557,6 +1571,11 @@ async fn handle_stop(state: &SharedState, services: Vec<String>) -> Response {
 /// out of their terminal state, matching the behaviour `up` relies on.
 async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
     let mut guard = state.lock().await;
+    // Empty `services` means "start every eligible service" (e.g. the
+    // implicit Start that follows `up`'s Reload). In that mode, services
+    // with `disabled: true` must stay parked — they are eligible only when
+    // the user names them explicitly.
+    let explicit_start = !services.is_empty();
     match resolve_services_or_error(&guard, &services) {
         Err(resp) => resp,
         Ok(names) => {
@@ -1589,6 +1608,12 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
             for name in &to_start {
                 if let Some(runtime) = guard.processes.get_mut(name) {
                     if runtime.status.is_terminal() {
+                        // Skip disabled services under a blanket start: only
+                        // an explicit `start NAME` (or a transitive dep pulled
+                        // in by one) overrides the disabled flag.
+                        if !explicit_start && runtime.spec.disabled {
+                            continue;
+                        }
                         runtime.status = ProcessStatus::Pending;
                         runtime.log_ready = false;
                         runtime.ready = false;
@@ -1601,7 +1626,9 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
                         // the service would never launch. Transitive deps
                         // pulled in above are overridden too so `start A`
                         // can bring up a disabled dep.
-                        runtime.spec.disabled = false;
+                        if explicit_start {
+                            runtime.spec.disabled = false;
+                        }
                         started += 1;
                     }
                 }
@@ -1809,20 +1836,21 @@ async fn handle_reload(
     //    fall out naturally in the diff because we also include `replicas`
     //    (counted by iterating the instance map).
     let new_fingerprints: BTreeMap<String, ServiceFingerprint> = {
-        let mut map: BTreeMap<String, (String, u16)> = BTreeMap::new();
+        let mut map: BTreeMap<String, (String, u16, bool)> = BTreeMap::new();
         for runtime in new_process_map.values() {
             let entry = map
                 .entry(runtime.spec.base_name.clone())
-                .or_insert_with(|| (runtime.spec.config_hash.clone(), 0));
+                .or_insert_with(|| (runtime.spec.config_hash.clone(), 0, runtime.spec.disabled));
             entry.1 += 1;
         }
         map.into_iter()
-            .map(|(k, (hash, replicas))| {
+            .map(|(k, (hash, replicas, disabled))| {
                 (
                     k,
                     ServiceFingerprint {
                         config_hash: hash,
                         replicas,
+                        disabled,
                     },
                 )
             })
@@ -1842,20 +1870,21 @@ async fn handle_reload(
     // 3. Snapshot current state under the lock.
     let old_fingerprints: BTreeMap<String, ServiceFingerprint> = {
         let guard = state.lock().await;
-        let mut map: BTreeMap<String, (String, u16)> = BTreeMap::new();
+        let mut map: BTreeMap<String, (String, u16, bool)> = BTreeMap::new();
         for runtime in guard.processes.values() {
             let entry = map
                 .entry(runtime.spec.base_name.clone())
-                .or_insert_with(|| (runtime.spec.config_hash.clone(), 0));
+                .or_insert_with(|| (runtime.spec.config_hash.clone(), 0, runtime.spec.disabled));
             entry.1 += 1;
         }
         map.into_iter()
-            .map(|(k, (hash, replicas))| {
+            .map(|(k, (hash, replicas, disabled))| {
                 (
                     k,
                     ServiceFingerprint {
                         config_hash: hash,
                         replicas,
+                        disabled,
                     },
                 )
             })
@@ -1951,10 +1980,29 @@ async fn handle_reload(
         })
         .collect();
 
+    // Instances whose service just flipped disabled: false → true. We stop
+    // them here so the splice block below can flip their status to Disabled
+    // and clear their running state.
+    let disabled_now_true_instances: Vec<String> = {
+        let guard = state.lock().await;
+        guard
+            .processes
+            .iter()
+            .filter(|(_, r)| {
+                plan.disabled_toggled
+                    .get(&r.spec.base_name)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+
     let to_stop: Vec<String> = changed_instances
         .iter()
         .chain(removed_instances.iter())
         .chain(scaled_down_instances.iter())
+        .chain(disabled_now_true_instances.iter())
         .cloned()
         .collect();
 
@@ -2058,6 +2106,42 @@ async fn handle_reload(
             // scaled_up_tail contributes to `replica_delta` via plan.scaled,
             // so it doesn't need a separate counter here.
         }
+        // Apply disabled-flag toggles on services that were neither recreated
+        // nor scaled out of existence. For each toggled base name, walk every
+        // runtime of that service:
+        //   new disabled == true  → spec.disabled=true, status=Disabled.
+        //   new disabled == false → spec.disabled=false, Disabled → Pending.
+        let mut n_disabled_toggled = 0usize;
+        for (base, new_disabled) in &plan.disabled_toggled {
+            // Scaled services may have had their runtimes recreated (hash
+            // diverged) or dropped entirely; nothing to toggle for those.
+            if plan.changed.contains(base) {
+                continue;
+            }
+            for runtime in guard.processes.values_mut() {
+                if runtime.spec.base_name != *base {
+                    continue;
+                }
+                if *new_disabled {
+                    runtime.spec.disabled = true;
+                    runtime.status = ProcessStatus::Disabled;
+                    runtime.log_ready = false;
+                    runtime.ready = false;
+                    runtime.alive = true;
+                } else {
+                    runtime.spec.disabled = false;
+                    if matches!(runtime.status, ProcessStatus::Disabled) {
+                        runtime.status = ProcessStatus::Pending;
+                        runtime.log_ready = false;
+                        runtime.ready = false;
+                        runtime.alive = true;
+                    }
+                }
+                n_disabled_toggled += 1;
+            }
+        }
+        let _ = n_disabled_toggled; // reported below via plan.disabled_toggled.len()
+
         let removed_count = if remove_orphans {
             removed_instances.len()
         } else {
@@ -2262,6 +2346,15 @@ mod tests {
         ServiceFingerprint {
             config_hash: hash.to_string(),
             replicas,
+            disabled: false,
+        }
+    }
+
+    fn fp_disabled(hash: &str, replicas: u16, disabled: bool) -> ServiceFingerprint {
+        ServiceFingerprint {
+            config_hash: hash.to_string(),
+            replicas,
+            disabled,
         }
     }
 
@@ -2508,6 +2601,26 @@ mod tests {
 
         assert_eq!(plan.changed, vec!["api".to_string()]);
         assert_eq!(plan.unchanged, vec!["db".to_string()]);
+    }
+
+    #[test]
+    fn reload_plan_records_disabled_toggle_without_recreate() {
+        let mut old = BTreeMap::new();
+        old.insert("api".to_string(), fp_disabled("h_api", 1, false));
+        old.insert("worker".to_string(), fp_disabled("h_w", 1, true));
+
+        let mut new = BTreeMap::new();
+        new.insert("api".to_string(), fp_disabled("h_api", 1, true));
+        new.insert("worker".to_string(), fp_disabled("h_w", 1, false));
+
+        let deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let plan = compute_reload_plan(&old, &new, &deps, false, false).expect("ok");
+
+        // Neither service hash changed, so neither is `changed` or `unchanged`.
+        assert!(plan.changed.is_empty());
+        assert!(plan.unchanged.is_empty());
+        assert_eq!(plan.disabled_toggled.get("api"), Some(&true));
+        assert_eq!(plan.disabled_toggled.get("worker"), Some(&false));
     }
 
     #[test]
