@@ -18,6 +18,17 @@ pub const DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 pub const FILE_MODE: u32 = 0o600;
 
+/// Maximum length (in bytes) of a Unix domain socket path, **including** the
+/// trailing NUL terminator. The kernel's `sockaddr_un.sun_path` buffer is
+/// 104 bytes on macOS/BSD and 108 bytes on Linux; bind(2)/connect(2) fail
+/// with a cryptic `EINVAL` ("Invalid argument") when exceeded.
+#[cfg(target_os = "macos")]
+pub const SOCKET_PATH_MAX: usize = 104;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const SOCKET_PATH_MAX: usize = 108;
+#[cfg(not(unix))]
+pub const SOCKET_PATH_MAX: usize = 108;
+
 /// Create a directory (and ancestors as needed) with restrictive 0o700 perms.
 ///
 /// If the final directory already exists (e.g. from an older decompose version
@@ -112,12 +123,43 @@ pub fn runtime_paths_for(instance: &str) -> Result<RuntimePaths> {
     create_dir_secure(&socket_root)?;
     create_dir_secure(&state_root)?;
 
+    let socket = socket_root.join(format!("{instance}.sock"));
+    check_socket_path_length(&socket)?;
+
     Ok(RuntimePaths {
-        socket: socket_root.join(format!("{instance}.sock")),
+        socket,
         pid: state_root.join(format!("{instance}.pid")),
         daemon_log: state_root.join(format!("{instance}.log")),
         lock: state_root.join(format!("{instance}.lock")),
     })
+}
+
+/// Validate that `path` fits in the kernel's `sockaddr_un.sun_path` buffer.
+///
+/// Returns an error describing the limit, the actual length, and a workaround
+/// when the path (plus its NUL terminator) would exceed the per-OS limit.
+pub fn check_socket_path_length(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes().len();
+    // sun_path holds the NUL terminator, so usable path bytes = MAX - 1.
+    let usable = SOCKET_PATH_MAX.saturating_sub(1);
+    if bytes > usable {
+        let limit = SOCKET_PATH_MAX;
+        let os = if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            "Linux"
+        };
+        return Err(anyhow!(
+            "socket path is too long for the kernel's sockaddr_un.sun_path buffer \
+             ({os} limit: {limit} bytes including NUL; usable: {usable} bytes; \
+             got {bytes} bytes): {path}\n\
+             \n\
+             Set a shorter XDG_RUNTIME_DIR to work around this, e.g.:\n    \
+             export XDG_RUNTIME_DIR=/tmp/xdg-run",
+            path = path.display(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn socket_root_with_env(
@@ -275,6 +317,51 @@ mod tests {
         create_dir_secure(&target).unwrap();
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn check_socket_path_length_accepts_short_path() {
+        let p = PathBuf::from("/tmp/decompose/abc.sock");
+        assert!(check_socket_path_length(&p).is_ok());
+    }
+
+    #[test]
+    fn check_socket_path_length_accepts_path_at_limit() {
+        // Usable bytes = SOCKET_PATH_MAX - 1 (NUL terminator).
+        let usable = SOCKET_PATH_MAX - 1;
+        // Build an absolute path of exactly `usable` bytes.
+        let mut s = String::from("/");
+        s.push_str(&"a".repeat(usable - 1));
+        let p = PathBuf::from(&s);
+        assert_eq!(p.as_os_str().len(), usable);
+        assert!(check_socket_path_length(&p).is_ok());
+    }
+
+    #[test]
+    fn check_socket_path_length_rejects_overlong_path() {
+        // One byte over the usable limit.
+        let over = SOCKET_PATH_MAX; // usable + 1
+        let mut s = String::from("/");
+        s.push_str(&"a".repeat(over - 1));
+        let p = PathBuf::from(&s);
+        assert_eq!(p.as_os_str().len(), over);
+        let err = check_socket_path_length(&p).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("socket path is too long"), "msg={msg}");
+        assert!(msg.contains(&format!("{SOCKET_PATH_MAX}")), "msg={msg}");
+        assert!(msg.contains(&format!("{over}")), "msg={msg}");
+        assert!(msg.contains("XDG_RUNTIME_DIR"), "msg={msg}");
+    }
+
+    #[test]
+    fn check_socket_path_length_rejects_deeply_nested_runtime_dir() {
+        // Simulate a real-world offender: long $HOME + long XDG_RUNTIME_DIR.
+        let long_runtime =
+            "/Users/averyverylongusername/Library/Application Support/xdg-runtime-dir/decompose";
+        let mut p = PathBuf::from(long_runtime);
+        p.push("0123456789abcdef.sock");
+        assert!(p.as_os_str().len() > SOCKET_PATH_MAX - 1);
+        assert!(check_socket_path_length(&p).is_err());
     }
 
     #[cfg(unix)]
