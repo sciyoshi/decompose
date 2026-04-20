@@ -12,21 +12,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-jobs:
-  create-release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          changelog: CHANGELOG.md
-          allow-missing-changelog: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+# The GitHub release itself is created by the `/release` Claude skill via
+# `gh release create`, which also pushes the tag that triggers this workflow.
+# Release notes live on the GitHub release and are the source of truth for
+# the changelog — there is no CHANGELOG.md in this repo.
 
+jobs:
   upload-assets:
     name: Upload ${{ matrix.target }}
-    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +50,6 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    needs: create-release
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
