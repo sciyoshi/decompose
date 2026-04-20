@@ -1670,45 +1670,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 instance: guard.instance.clone(),
             }
         }
-        Request::Ps => {
-            let guard = state.lock().await;
-            let processes = guard
-                .processes
-                .values()
-                .map(|proc_runtime| {
-                    let exit_code = match &proc_runtime.status {
-                        ProcessStatus::Exited { code } => Some(*code),
-                        _ => None,
-                    };
-                    let pid = match &proc_runtime.status {
-                        ProcessStatus::Running { pid } => Some(*pid),
-                        _ => None,
-                    };
-                    ProcessSnapshot {
-                        name: proc_runtime.spec.name.clone(),
-                        base: proc_runtime.spec.base_name.clone(),
-                        replica: proc_runtime.spec.replica,
-                        status: proc_runtime.status.to_human(),
-                        state: proc_runtime.status.to_json_status().to_string(),
-                        description: proc_runtime.spec.description.clone(),
-                        restart_count: proc_runtime.restart_count,
-                        log_ready: proc_runtime.log_ready,
-                        ready: proc_runtime.ready,
-                        alive: proc_runtime.alive,
-                        has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),
-                        has_liveness_probe: proc_runtime.spec.liveness_probe.is_some(),
-                        pid,
-                        exit_code,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            Response::Ps {
-                pid: std::process::id(),
-                instance: guard.instance.clone(),
-                processes,
-            }
-        }
+        Request::Ps => handle_ps(&state).await,
         Request::Down { timeout_seconds } => {
             let mut guard = state.lock().await;
             guard.shutdown_timeout_override = timeout_seconds;
@@ -1717,170 +1679,11 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 message: "shutdown requested".to_string(),
             }
         }
-        Request::Stop { services } => {
-            let mut guard = state.lock().await;
-            match resolve_services_or_error(&guard, &services) {
-                Err(resp) => resp,
-                Ok(names) => {
-                    guard.stop_instances(&names);
-                    Response::Ack {
-                        message: format!("stopping {}", describe_services(&services)),
-                    }
-                }
-            }
-        }
-        Request::Start { services } => {
-            let mut guard = state.lock().await;
-            match resolve_services_or_error(&guard, &services) {
-                Err(resp) => resp,
-                Ok(names) => {
-                    // Collect the set of services to start, including their
-                    // transitive dependencies that are also in a terminal state
-                    // (e.g. NotStarted). This ensures `start serviceB` also
-                    // brings up serviceB's deps if they haven't been launched.
-                    let mut to_start: std::collections::BTreeSet<String> =
-                        names.into_iter().collect();
-                    let mut queue: std::collections::VecDeque<String> =
-                        to_start.iter().cloned().collect();
-                    while let Some(name) = queue.pop_front() {
-                        if let Some(runtime) = guard.processes.get(&name) {
-                            for dep_base in runtime.spec.depends_on.keys() {
-                                // Find all runtime instances matching the dep base name
-                                let dep_names: Vec<String> = guard
-                                    .processes
-                                    .iter()
-                                    .filter(|(_, r)| r.spec.base_name == *dep_base)
-                                    .map(|(n, _)| n.clone())
-                                    .collect();
-                                for dep_name in dep_names {
-                                    if to_start.insert(dep_name.clone()) {
-                                        queue.push_back(dep_name);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let mut started = 0;
-                    for name in &to_start {
-                        if let Some(runtime) = guard.processes.get_mut(name) {
-                            if runtime.status.is_terminal() {
-                                runtime.status = ProcessStatus::Pending;
-                                runtime.log_ready = false;
-                                runtime.ready = false;
-                                // `alive` defaults to true for a fresh
-                                // instance — see ProcessRuntime docs.
-                                runtime.alive = true;
-                                started += 1;
-                            }
-                        }
-                    }
-                    if started == 0 {
-                        Response::Ack {
-                            message: format!("{} already running", describe_services(&services)),
-                        }
-                    } else {
-                        Response::Ack {
-                            message: format!("starting {}", describe_services(&services)),
-                        }
-                    }
-                }
-            }
-        }
-        Request::Kill { services, signal } => {
-            let guard = state.lock().await;
-            match resolve_services_or_error(&guard, &services) {
-                Err(resp) => resp,
-                Ok(names) => {
-                    for name in &names {
-                        if let Some(runtime) = guard.processes.get(name) {
-                            if let ProcessStatus::Running { pid } = runtime.status {
-                                #[cfg(unix)]
-                                {
-                                    use nix::sys::signal::{self, Signal};
-                                    use nix::unistd::Pid;
-                                    if let Ok(sig) = Signal::try_from(signal) {
-                                        let _ = signal::kill(Pid::from_raw(pid as i32), sig);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Response::Ack {
-                        message: format!("killed {}", describe_services(&services)),
-                    }
-                }
-            }
-        }
-        Request::Restart { services } => {
-            let mut guard = state.lock().await;
-            match resolve_services_or_error(&guard, &services) {
-                Err(resp) => resp,
-                Ok(names) => {
-                    guard.stop_instances(&names);
-                    drop(guard);
-                    // Spawn a task to wait for stop then reset to Pending
-                    let state_clone = state.clone();
-                    let names_clone = names.clone();
-                    tokio::spawn(async move {
-                        wait_for_terminal(
-                            &state_clone,
-                            &names_clone,
-                            Duration::from_millis(50),
-                            200,
-                        )
-                        .await;
-                        let mut guard = state_clone.lock().await;
-                        for name in &names_clone {
-                            if let Some(runtime) = guard.processes.get_mut(name) {
-                                runtime.status = ProcessStatus::Pending;
-                                runtime.log_ready = false;
-                                runtime.ready = false;
-                                runtime.alive = true;
-                            }
-                        }
-                    });
-                    Response::Ack {
-                        message: format!("restarting {}", describe_services(&services)),
-                    }
-                }
-            }
-        }
-        Request::RemoveOrphans { keep } => {
-            let mut guard = state.lock().await;
-            let keep_set: std::collections::HashSet<&str> =
-                keep.iter().map(|s| s.as_str()).collect();
-            let orphans: Vec<String> = guard
-                .processes
-                .keys()
-                .filter(|name| {
-                    let base = guard.processes[name.as_str()].spec.base_name.as_str();
-                    !keep_set.contains(base)
-                })
-                .cloned()
-                .collect();
-            guard.stop_instances(&orphans);
-            // Spawn a task to wait for orphans to stop then remove them
-            if !orphans.is_empty() {
-                let state_clone = state.clone();
-                let orphans_clone = orphans.clone();
-                tokio::spawn(async move {
-                    wait_for_terminal(&state_clone, &orphans_clone, Duration::from_millis(50), 200)
-                        .await;
-                    let mut guard = state_clone.lock().await;
-                    for name in &orphans_clone {
-                        guard.processes.remove(name);
-                        guard.controllers.remove(name);
-                    }
-                });
-            }
-            let msg = if orphans.is_empty() {
-                "no orphan processes found".to_string()
-            } else {
-                format!("removing orphan(s): {}", orphans.join(", "))
-            };
-            Response::Ack { message: msg }
-        }
+        Request::Stop { services } => handle_stop(&state, services).await,
+        Request::Start { services } => handle_start(&state, services).await,
+        Request::Kill { services, signal } => handle_kill(&state, services, signal).await,
+        Request::Restart { services } => handle_restart(&state, services).await,
+        Request::RemoveOrphans { keep } => handle_remove_orphans(&state, keep).await,
         Request::Reload {
             force_recreate,
             no_recreate,
@@ -1896,21 +1699,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             )
             .await
         }
-        Request::ServiceRunState { name } => {
-            let guard = state.lock().await;
-            let mut known = false;
-            let mut any_running = false;
-            for runtime in guard.processes.values() {
-                if runtime.spec.base_name == name || runtime.spec.name == name {
-                    known = true;
-                    if matches!(runtime.status, ProcessStatus::Running { .. }) {
-                        any_running = true;
-                        break;
-                    }
-                }
-            }
-            Response::ServiceRunState { known, any_running }
-        }
+        Request::ServiceRunState { name } => handle_service_run_state(&state, name).await,
     };
 
     let payload = serde_json::to_string(&response)?;
@@ -1918,6 +1707,241 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
     Ok(())
+}
+
+/// Snapshot every tracked process into a `Response::Ps`. Read-only; holds the
+/// state lock just long enough to clone the runtime fields.
+async fn handle_ps(state: &SharedState) -> Response {
+    let guard = state.lock().await;
+    let processes = guard
+        .processes
+        .values()
+        .map(|proc_runtime| {
+            let exit_code = match &proc_runtime.status {
+                ProcessStatus::Exited { code } => Some(*code),
+                _ => None,
+            };
+            let pid = match &proc_runtime.status {
+                ProcessStatus::Running { pid } => Some(*pid),
+                _ => None,
+            };
+            ProcessSnapshot {
+                name: proc_runtime.spec.name.clone(),
+                base: proc_runtime.spec.base_name.clone(),
+                replica: proc_runtime.spec.replica,
+                status: proc_runtime.status.to_human(),
+                state: proc_runtime.status.to_json_status().to_string(),
+                description: proc_runtime.spec.description.clone(),
+                restart_count: proc_runtime.restart_count,
+                log_ready: proc_runtime.log_ready,
+                ready: proc_runtime.ready,
+                alive: proc_runtime.alive,
+                has_readiness_probe: proc_runtime.spec.readiness_probe.is_some(),
+                has_liveness_probe: proc_runtime.spec.liveness_probe.is_some(),
+                pid,
+                exit_code,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Response::Ps {
+        pid: std::process::id(),
+        instance: guard.instance.clone(),
+        processes,
+    }
+}
+
+/// Stop the named services (or all services when `services` is empty).
+/// Returns an error response if any name is unknown; otherwise triggers the
+/// supervisor to begin shutdown and acks immediately.
+async fn handle_stop(state: &SharedState, services: Vec<String>) -> Response {
+    let mut guard = state.lock().await;
+    match resolve_services_or_error(&guard, &services) {
+        Err(resp) => resp,
+        Ok(names) => {
+            guard.stop_instances(&names);
+            Response::Ack {
+                message: format!("stopping {}", describe_services(&services)),
+            }
+        }
+    }
+}
+
+/// Start the named services (or all services when `services` is empty). Walks
+/// the dependency graph so transitively-depended-on services also get flipped
+/// out of their terminal state, matching the behaviour `up` relies on.
+async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
+    let mut guard = state.lock().await;
+    match resolve_services_or_error(&guard, &services) {
+        Err(resp) => resp,
+        Ok(names) => {
+            // Collect the set of services to start, including their
+            // transitive dependencies that are also in a terminal state
+            // (e.g. NotStarted). This ensures `start serviceB` also
+            // brings up serviceB's deps if they haven't been launched.
+            let mut to_start: std::collections::BTreeSet<String> = names.into_iter().collect();
+            let mut queue: std::collections::VecDeque<String> = to_start.iter().cloned().collect();
+            while let Some(name) = queue.pop_front() {
+                if let Some(runtime) = guard.processes.get(&name) {
+                    for dep_base in runtime.spec.depends_on.keys() {
+                        // Find all runtime instances matching the dep base name
+                        let dep_names: Vec<String> = guard
+                            .processes
+                            .iter()
+                            .filter(|(_, r)| r.spec.base_name == *dep_base)
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        for dep_name in dep_names {
+                            if to_start.insert(dep_name.clone()) {
+                                queue.push_back(dep_name);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut started = 0;
+            for name in &to_start {
+                if let Some(runtime) = guard.processes.get_mut(name) {
+                    if runtime.status.is_terminal() {
+                        runtime.status = ProcessStatus::Pending;
+                        runtime.log_ready = false;
+                        runtime.ready = false;
+                        // `alive` defaults to true for a fresh
+                        // instance — see ProcessRuntime docs.
+                        runtime.alive = true;
+                        started += 1;
+                    }
+                }
+            }
+            if started == 0 {
+                Response::Ack {
+                    message: format!("{} already running", describe_services(&services)),
+                }
+            } else {
+                Response::Ack {
+                    message: format!("starting {}", describe_services(&services)),
+                }
+            }
+        }
+    }
+}
+
+/// Send `signal` to every Running instance of the named services. Unknown
+/// services error out; services that aren't currently running are silently
+/// skipped (the signal only has a target for actively-Running PIDs).
+async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) -> Response {
+    let guard = state.lock().await;
+    match resolve_services_or_error(&guard, &services) {
+        Err(resp) => resp,
+        Ok(names) => {
+            for name in &names {
+                if let Some(runtime) = guard.processes.get(name) {
+                    if let ProcessStatus::Running { pid } = runtime.status {
+                        #[cfg(unix)]
+                        {
+                            use nix::sys::signal::{self, Signal};
+                            use nix::unistd::Pid;
+                            if let Ok(sig) = Signal::try_from(signal) {
+                                let _ = signal::kill(Pid::from_raw(pid as i32), sig);
+                            }
+                        }
+                    }
+                }
+            }
+            Response::Ack {
+                message: format!("killed {}", describe_services(&services)),
+            }
+        }
+    }
+}
+
+/// Restart the named services by stopping them and spawning a background task
+/// that waits for each to reach a terminal state before flipping them back to
+/// `Pending` so the supervisor respawns them.
+async fn handle_restart(state: &SharedState, services: Vec<String>) -> Response {
+    let mut guard = state.lock().await;
+    match resolve_services_or_error(&guard, &services) {
+        Err(resp) => resp,
+        Ok(names) => {
+            guard.stop_instances(&names);
+            drop(guard);
+            // Spawn a task to wait for stop then reset to Pending
+            let state_clone = state.clone();
+            let names_clone = names.clone();
+            tokio::spawn(async move {
+                wait_for_terminal(&state_clone, &names_clone, Duration::from_millis(50), 200).await;
+                let mut guard = state_clone.lock().await;
+                for name in &names_clone {
+                    if let Some(runtime) = guard.processes.get_mut(name) {
+                        runtime.status = ProcessStatus::Pending;
+                        runtime.log_ready = false;
+                        runtime.ready = false;
+                        runtime.alive = true;
+                    }
+                }
+            });
+            Response::Ack {
+                message: format!("restarting {}", describe_services(&services)),
+            }
+        }
+    }
+}
+
+/// Stop and drop every process whose base-name is not in `keep`. Any orphan
+/// instance is first sent a stop signal; a background task then waits for the
+/// instances to go terminal before removing them from the process map.
+async fn handle_remove_orphans(state: &SharedState, keep: Vec<String>) -> Response {
+    let mut guard = state.lock().await;
+    let keep_set: std::collections::HashSet<&str> = keep.iter().map(|s| s.as_str()).collect();
+    let orphans: Vec<String> = guard
+        .processes
+        .keys()
+        .filter(|name| {
+            let base = guard.processes[name.as_str()].spec.base_name.as_str();
+            !keep_set.contains(base)
+        })
+        .cloned()
+        .collect();
+    guard.stop_instances(&orphans);
+    // Spawn a task to wait for orphans to stop then remove them
+    if !orphans.is_empty() {
+        let state_clone = state.clone();
+        let orphans_clone = orphans.clone();
+        tokio::spawn(async move {
+            wait_for_terminal(&state_clone, &orphans_clone, Duration::from_millis(50), 200).await;
+            let mut guard = state_clone.lock().await;
+            for name in &orphans_clone {
+                guard.processes.remove(name);
+                guard.controllers.remove(name);
+            }
+        });
+    }
+    let msg = if orphans.is_empty() {
+        "no orphan processes found".to_string()
+    } else {
+        format!("removing orphan(s): {}", orphans.join(", "))
+    };
+    Response::Ack { message: msg }
+}
+
+/// Report whether `name` matches any tracked service (by base-name or
+/// fully-qualified replica name) and whether any matching replica is Running.
+/// Used by `exec` to preflight-check before spawning.
+async fn handle_service_run_state(state: &SharedState, name: String) -> Response {
+    let guard = state.lock().await;
+    let mut known = false;
+    let mut any_running = false;
+    for runtime in guard.processes.values() {
+        if runtime.spec.base_name == name || runtime.spec.name == name {
+            known = true;
+            if matches!(runtime.status, ProcessStatus::Running { .. }) {
+                any_running = true;
+                break;
+            }
+        }
+    }
+    Response::ServiceRunState { known, any_running }
 }
 
 /// Re-read the daemon's config from disk, compute a reload plan against the
