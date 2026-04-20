@@ -167,12 +167,24 @@ pub const MAX_REPLICAS: u16 = 100;
 /// the supervisor would walk an absurdly deep chain on every tick.
 pub const MAX_DEPENDENCY_DEPTH: usize = 32;
 
+/// Process names must be identifier-shaped: start with an ASCII letter or
+/// underscore, followed by letters, digits, underscores, or hyphens. Matches
+/// Docker Compose's service-name rules closely enough for portability.
+static PROCESS_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_-]*$").unwrap());
+
 pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
     if cfg.processes.is_empty() {
         bail!("config has no processes");
     }
 
     for (name, proc_cfg) in &cfg.processes {
+        if !PROCESS_NAME_RE.is_match(name) {
+            bail!(
+                "process name `{name}` is invalid: must match \
+                 [A-Za-z_][A-Za-z0-9_-]*"
+            );
+        }
         if proc_cfg.command.trim().is_empty() {
             bail!("process `{name}` has an empty command");
         }
@@ -979,6 +991,36 @@ environment:
         let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
         assert_eq!(cfg.environment.0.get("A"), Some(&"1".to_string()));
         assert_eq!(cfg.environment.0.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_process_name() {
+        let yaml = r#"
+processes:
+  "bad name":
+    command: "echo hi"
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
+        let err = validate_config(&cfg).expect_err("must reject invalid name");
+        assert!(
+            err.to_string().contains("is invalid"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_identifier_shaped_names() {
+        let yaml = r#"
+processes:
+  api_v2:
+    command: "echo hi"
+  web-worker:
+    command: "echo hi"
+  _internal:
+    command: "echo hi"
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse config");
+        validate_config(&cfg).expect("valid names should pass");
     }
 
     #[test]
