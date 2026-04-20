@@ -2326,6 +2326,278 @@ processes:
     assert_success(&down, "down");
 }
 
+/// `depends_on: { dep: { condition: process_started } }` — `app` stays
+/// `pending` while `dep` is itself gated on an earlier predecessor, and flips
+/// to `running` immediately after `dep` reaches `running` (no wait for
+/// ready/exit).
+///
+/// We use a `gate` service that takes ~1s to exit successfully, so `dep` is
+/// held in `pending` long enough to observe `app` also parked in `pending`
+/// before the chain unlocks.
+#[test]
+fn depends_on_process_started_gates_dependent_service() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  gate:
+    command: "sleep 1 && exit 0"
+  dep:
+    command: "sleep 30"
+    depends_on:
+      gate:
+        condition: process_completed_successfully
+  app:
+    command: "sleep 30"
+    depends_on:
+      dep:
+        condition: process_started
+"#,
+    );
+
+    env.up_detach_json();
+
+    // Early window: gate is still sleeping, so dep hasn't started and app
+    // must be pending. Sample a few times during gate's 1s window.
+    let mut saw_dep_pending = false;
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    while std::time::Instant::now() < deadline {
+        let parsed = env.ps_json_value();
+        let (dep_state, dep_pid) = state_and_pid_of(&parsed, "dep");
+        let (app_state, app_pid) = state_and_pid_of(&parsed, "app");
+        if dep_state == "pending" {
+            assert!(
+                dep_pid.is_none(),
+                "dep in pending must have no pid, got {dep_pid:?}"
+            );
+            assert_eq!(
+                app_state, "pending",
+                "app must be pending while dep is pending, got {app_state:?}"
+            );
+            assert!(
+                app_pid.is_none(),
+                "app must not have a pid while dep is pending, got {app_pid:?}"
+            );
+            saw_dep_pending = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_dep_pending,
+        "expected to observe dep in pending state during gate's warm-up window"
+    );
+
+    // After gate exits 0, dep starts, and app should follow.
+    let (app_state, app_pid) = wait_for_state(&env, "app", Duration::from_secs(15), |s, p| {
+        s == "running" && p.is_some()
+    });
+    assert_eq!(
+        app_state, "running",
+        "app should reach running once dep starts, got {app_state:?}"
+    );
+    assert!(app_pid.is_some(), "app must have a pid once running");
+
+    let parsed = env.ps_json_value();
+    let (dep_final_state, dep_final_pid) = state_and_pid_of(&parsed, "dep");
+    assert_eq!(dep_final_state, "running");
+    assert!(dep_final_pid.is_some());
+}
+
+/// `depends_on: { dep: { condition: process_completed } }` — `app` must stay
+/// `pending` while `dep` is running, then launch once `dep` terminates
+/// regardless of exit code. Uses a nonzero exit to confirm the `_successfully`
+/// variant is what filters on code.
+#[test]
+fn depends_on_process_completed_gates_dependent_service() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  dep:
+    command: "sleep 2 && exit 3"
+  app:
+    command: "sleep 30"
+    depends_on:
+      dep:
+        condition: process_completed
+"#,
+    );
+
+    env.up_detach_json();
+
+    // Sample quickly: dep is mid-sleep (running), app must still be pending.
+    thread::sleep(Duration::from_millis(400));
+    let parsed = env.ps_json_value();
+    let (dep_early, _) = state_and_pid_of(&parsed, "dep");
+    let (app_early, app_early_pid) = state_and_pid_of(&parsed, "app");
+    assert_eq!(
+        dep_early, "running",
+        "dep should be mid-sleep when first sampled, got {dep_early:?}"
+    );
+    assert_eq!(
+        app_early, "pending",
+        "app must be pending while dep is running, got {app_early:?}"
+    );
+    assert!(
+        app_early_pid.is_none(),
+        "app must not have a pid before dep completes, got {app_early_pid:?}"
+    );
+
+    // Wait for dep to exit and app to launch.
+    let (app_state, app_pid) = wait_for_state(&env, "app", Duration::from_secs(10), |s, p| {
+        s == "running" && p.is_some()
+    });
+    assert_eq!(
+        app_state, "running",
+        "app should launch after dep exits (any code), got {app_state:?}"
+    );
+    assert!(app_pid.is_some());
+
+    // Sanity-check dep: it exited nonzero, so `ps` reports it as "failed"
+    // (per ProcessStatus::state_label for Exited with non-zero code).
+    let parsed = env.ps_json_value();
+    let (dep_final, _) = state_and_pid_of(&parsed, "dep");
+    assert_eq!(
+        dep_final, "failed",
+        "dep exited with code 3 → surfaced as failed, got {dep_final:?}"
+    );
+}
+
+/// `depends_on: { dep: { condition: process_completed_successfully } }` —
+/// positive path (dep exits 0 → app starts) and negative path (dep exits 1
+/// → app stays `pending` forever).
+#[test]
+fn depends_on_process_completed_successfully_positive_and_negative() {
+    // Positive: dep exits 0, app must start.
+    {
+        let mut env = TestEnv::new();
+        env.with_config(
+            r#"
+processes:
+  dep:
+    command: "sleep 1 && exit 0"
+  app:
+    command: "sleep 30"
+    depends_on:
+      dep:
+        condition: process_completed_successfully
+"#,
+        );
+
+        env.up_detach_json();
+
+        let (app_state, app_pid) = wait_for_state(&env, "app", Duration::from_secs(10), |s, p| {
+            s == "running" && p.is_some()
+        });
+        assert_eq!(
+            app_state, "running",
+            "app should start once dep exits 0, got {app_state:?}"
+        );
+        assert!(app_pid.is_some());
+
+        let parsed = env.ps_json_value();
+        let (dep_state, _) = state_and_pid_of(&parsed, "dep");
+        assert_eq!(dep_state, "exited", "dep should surface as exited (code 0)");
+    }
+
+    // Negative: dep exits 1, app stays pending indefinitely — `_successfully`
+    // never satisfies on a nonzero exit.
+    {
+        let mut env = TestEnv::new();
+        env.with_config(
+            r#"
+processes:
+  dep:
+    command: "sleep 1 && exit 1"
+  app:
+    command: "sleep 30"
+    depends_on:
+      dep:
+        condition: process_completed_successfully
+"#,
+        );
+
+        env.up_detach_json();
+
+        // Wait long enough for dep to exit, plus a few supervisor ticks.
+        thread::sleep(Duration::from_secs(3));
+
+        let parsed = env.ps_json_value();
+        let (dep_state, _) = state_and_pid_of(&parsed, "dep");
+        let (app_state, app_pid) = state_and_pid_of(&parsed, "app");
+        assert_eq!(
+            dep_state, "failed",
+            "dep exited 1 → failed label, got {dep_state:?}"
+        );
+        assert_eq!(
+            app_state, "pending",
+            "app must stay pending when dep fails under \
+             process_completed_successfully, got {app_state:?}"
+        );
+        assert!(
+            app_pid.is_none(),
+            "app must not launch on failed dep, got pid={app_pid:?}"
+        );
+    }
+}
+
+/// `depends_on: { dep: { condition: process_log_ready } }` — `app` stays
+/// `pending` until `dep` emits a line matching `ready_log_line`, then
+/// launches. The dep writes a non-matching line first, sleeps, then emits the
+/// ready token.
+#[test]
+fn depends_on_process_log_ready_gates_dependent_service() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  dep:
+    command: "echo booting; sleep 2; echo SERVER_READY; sleep 30"
+    ready_log_line: "SERVER_READY"
+  app:
+    command: "sleep 30"
+    depends_on:
+      dep:
+        condition: process_log_ready
+"#,
+    );
+
+    env.up_detach_json();
+
+    // Early window: dep is running but hasn't emitted the ready token yet.
+    thread::sleep(Duration::from_millis(400));
+    let parsed = env.ps_json_value();
+    let (dep_early, dep_early_pid) = state_and_pid_of(&parsed, "dep");
+    let (app_early, app_early_pid) = state_and_pid_of(&parsed, "app");
+    assert_eq!(
+        dep_early, "running",
+        "dep should be running in warm-up window, got {dep_early:?}"
+    );
+    assert!(
+        dep_early_pid.is_some(),
+        "dep must have a pid, got {dep_early_pid:?}"
+    );
+    assert_eq!(
+        app_early, "pending",
+        "app must be pending before dep logs ready token, got {app_early:?}"
+    );
+    assert!(
+        app_early_pid.is_none(),
+        "app must not have a pid before ready log, got {app_early_pid:?}"
+    );
+
+    // After the echo fires, app should transition to running.
+    let (app_state, app_pid) = wait_for_state(&env, "app", Duration::from_secs(10), |s, p| {
+        s == "running" && p.is_some()
+    });
+    assert_eq!(
+        app_state, "running",
+        "app should launch once dep emits SERVER_READY, got {app_state:?}"
+    );
+    assert!(app_pid.is_some());
+}
+
 #[test]
 fn liveness_probe_kills_process_on_failure() {
     let (_root, project, runtime, state, _config) = setup_project();
