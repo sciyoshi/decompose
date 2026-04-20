@@ -5389,3 +5389,341 @@ fn completion_rejects_unknown_shell() {
         "completion with unknown shell should fail"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Disabled-flag integration tests (bd decompose-yxg)
+//
+// These pin down the end-to-end behaviour of the `disabled: true` YAML flag:
+//   - `up` must skip disabled services (supervisor filter in daemon.rs).
+//   - `ps` must surface `state: "disabled"` with no pid.
+//   - `start` against a disabled service flips it out of terminal state.
+//   - Reload (via a second `up`) toggling disabled true↔false should take
+//     effect.
+//
+// Several of these tests assert *current* behaviour rather than ideal
+// behaviour; see the inline comments for the surprises that motivated
+// follow-up beads.
+// ---------------------------------------------------------------------------
+
+/// Helper: find the named process's entry in a `ps --json` payload and return
+/// its `(state, pid)`. Panics if the entry is missing — the tests below all
+/// write configs where every service should be present.
+fn state_and_pid_of(ps_json: &Value, name: &str) -> (String, Option<u64>) {
+    let proc = ps_json
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("ps processes array")
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+        .unwrap_or_else(|| panic!("service {name:?} missing from ps"));
+    let state = proc
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let pid = proc.get("pid").and_then(Value::as_u64);
+    (state, pid)
+}
+
+/// Poll `ps --json` until `predicate(state, pid)` returns true for `name`, or
+/// the deadline elapses. Returns the final observed (state, pid) regardless of
+/// whether the predicate matched — callers assert on the shape they expected.
+fn wait_for_state(
+    env: &TestEnv,
+    name: &str,
+    timeout: Duration,
+    predicate: impl Fn(&str, Option<u64>) -> bool,
+) -> (String, Option<u64>) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = (String::new(), None);
+    while std::time::Instant::now() < deadline {
+        let parsed = env.ps_json_value();
+        last = state_and_pid_of(&parsed, name);
+        if predicate(&last.0, last.1) {
+            return last;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    last
+}
+
+/// `up -d --wait` with one enabled and one disabled service:
+///   * the enabled service reaches Running and has a pid.
+///   * the disabled service sits in `state: "disabled"` with no pid — the
+///     supervisor's skip at daemon.rs:532 prevents it from launching.
+#[test]
+fn disabled_up_skips_service() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  alive:
+    command: "sleep 30"
+  dead:
+    command: "sleep 30"
+    disabled: true
+"#,
+    );
+
+    let up = env.run(&["up", "-d", "--wait", "--json"]);
+    assert_success(&up, "up -d --wait");
+    env.up_started = true;
+
+    let parsed = env.ps_json_value();
+    let (alive_state, alive_pid) = state_and_pid_of(&parsed, "alive");
+    assert_eq!(alive_state, "running", "alive should be running");
+    assert!(alive_pid.is_some(), "alive should have a pid");
+
+    let (dead_state, dead_pid) = state_and_pid_of(&parsed, "dead");
+    assert_eq!(dead_state, "disabled", "dead should report disabled state");
+    assert!(
+        dead_pid.is_none(),
+        "dead should have no pid, got {dead_pid:?}"
+    );
+}
+
+/// Convenience pair to the above: `ps` output lists disabled services (they
+/// aren't hidden) and surfaces the canonical `"disabled"` state string so
+/// downstream consumers (table, JSON, `--wait` filter) can distinguish them
+/// from `not_started`.
+#[test]
+fn disabled_ps_shows_disabled_state() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  only_disabled:
+    command: "sleep 30"
+    disabled: true
+"#,
+    );
+
+    env.up_detach_json();
+
+    let parsed = env.ps_json_value();
+    let procs = parsed
+        .get("processes")
+        .and_then(Value::as_array)
+        .expect("ps processes");
+    assert_eq!(procs.len(), 1, "disabled service must still appear in ps");
+
+    let (state, pid) = state_and_pid_of(&parsed, "only_disabled");
+    assert_eq!(state, "disabled");
+    assert!(pid.is_none());
+}
+
+/// `decompose start <disabled-svc>` attempts to transition the service out
+/// of its terminal `Disabled` state. `handle_start` flips terminal statuses
+/// to `Pending`, but the supervisor's per-tick filter in `supervisor_loop`
+/// also skips any runtime whose `spec.disabled == true`. Because reload
+/// excludes `disabled` from `config_hash`, `spec.disabled` never flips away
+/// from the YAML-declared value for services whose command/env is otherwise
+/// unchanged — so `start` on a still-disabled service is a no-op: it pings
+/// the status to `Pending` but the service never actually launches.
+///
+/// This test pins down that current (surprising) behaviour. See
+/// bd decompose-p9a for the real fix: either `start` should clear
+/// `spec.disabled`, or the supervisor should gate on `spec.disabled`
+/// only when the runtime status is `Disabled`.
+#[test]
+fn disabled_start_transitions_to_running() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  dead:
+    command: "sleep 30"
+    disabled: true
+"#,
+    );
+
+    env.up_detach_json();
+
+    // Baseline: dead is Disabled and has no pid.
+    let parsed = env.ps_json_value();
+    let (state, pid) = state_and_pid_of(&parsed, "dead");
+    assert_eq!(state, "disabled");
+    assert!(pid.is_none());
+
+    // Ask the daemon to start the disabled service.
+    let start = env.run(&["start", "--json", "dead"]);
+    assert_success(&start, "start dead");
+
+    // Current behaviour: handle_start flips Disabled → Pending, but the
+    // supervisor skip on `spec.disabled` prevents an actual launch. So we
+    // expect the service to remain disabled-or-pending without a pid,
+    // *never* reaching Running. Poll briefly to give the supervisor a
+    // chance to do the wrong thing, then assert no pid.
+    let (final_state, final_pid) =
+        wait_for_state(&env, "dead", Duration::from_millis(800), |s, p| {
+            s == "running" && p.is_some()
+        });
+    assert!(
+        final_pid.is_none(),
+        "start on a disabled service should NOT launch it \
+         (supervisor filter at daemon.rs:532 blocks the launch). \
+         Observed state={final_state:?}, pid={final_pid:?}. \
+         If this ever flips to running, bd decompose-p9a was \
+         fixed; update this test to assert the new behaviour."
+    );
+    assert!(
+        matches!(final_state.as_str(), "disabled" | "pending"),
+        "expected disabled or pending after start on disabled svc, got {final_state:?}"
+    );
+}
+
+/// `start A` where `A depends_on: B` and `B` is `disabled: true`.
+///
+/// `handle_start` walks transitive deps and adds every dep with a terminal
+/// status to the to-start set — including `Disabled`, because `is_terminal`
+/// covers it. Each is then flipped to `Pending`. As in
+/// `disabled_start_transitions_to_running`, the supervisor's `spec.disabled`
+/// filter then blocks `B` from actually launching. Because `A` depends on
+/// `B` with `condition: process_started`, `A` never satisfies its
+/// dependency check either, so `A` also stays `Pending` indefinitely.
+///
+/// This test documents that current behaviour: starting A when B is
+/// disabled effectively stalls the whole dep chain. Tracked alongside
+/// the broader start-on-disabled gap in bd decompose-p9a.
+#[test]
+fn disabled_start_respects_other_disabled_deps() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  dep:
+    command: "sleep 30"
+    disabled: true
+  app:
+    command: "sleep 30"
+    depends_on:
+      dep:
+        condition: process_started
+"#,
+    );
+
+    // `up -d` (no --wait): daemon launches enabled services whose deps are
+    // satisfied. `app` depends on `dep`, which is disabled → neither ever
+    // runs. We skip --wait because it would time out on `app`.
+    env.up_detach_json();
+
+    // Baseline: both services parked, no pids.
+    let parsed = env.ps_json_value();
+    let (dep_state, dep_pid) = state_and_pid_of(&parsed, "dep");
+    let (app_state, app_pid) = state_and_pid_of(&parsed, "app");
+    assert_eq!(dep_state, "disabled");
+    assert!(dep_pid.is_none());
+    assert!(app_pid.is_none());
+    assert!(
+        matches!(app_state.as_str(), "pending" | "not_started"),
+        "app starts as pending or not_started, got {app_state:?}"
+    );
+
+    // Ask the daemon to start app. handle_start's transitive-deps walk
+    // adds `dep` to the to-start set (it's terminal: Disabled), flips both
+    // to Pending, then the supervisor blocks `dep` on spec.disabled and
+    // `app` on the unmet process_started dep.
+    let start = env.run(&["start", "--json", "app"]);
+    assert_success(&start, "start app");
+
+    // Both should fail to reach Running. Give the supervisor some time to
+    // do nothing, then assert.
+    thread::sleep(Duration::from_millis(600));
+
+    let parsed = env.ps_json_value();
+    let (_, dep_pid) = state_and_pid_of(&parsed, "dep");
+    let (_, app_pid) = state_and_pid_of(&parsed, "app");
+    assert!(
+        dep_pid.is_none(),
+        "disabled dep must not launch even when a dependent service calls start; \
+         got pid={dep_pid:?}"
+    );
+    assert!(
+        app_pid.is_none(),
+        "app must not launch while its process_started dep is blocked on the \
+         disabled-flag filter; got pid={app_pid:?}"
+    );
+}
+
+/// Reload toggling `disabled: true → false` via a second `up`.
+///
+/// Because `compute_config_hash` excludes the `disabled` field, a pure
+/// disabled-toggle doesn't mark the service as `changed` in
+/// `compute_reload_plan`. The reload path therefore keeps the existing
+/// runtime (with `spec.disabled == true`) in place, and the post-reload
+/// `Start` flips its terminal status to `Pending` — only to be skipped by
+/// the supervisor's `spec.disabled` filter. Net effect: toggling disabled
+/// on a live daemon is a no-op.
+///
+/// Reverse toggle (`false → true`) has the opposite problem: the running
+/// process's `spec.disabled` was false when created, so even after the
+/// reload it keeps running — no stop is issued.
+///
+/// Both are surprising; bd decompose-xhv tracks the fix.
+#[test]
+fn disabled_reload_toggles_true_to_false() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  toggler:
+    command: "sleep 30"
+    disabled: true
+"#,
+    );
+
+    env.up_detach_json();
+
+    // Baseline: disabled, no pid.
+    let parsed = env.ps_json_value();
+    let (state, pid) = state_and_pid_of(&parsed, "toggler");
+    assert_eq!(state, "disabled");
+    assert!(pid.is_none());
+
+    // Flip disabled → false in the config and re-run up. `up` on an
+    // existing daemon sends Reload followed by Start.
+    env.with_config(
+        r#"
+processes:
+  toggler:
+    command: "sleep 30"
+"#,
+    );
+    let up2 = env.run(&["up", "-d", "--json"]);
+    assert_success(&up2, "second up with disabled: false");
+
+    // Current behaviour: reload classifies `toggler` as unchanged (hash
+    // excludes disabled), so the runtime keeps spec.disabled=true. Start
+    // flips status → Pending but supervisor skips. No pid ever appears.
+    let (final_state, final_pid) =
+        wait_for_state(&env, "toggler", Duration::from_millis(800), |s, p| {
+            s == "running" && p.is_some()
+        });
+    assert!(
+        final_pid.is_none(),
+        "toggling disabled true→false on a live daemon is currently a \
+         no-op: reload doesn't pick up the change and the supervisor \
+         filter blocks launch. Observed state={final_state:?}, \
+         pid={final_pid:?}. Flip this assertion once bd decompose-xhv \
+         lands the fix."
+    );
+
+    // Now toggle back to disabled: true and run up once more. The service
+    // was never actually running, so this has no observable effect beyond
+    // re-asserting disabled state in config. We're really probing that
+    // reload doesn't blow up on the reverse toggle either.
+    env.with_config(
+        r#"
+processes:
+  toggler:
+    command: "sleep 30"
+    disabled: true
+"#,
+    );
+    let up3 = env.run(&["up", "-d", "--json"]);
+    assert_success(&up3, "third up back to disabled: true");
+
+    let parsed = env.ps_json_value();
+    let (_, pid) = state_and_pid_of(&parsed, "toggler");
+    assert!(pid.is_none(), "still never launched, got pid={pid:?}");
+}
