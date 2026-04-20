@@ -142,8 +142,17 @@ pub struct ProcessDependency {
 pub fn load_config(path: &Path) -> Result<ProjectConfig> {
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    let cfg: ProjectConfig = serde_yaml_ng::from_str(&data).context("invalid yaml")?;
-    validate_config(&cfg)?;
+    let cfg: ProjectConfig = serde_yaml_ng::from_str(&data).map_err(|e| {
+        // serde_yaml_ng exposes a line/column location on parse errors;
+        // surface it alongside the file path so users see the offending
+        // spot instead of a bare "mapping: invalid value" message.
+        let location = e
+            .location()
+            .map(|loc| format!(":{}:{}", loc.line(), loc.column()))
+            .unwrap_or_default();
+        anyhow::anyhow!("config error: {}{location}: {e}", path.display())
+    })?;
+    validate_config(&cfg).map_err(|e| anyhow::anyhow!("config error: {}: {e}", path.display()))?;
     Ok(cfg)
 }
 
@@ -1086,6 +1095,44 @@ processes:
 "#;
         let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         validate_project_paths(&cfg, project.path()).expect("inside project should pass");
+    }
+
+    #[test]
+    fn load_config_wraps_yaml_parse_error_with_path_and_location() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("decompose.yaml");
+        fs::write(
+            &path,
+            "processes:\n  api:\n    command: [this is not a string\n",
+        )
+        .unwrap();
+        let err = load_config(&path).expect_err("parse must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("config error: "),
+            "expected config error prefix, got: {msg}"
+        );
+        assert!(
+            msg.contains("decompose.yaml:"),
+            "expected file path in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_config_wraps_validate_error_with_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("decompose.yaml");
+        fs::write(
+            &path,
+            "processes:\n  \"bad name\":\n    command: \"echo hi\"\n",
+        )
+        .unwrap();
+        let err = load_config(&path).expect_err("validate must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("config error: ") && msg.contains("decompose.yaml"),
+            "expected prefixed error with path, got: {msg}"
+        );
     }
 
     #[test]
