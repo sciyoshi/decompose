@@ -5942,6 +5942,109 @@ processes:
     );
 }
 
+/// `--remove-orphans` must also clean up services that have already
+/// exited (e.g. a command that ran once and finished): the previous
+/// behaviour left the stale runtime in the daemon state, confusing `ps`.
+#[test]
+fn reload_with_remove_orphans_cleans_failed_service() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+    let cfg_path = project.join("decompose.yaml");
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+  dud:
+    command: "sh -c 'exit 3'"
+"#,
+    );
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "first up with failing service");
+
+    // Wait for `dud` to exit with a failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ps = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "ps", "--json"],
+            &[],
+            &[],
+        );
+        let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+        if state_of(&parsed, "dud").as_deref() == Some("failed") {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("dud never reached failed state: {parsed}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Remove dud from config and reload with --remove-orphans.
+    rewrite_config(
+        &cfg_path,
+        r#"
+processes:
+  alpha:
+    command: "sleep 30"
+"#,
+    );
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "-d", "--json", "--remove-orphans"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "second up with --remove-orphans");
+
+    let ps = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "ps", "--json"],
+        &[],
+        &[],
+    );
+    let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json");
+    let procs = parsed.get("processes").and_then(Value::as_array).unwrap();
+    assert_eq!(
+        procs.len(),
+        1,
+        "failed orphan should be cleaned up, got: {parsed}"
+    );
+    assert_eq!(state_of(&parsed, "alpha").as_deref(), Some("running"));
+
+    let down = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down");
+}
+
 /// Editing .env between `up` runs must recreate the service so the new
 /// value reaches the child. The fix hinges on including the resolved
 /// post-merge env in compute_config_hash — otherwise the reload diff
