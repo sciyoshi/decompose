@@ -105,6 +105,13 @@ pub struct ProcessConfig {
     pub liveness_probe: Option<HealthProbe>,
     #[serde(default)]
     pub disabled: bool,
+    /// When true, keys sourced from the project's `.env` file are excluded
+    /// from the spawned child's environment. `.env` is still loaded and
+    /// still used for `${VAR}` interpolation, and global `environment`,
+    /// per-process `env_file`, and per-process `environment` entries still
+    /// reach the child — even if they share a key name with `.env`.
+    #[serde(default)]
+    pub is_dotenv_disabled: bool,
 }
 
 fn default_replicas() -> u16 {
@@ -950,6 +957,38 @@ pub fn build_process_instances(
 
             env.extend(proc_cfg.environment.0.clone());
 
+            // If the service opted out of .env propagation, strip every
+            // key whose value came only from the dotenv layer — i.e.
+            // .env-sourced and not overridden by any higher-priority
+            // source (global env, per-process env_file, per-process env).
+            if proc_cfg.is_dotenv_disabled {
+                let overrides: std::collections::HashSet<&String> = cfg
+                    .environment
+                    .0
+                    .keys()
+                    .chain(proc_cfg.environment.0.keys())
+                    .collect();
+                // env_file-sourced keys are harder to re-derive post-merge;
+                // conservatively treat any key also present in env_file
+                // content as an override. Re-read the files to collect
+                // their key sets.
+                let mut env_file_keys: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for env_file_path in &proc_cfg.env_file {
+                    let abs = if Path::new(env_file_path).is_absolute() {
+                        PathBuf::from(env_file_path)
+                    } else {
+                        cwd.join(env_file_path)
+                    };
+                    if let Ok(parsed) = parse_dotenv(&abs) {
+                        env_file_keys.extend(parsed.into_keys());
+                    }
+                }
+                env.retain(|k, _| {
+                    !dotenv.contains_key(k) || overrides.contains(k) || env_file_keys.contains(k)
+                });
+            }
+
             let working_dir = match &proc_cfg.working_dir {
                 Some(d) if d.is_absolute() => d.clone(),
                 Some(d) => cwd.join(d),
@@ -1469,6 +1508,65 @@ processes:
         assert!(out.contains_key("api[2]"), "second replica");
         assert_eq!(first.spec.environment.get("GLOBAL"), Some(&"g".to_string()));
         assert_eq!(first.spec.environment.get("LOCAL"), Some(&"l".to_string()));
+    }
+
+    #[test]
+    fn build_instances_default_propagates_dotenv_to_child() {
+        let yaml = r#"
+processes:
+  api:
+    command: "echo hi"
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse");
+        let mut dotenv = BTreeMap::new();
+        dotenv.insert("FROM_DOTENV".to_string(), "v1".to_string());
+        let out = build_process_instances(&cfg, Path::new("/tmp"), &dotenv);
+        let api = out.get("api").unwrap();
+        assert_eq!(
+            api.spec.environment.get("FROM_DOTENV"),
+            Some(&"v1".to_string())
+        );
+    }
+
+    #[test]
+    fn build_instances_is_dotenv_disabled_strips_dotenv_keys() {
+        let yaml = r#"
+processes:
+  api:
+    command: "echo hi"
+    is_dotenv_disabled: true
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse");
+        let mut dotenv = BTreeMap::new();
+        dotenv.insert("FROM_DOTENV".to_string(), "v1".to_string());
+        let out = build_process_instances(&cfg, Path::new("/tmp"), &dotenv);
+        let api = out.get("api").unwrap();
+        assert!(
+            !api.spec.environment.contains_key("FROM_DOTENV"),
+            "dotenv-sourced key must be stripped"
+        );
+    }
+
+    #[test]
+    fn build_instances_is_dotenv_disabled_keeps_per_process_override() {
+        let yaml = r#"
+processes:
+  api:
+    command: "echo hi"
+    is_dotenv_disabled: true
+    environment:
+      FROM_DOTENV: "override"
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).expect("parse");
+        let mut dotenv = BTreeMap::new();
+        dotenv.insert("FROM_DOTENV".to_string(), "original".to_string());
+        let out = build_process_instances(&cfg, Path::new("/tmp"), &dotenv);
+        let api = out.get("api").unwrap();
+        assert_eq!(
+            api.spec.environment.get("FROM_DOTENV"),
+            Some(&"override".to_string()),
+            "per-process override must still reach child"
+        );
     }
 
     #[test]
