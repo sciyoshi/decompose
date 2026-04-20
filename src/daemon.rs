@@ -70,6 +70,31 @@ fn open_secure_append(path: &Path) -> std::io::Result<fs::File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+/// Truncate (or create) a file with 0o600 permissions, dropping the handle
+/// immediately. Used to reset the daemon log at the start of a session
+/// without disturbing the append-mode handle passed to the child process.
+#[cfg(unix)]
+fn truncate_secure(path: &Path) -> std::io::Result<()> {
+    let _ = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(FILE_MODE)
+        .open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn truncate_secure(path: &Path) -> std::io::Result<()> {
+    let _ = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_secure_lock(path: &Path) -> std::io::Result<fs::File> {
     let file = OpenOptions::new()
@@ -286,6 +311,18 @@ pub fn spawn_daemon_process(
     if let Some(parent) = paths.daemon_log.parent() {
         create_dir_secure(parent)?;
     }
+
+    // Truncate any leftover log from a previous session so `decompose logs`
+    // only shows output from this run. We open+drop a truncating handle here
+    // rather than switching `open_secure_append` to truncate mode, because the
+    // handle below is passed to the child as its stdout/stderr and must stay
+    // in append mode (two `Stdio::from` clones sharing the same file).
+    truncate_secure(&paths.daemon_log).with_context(|| {
+        format!(
+            "failed to truncate daemon log at {}",
+            paths.daemon_log.display()
+        )
+    })?;
 
     let mut log_file = open_secure_append(&paths.daemon_log).with_context(|| {
         format!(

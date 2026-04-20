@@ -6116,3 +6116,134 @@ processes:
         "after .env edit + up, child must see the new value"
     );
 }
+
+/// The daemon log file must be truncated on each `up` so `decompose logs`
+/// only shows the current session. See `decompose-eii`.
+#[test]
+fn daemon_log_is_truncated_on_each_up() {
+    let (_root, project, runtime, state, _config) = setup_project();
+    let home = project.parent().expect("parent").join("home");
+
+    let cfg_path = project.join("decompose.yaml");
+    let cfg = cfg_path.to_string_lossy().to_string();
+
+    // First session emits SESSION_ONE.
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  talker:
+    command: "sh -c 'echo SESSION_ONE_MARKER; sleep 30'"
+"#,
+    )
+    .expect("write config 1");
+
+    let up1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up1, "up session 1");
+
+    // Wait for the first session's marker to land in the log.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_first = false;
+    while std::time::Instant::now() < deadline {
+        let logs = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "logs", "--no-pager"],
+            &[],
+            &[],
+        );
+        if logs.status.success()
+            && String::from_utf8_lossy(&logs.stdout).contains("SESSION_ONE_MARKER")
+        {
+            saw_first = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(saw_first, "expected SESSION_ONE_MARKER after first up");
+
+    let down1 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down1, "down session 1");
+
+    // Swap in a second command and bring the env back up.
+    fs::write(
+        &cfg_path,
+        r#"
+processes:
+  talker:
+    command: "sh -c 'echo SESSION_TWO_MARKER; sleep 30'"
+"#,
+    )
+    .expect("write config 2");
+
+    let up2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up2, "up session 2");
+
+    // Wait for the second session's marker, then assert the first is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut final_text = String::new();
+    while std::time::Instant::now() < deadline {
+        let logs = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--file", &cfg, "logs", "--no-pager"],
+            &[],
+            &[],
+        );
+        if logs.status.success() {
+            let text = String::from_utf8_lossy(&logs.stdout).to_string();
+            if text.contains("SESSION_TWO_MARKER") {
+                final_text = text;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        final_text.contains("SESSION_TWO_MARKER"),
+        "expected SESSION_TWO_MARKER after second up, got:\n{final_text}"
+    );
+    assert!(
+        !final_text.contains("SESSION_ONE_MARKER"),
+        "daemon log should be truncated on new up; stale content leaked:\n{final_text}"
+    );
+
+    let down2 = run_cmd(
+        &project,
+        &runtime,
+        &state,
+        &home,
+        &["--file", &cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down2, "down session 2");
+}
