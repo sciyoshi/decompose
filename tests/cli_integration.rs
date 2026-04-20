@@ -74,65 +74,134 @@ fn assert_success(output: &Output, context: &str) {
     }
 }
 
+/// Fluent test fixture that wraps `setup_project` + `run_cmd` with:
+///   * shared temp directory and XDG paths,
+///   * a helper for (re)writing the project's `decompose.yaml`,
+///   * convenience wrappers around `up`, `down`, `ps`, `logs`, `run_args`,
+///   * automatic `down` on drop so panicking tests don't leak daemons.
+///
+/// Tests that need something exotic (attached `up`, raw `Command`, custom
+/// env vars, etc.) can still use the underlying `run_cmd` via `env.run_cmd(...)`
+/// or reach for the fields directly.
+struct TestEnv {
+    _root: tempfile::TempDir,
+    project: PathBuf,
+    runtime: PathBuf,
+    state: PathBuf,
+    home: PathBuf,
+    cfg_path: PathBuf,
+    up_started: bool,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let (root, project, runtime, state, cfg_path) = setup_project();
+        let home = project.parent().expect("parent").join("home");
+        Self {
+            _root: root,
+            project,
+            runtime,
+            state,
+            home,
+            cfg_path,
+            up_started: false,
+        }
+    }
+
+    fn cfg_arg(&self) -> String {
+        self.cfg_path.to_string_lossy().to_string()
+    }
+
+    /// Overwrite `decompose.yaml` with the provided contents.
+    fn with_config(&mut self, contents: &str) -> &mut Self {
+        fs::write(&self.cfg_path, contents).expect("write config");
+        self
+    }
+
+    /// Run the binary with `--file <cfg>` prepended to the given args.
+    /// Use this for commands that take a config (up, down, ps, logs, ...).
+    fn run(&self, args: &[&str]) -> Output {
+        let cfg = self.cfg_arg();
+        let mut full = Vec::with_capacity(args.len() + 2);
+        full.push("--file");
+        full.push(&cfg);
+        full.extend_from_slice(args);
+        run_cmd(
+            &self.project,
+            &self.runtime,
+            &self.state,
+            &self.home,
+            &full,
+            &[],
+            &[],
+        )
+    }
+
+    fn up_detach_json(&mut self) -> Output {
+        let out = self.run(&["up", "--detach", "--json"]);
+        assert_success(&out, "up --detach --json");
+        self.up_started = true;
+        out
+    }
+
+    fn ps_json(&self) -> Output {
+        let out = self.run(&["ps", "--json"]);
+        assert_success(&out, "ps --json");
+        out
+    }
+
+    fn ps_json_value(&self) -> Value {
+        let out = self.ps_json();
+        serde_json::from_slice(&out.stdout).expect("ps json")
+    }
+
+    fn down_json(&mut self) -> Output {
+        let out = self.run(&["down", "--json"]);
+        assert_success(&out, "down --json");
+        self.up_started = false;
+        out
+    }
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        if !self.up_started {
+            return;
+        }
+        // Best-effort cleanup: never panic from Drop (esp. mid-unwind).
+        let _ = run_cmd(
+            &self.project,
+            &self.runtime,
+            &self.state,
+            &self.home,
+            &["--file", &self.cfg_arg(), "down", "--json"],
+            &[],
+            &[],
+        );
+    }
+}
+
 #[test]
 fn cli_supports_json_and_table_modes() {
-    let (_root, project, runtime, state, config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-    let cfg = config.to_string_lossy().to_string();
+    let mut env = TestEnv::new();
 
-    let up = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&up, "up --json");
+    let up = env.up_detach_json();
     let up_json: Value = serde_json::from_slice(&up.stdout).expect("up json");
     assert_eq!(
         up_json.get("status").and_then(Value::as_str),
         Some("started")
     );
 
-    let ps_json = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&ps_json, "ps --json");
-    let parsed: Value = serde_json::from_slice(&ps_json.stdout).expect("ps json");
+    let parsed = env.ps_json_value();
     assert!(parsed.get("processes").and_then(Value::as_array).is_some());
 
-    let ps_table = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--table"],
-        &[],
-        &[],
-    );
+    let ps_table = env.run(&["ps", "--table"]);
     assert_success(&ps_table, "ps --table");
     let ps_table_text = String::from_utf8_lossy(&ps_table.stdout);
     assert!(ps_table_text.contains("NAME"));
     assert!(ps_table_text.contains("sleeper"));
 
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&down, "down --json");
+    let down = env.down_json();
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
     assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
 }
@@ -335,19 +404,9 @@ processes:
 
 #[test]
 fn down_when_not_running_exits_zero() {
-    let (_root, project, runtime, state, config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-    let cfg = config.to_string_lossy().to_string();
+    let env = TestEnv::new();
 
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--json"],
-        &[],
-        &[],
-    );
+    let down = env.run(&["down", "--json"]);
     assert_success(&down, "down when nothing is running");
     let parsed: Value = serde_json::from_slice(&down.stdout).expect("down json");
     assert_eq!(parsed.get("status").and_then(Value::as_str), Some("ok"));
@@ -355,21 +414,9 @@ fn down_when_not_running_exits_zero() {
 
 #[test]
 fn ps_when_not_running_is_empty_not_error() {
-    let (_root, project, runtime, state, config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-    let cfg = config.to_string_lossy().to_string();
+    let env = TestEnv::new();
 
-    let ps_json = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&ps_json, "ps --json when not running");
-    let parsed: Value = serde_json::from_slice(&ps_json.stdout).expect("json parse");
+    let parsed = env.ps_json_value();
     assert_eq!(parsed.get("running").and_then(Value::as_bool), Some(false));
     assert_eq!(
         parsed
@@ -379,15 +426,7 @@ fn ps_when_not_running_is_empty_not_error() {
         Some(0)
     );
 
-    let ps_table = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--table"],
-        &[],
-        &[],
-    );
+    let ps_table = env.run(&["ps", "--table"]);
     assert_success(&ps_table, "ps --table when not running");
     let table = String::from_utf8_lossy(&ps_table.stdout);
     assert!(table.contains("No processes running"));
@@ -1161,87 +1200,41 @@ processes:
 
 #[test]
 fn up_detach_wait_returns_when_services_running() {
-    let (_root, project, runtime, state, config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-    let cfg = config.to_string_lossy().to_string();
+    let mut env = TestEnv::new();
 
-    let up = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "up", "-d", "--wait", "--json"],
-        &[],
-        &[],
-    );
+    let up = env.run(&["up", "-d", "--wait", "--json"]);
     assert_success(&up, "up -d --wait");
+    env.up_started = true;
 
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&down, "down");
+    env.down_json();
 }
 
 #[test]
 fn shutdown_normal_sigterm_clean_exit() {
-    let (_root, project, runtime, state, _config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-
-    let cfg_path = project.join("decompose.yaml");
-    fs::write(
-        &cfg_path,
+    let mut env = TestEnv::new();
+    env.with_config(
         r#"
 processes:
   trapper:
     command: "sh -c 'trap \"exit 0\" TERM; sleep 30'"
 "#,
-    )
-    .expect("write config");
-    let cfg = cfg_path.to_string_lossy().to_string();
-
-    let up = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
-        &[],
-        &[],
     );
-    assert_success(&up, "up");
+
+    env.up_detach_json();
 
     // Give the process time to start and register the trap.
     thread::sleep(Duration::from_millis(500));
 
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&down, "down after SIGTERM clean exit");
+    let down = env.down_json();
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
     assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
 }
 
 #[test]
 fn shutdown_timeout_escalation_to_sigkill() {
-    let (_root, project, runtime, state, _config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-
+    let mut env = TestEnv::new();
     // Process that ignores SIGTERM, so shutdown must escalate to SIGKILL.
-    let cfg_path = project.join("decompose.yaml");
-    fs::write(
-        &cfg_path,
+    env.with_config(
         r#"
 processes:
   stubborn:
@@ -1249,37 +1242,19 @@ processes:
     shutdown:
       timeout_seconds: 1
 "#,
-    )
-    .expect("write config");
-    let cfg = cfg_path.to_string_lossy().to_string();
-
-    let up = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
-        &[],
-        &[],
     );
-    assert_success(&up, "up");
+
+    env.up_detach_json();
 
     // Give the process time to start and register the trap.
     thread::sleep(Duration::from_millis(500));
 
     let start = std::time::Instant::now();
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--timeout", "1", "--json"],
-        &[],
-        &[],
-    );
+    let down = env.run(&["down", "--timeout", "1", "--json"]);
     let elapsed = start.elapsed();
 
     assert_success(&down, "down after timeout escalation to SIGKILL");
+    env.up_started = false;
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
     assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
 
@@ -1295,13 +1270,9 @@ processes:
 
 #[test]
 fn shutdown_custom_signal() {
-    let (_root, project, runtime, state, _config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
-
+    let mut env = TestEnv::new();
     // Process that traps SIGINT (signal 2) and exits cleanly, but ignores SIGTERM.
-    let cfg_path = project.join("decompose.yaml");
-    fs::write(
-        &cfg_path,
+    env.with_config(
         r#"
 processes:
   custom_sig:
@@ -1310,37 +1281,17 @@ processes:
       signal: 2
       timeout_seconds: 5
 "#,
-    )
-    .expect("write config");
-    let cfg = cfg_path.to_string_lossy().to_string();
-
-    let up = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
-        &[],
-        &[],
     );
-    assert_success(&up, "up");
+
+    env.up_detach_json();
 
     // Give the process time to start and register the traps.
     thread::sleep(Duration::from_millis(500));
 
     let start = std::time::Instant::now();
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--json"],
-        &[],
-        &[],
-    );
+    let down = env.down_json();
     let elapsed = start.elapsed();
 
-    assert_success(&down, "down with custom SIGINT shutdown signal");
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
     assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
 
@@ -2111,18 +2062,14 @@ processes:
 
 #[test]
 fn exec_readiness_probe_flips_healthy_flag() {
-    let (_root, project, runtime, state, _config) = setup_project();
-    let home = project.parent().expect("parent").join("home");
+    let mut env = TestEnv::new();
 
     // The marker file starts absent; the probe checks for it.
-    let marker = project.join("healthy_marker");
+    let marker = env.project.join("healthy_marker");
     let marker_str = marker.to_string_lossy().to_string();
 
-    let cfg_path = project.join("decompose.yaml");
-    fs::write(
-        &cfg_path,
-        format!(
-            r#"
+    env.with_config(&format!(
+        r#"
 processes:
   web:
     command: "sleep 60"
@@ -2134,36 +2081,14 @@ processes:
       success_threshold: 1
       failure_threshold: 1
 "#
-        ),
-    )
-    .expect("write config");
-    let cfg = cfg_path.to_string_lossy().to_string();
+    ));
 
-    let up = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&up, "up");
+    env.up_detach_json();
 
     // Wait for a couple of probe periods — healthy should still be false
     thread::sleep(Duration::from_secs(3));
 
-    let ps1 = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&ps1, "ps before marker");
-    let ps1_json: Value = serde_json::from_slice(&ps1.stdout).expect("ps json");
+    let ps1_json = env.ps_json_value();
     let web1 = ps1_json["processes"]
         .as_array()
         .expect("processes array")
@@ -2187,17 +2112,7 @@ processes:
     // Wait for probe to detect it
     thread::sleep(Duration::from_secs(3));
 
-    let ps2 = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "ps", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&ps2, "ps after marker");
-    let ps2_json: Value = serde_json::from_slice(&ps2.stdout).expect("ps json");
+    let ps2_json = env.ps_json_value();
     let web2 = ps2_json["processes"]
         .as_array()
         .expect("processes array")
@@ -2210,16 +2125,7 @@ processes:
         "ready should be true after marker is created"
     );
 
-    let down = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["--file", &cfg, "down", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&down, "down");
+    env.down_json();
 }
 
 #[test]
