@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a new decompose release. Bumps the Cargo.toml version, commits, then creates a GitHub release with notes generated from commits since the last tag. Pushing the release tag triggers the GitHub Actions workflow that uploads binaries and publishes to crates.io. GitHub releases are the source of truth for the changelog — there is no CHANGELOG.md.
+description: Cut a new decompose release. Bumps the Cargo.toml version, commits, then creates a GitHub release with notes generated from commits since the last tag. Pushing the release tag triggers the GitHub Actions workflow that uploads binaries and publishes to crates.io. GitHub releases are the source of truth for the changelog -- there is no CHANGELOG.md.
 ---
 
 You are helping the user cut a new release of `decompose`.
@@ -46,7 +46,7 @@ The most recent run on main must have `conclusion == "success"` and `headSha` ma
 
 - Current version: read the `version = "..."` line from `Cargo.toml`.
 - Target version: from the skill args (validated above).
-- Previous tag: `git describe --tags --abbrev=0 2>/dev/null` — may be empty for the first release.
+- Previous tag: `git describe --tags --abbrev=0 2>/dev/null` -- may be empty for the first release.
 
 Confirm to the user: "Cutting release: current=`{current}`, target=`{target}`, previous tag=`{tag or none}`. Proceed?" Do not take any irreversible action until they confirm.
 
@@ -72,7 +72,7 @@ Use a heredoc for the commit message format shown in CLAUDE.md. Include the Co-A
 git log --pretty=format:'- %s (%h)' {previous_tag}..HEAD
 ```
 
-If there is no previous tag, use `git log --pretty=format:'- %s (%h)' HEAD` (entire history — probably too much; trim to recent commits by inspection).
+If there is no previous tag, use `git log --pretty=format:'- %s (%h)' HEAD` (entire history -- probably too much; trim to recent commits by inspection).
 
 Filter the result:
 
@@ -81,10 +81,14 @@ Filter the result:
 - **Group** by type if the log is long: `### Features`, `### Fixes`, `### Refactors`, `### Tests`, `### CI/Build`. Use the Conventional Commits prefix to group.
 - **Tidy** wording: strip the type prefix from each line (`feat(cli): add X` → `add X`). Keep the `(%h)` short SHA at the end.
 
+**Heading convention**: the top-level heading of the notes is always `## v{version} ({YYYY-MM-DD})`, using today's date from the `currentDate` context. Do NOT give the release a descriptive title like "Initial release", "What's Changed", or "First functional release" -- version + date only. This applies to every release, including the first one.
+
+**ASCII only**: avoid em-dashes and en-dashes in release notes and in this skill file. Use `--` for em-dash and `-` for en-dash.
+
 Example output:
 
 ```markdown
-## What's Changed
+## v0.2.0 (2026-05-12)
 
 ### Features
 - add shell completion subcommand (47e03c8)
@@ -100,7 +104,7 @@ Example output:
 **Full changelog**: https://github.com/sciyoshi/decompose/compare/{previous_tag}...v{target}
 ```
 
-For the **first** release (no previous tag), use a short "Initial release." summary and optionally a list of top-level capabilities rather than every commit.
+For the **first** release (no previous tag), keep the `## v{version} ({YYYY-MM-DD})` heading and then include a short body (e.g. a list of top-level capabilities) rather than every commit.
 
 Show the generated notes to the user and ask them to approve or edit before creating the release.
 
@@ -125,14 +129,14 @@ This command creates both the GitHub release AND pushes the git tag `v{target}` 
 Report to the user:
 - The release URL (`gh release view v{target} --web` to open, or just the URL).
 - The workflow run to watch (`gh run watch` or paste the URL from `gh run list --limit 1`).
-- That crates.io publishing typically takes 2–3 minutes after the workflow starts.
+- That crates.io publishing typically takes 2-3 minutes after the workflow starts.
 
 # Aborts and recovery
 
 - If the Cargo.toml bump or push fails before the tag is created: just reset. `git reset --hard origin/main` then try again.
-- If `gh release create` fails after the push has already landed: the commit is on main but no tag exists. Re-run the `gh release create` command — the release commit is a legitimate part of main even without a tag.
+- If `gh release create` fails after the push has already landed: the commit is on main but no tag exists. Re-run the `gh release create` command -- the release commit is a legitimate part of main even without a tag.
 - If the release was created but the workflow failed: fix the issue, then either delete+recreate the release or push a new tag.
-- If crates.io publishing fails (e.g. version already exists): it's a hard error — crates.io does not allow republishing. Cut a new version.
+- If crates.io publishing fails (e.g. version already exists): it's a hard error -- crates.io does not allow republishing. Cut a new version.
 
 # What this skill intentionally does NOT do
 
