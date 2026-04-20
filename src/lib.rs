@@ -84,6 +84,7 @@ fn resolve_service_context(
     let dotenv = load_dotenv_files(&cwd, &global.env_files, global.disable_dotenv)?;
     let mut cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
     apply_interpolation(&mut cfg);
+    crate::config::validate_project_paths(&cfg, &cwd)?;
     if !cfg.processes.contains_key(service) {
         let known: Vec<&str> = cfg.processes.keys().map(|k| k.as_str()).collect();
         bail!(
@@ -769,6 +770,7 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config_files = resolve_config_paths(&global.config_files, &cwd)?;
     let cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
+    crate::config::validate_project_paths(&cfg, &cwd)?;
 
     match output_mode {
         OutputMode::Json => {

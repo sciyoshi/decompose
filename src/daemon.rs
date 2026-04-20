@@ -369,6 +369,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     let mut config = load_and_merge_configs(&args.config_files)?;
     apply_interpolation(&mut config);
+    crate::config::validate_project_paths(&config, &args.cwd)?;
 
     // Determine which services were selected for launch. Non-selected ones
     // stay in the daemon state as NotStarted so they can be addressed later
@@ -1788,6 +1789,11 @@ async fn handle_reload(
         }
     };
     apply_interpolation(&mut new_config);
+    if let Err(e) = crate::config::validate_project_paths(&new_config, &cwd) {
+        return Response::Error {
+            message: format!("reload: invalid config: {e:#}"),
+        };
+    }
 
     let new_process_map = build_process_instances(&new_config, &cwd, &dotenv);
 
