@@ -881,6 +881,11 @@ struct ProcessConfigHashView<'a> {
     shutdown: &'a Option<ShutdownConfig>,
     readiness_probe: &'a Option<HealthProbe>,
     liveness_probe: &'a Option<HealthProbe>,
+    /// Fully-resolved env passed to the child at spawn time. Including
+    /// this makes `.env` edits and other env-layer changes trigger a
+    /// recreate on reload, since the pre-merge fields alone can't see
+    /// into the dotenv layer.
+    resolved_env: &'a BTreeMap<String, String>,
 }
 
 /// Compute a stable SHA-256 hash of the service's `ProcessConfig`, **excluding**
@@ -893,7 +898,7 @@ struct ProcessConfigHashView<'a> {
 ///
 /// Used by the reload path to diff services: same hash == same definition,
 /// different hash == tear down and respawn.
-pub fn compute_config_hash(cfg: &ProcessConfig) -> String {
+pub fn compute_config_hash(cfg: &ProcessConfig, resolved_env: &BTreeMap<String, String>) -> String {
     let view = ProcessConfigHashView {
         command: &cfg.command,
         description: &cfg.description,
@@ -907,6 +912,7 @@ pub fn compute_config_hash(cfg: &ProcessConfig) -> String {
         shutdown: &cfg.shutdown,
         readiness_probe: &cfg.readiness_probe,
         liveness_probe: &cfg.liveness_probe,
+        resolved_env,
     };
     // serde_json serialization of structs is field-declaration-order stable,
     // and the containers we reference (BTreeMap, Vec, Option) are themselves
@@ -916,6 +922,55 @@ pub fn compute_config_hash(cfg: &ProcessConfig) -> String {
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Build the fully-resolved environment that will be passed to the child at
+/// spawn time, following the documented precedence (lowest to highest):
+///
+/// 1. `.env` / `-e` files (the `dotenv` parameter)
+/// 2. Global `environment` block
+/// 3. Per-process `env_file` entries
+/// 4. Per-process `environment` block
+///
+/// When `is_dotenv_disabled` is set, keys whose only source was the dotenv
+/// layer are filtered out at the end.
+pub fn resolve_process_env(
+    proc_cfg: &ProcessConfig,
+    project_cfg: &ProjectConfig,
+    cwd: &Path,
+    dotenv: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = dotenv.clone();
+    env.extend(project_cfg.environment.0.clone());
+
+    let mut env_file_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for env_file_path in &proc_cfg.env_file {
+        let abs = if Path::new(env_file_path).is_absolute() {
+            PathBuf::from(env_file_path)
+        } else {
+            cwd.join(env_file_path)
+        };
+        if let Ok(parsed) = parse_dotenv(&abs) {
+            env_file_keys.extend(parsed.keys().cloned());
+            env.extend(parsed);
+        }
+    }
+
+    env.extend(proc_cfg.environment.0.clone());
+
+    if proc_cfg.is_dotenv_disabled {
+        let overrides: std::collections::HashSet<&String> = project_cfg
+            .environment
+            .0
+            .keys()
+            .chain(proc_cfg.environment.0.keys())
+            .collect();
+        env.retain(|k, _| {
+            !dotenv.contains_key(k) || overrides.contains(k) || env_file_keys.contains(k)
+        });
+    }
+
+    env
 }
 
 // ---------------------------------------------------------------------------
@@ -930,9 +985,12 @@ pub fn build_process_instances(
     let mut out = BTreeMap::new();
 
     for (base_name, proc_cfg) in &cfg.processes {
-        // Hash once per service; replicas share the same config hash since
-        // they're all spawned from the same ProcessConfig entry.
-        let config_hash = compute_config_hash(proc_cfg);
+        // Resolve env once per service; replicas share identical environments,
+        // so we only pay for the env_file reads and dotenv filtering once.
+        let resolved_env = resolve_process_env(proc_cfg, cfg, cwd, dotenv);
+        // Hash covers the resolved environment so that .env edits (and any
+        // other env-layer change) naturally trigger a recreate on reload.
+        let config_hash = compute_config_hash(proc_cfg, &resolved_env);
         for idx in 0..proc_cfg.replicas {
             let replica = idx + 1;
             let instance_name = if proc_cfg.replicas > 1 {
@@ -941,53 +999,7 @@ pub fn build_process_instances(
                 base_name.clone()
             };
 
-            let mut env = dotenv.clone();
-            env.extend(cfg.environment.0.clone());
-
-            for env_file_path in &proc_cfg.env_file {
-                let abs = if Path::new(env_file_path).is_absolute() {
-                    PathBuf::from(env_file_path)
-                } else {
-                    cwd.join(env_file_path)
-                };
-                if let Ok(parsed) = parse_dotenv(&abs) {
-                    env.extend(parsed);
-                }
-            }
-
-            env.extend(proc_cfg.environment.0.clone());
-
-            // If the service opted out of .env propagation, strip every
-            // key whose value came only from the dotenv layer — i.e.
-            // .env-sourced and not overridden by any higher-priority
-            // source (global env, per-process env_file, per-process env).
-            if proc_cfg.is_dotenv_disabled {
-                let overrides: std::collections::HashSet<&String> = cfg
-                    .environment
-                    .0
-                    .keys()
-                    .chain(proc_cfg.environment.0.keys())
-                    .collect();
-                // env_file-sourced keys are harder to re-derive post-merge;
-                // conservatively treat any key also present in env_file
-                // content as an override. Re-read the files to collect
-                // their key sets.
-                let mut env_file_keys: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for env_file_path in &proc_cfg.env_file {
-                    let abs = if Path::new(env_file_path).is_absolute() {
-                        PathBuf::from(env_file_path)
-                    } else {
-                        cwd.join(env_file_path)
-                    };
-                    if let Ok(parsed) = parse_dotenv(&abs) {
-                        env_file_keys.extend(parsed.into_keys());
-                    }
-                }
-                env.retain(|k, _| {
-                    !dotenv.contains_key(k) || overrides.contains(k) || env_file_keys.contains(k)
-                });
-            }
+            let env = resolved_env.clone();
 
             let working_dir = match &proc_cfg.working_dir {
                 Some(d) if d.is_absolute() => d.clone(),
@@ -2368,17 +2380,30 @@ processes:
 "#;
         let cfg_a: ProjectConfig = serde_yaml_ng::from_str(yaml_a).unwrap();
         let api_a = cfg_a.processes.get("api").unwrap();
-        let hash_a = compute_config_hash(api_a);
+        let env_a = resolve_process_env(api_a, &cfg_a, Path::new("/tmp"), &BTreeMap::new());
+        let hash_a = compute_config_hash(api_a, &env_a);
 
         // Identical config parsed independently must produce the same hash.
         let cfg_a2: ProjectConfig = serde_yaml_ng::from_str(yaml_a).unwrap();
-        let hash_a2 = compute_config_hash(cfg_a2.processes.get("api").unwrap());
+        let env_a2 = resolve_process_env(
+            cfg_a2.processes.get("api").unwrap(),
+            &cfg_a2,
+            Path::new("/tmp"),
+            &BTreeMap::new(),
+        );
+        let hash_a2 = compute_config_hash(cfg_a2.processes.get("api").unwrap(), &env_a2);
         assert_eq!(hash_a, hash_a2, "same config must hash the same");
 
         // Changing `command` must change the hash.
         let mut cfg_cmd = cfg_a.clone();
         cfg_cmd.processes.get_mut("api").unwrap().command = "run server --port 9000".to_string();
-        let hash_cmd = compute_config_hash(cfg_cmd.processes.get("api").unwrap());
+        let env_cmd = resolve_process_env(
+            cfg_cmd.processes.get("api").unwrap(),
+            &cfg_cmd,
+            Path::new("/tmp"),
+            &BTreeMap::new(),
+        );
+        let hash_cmd = compute_config_hash(cfg_cmd.processes.get("api").unwrap(), &env_cmd);
         assert_ne!(hash_a, hash_cmd, "command change must change hash");
 
         // Changing only `depends_on`, `replicas`, or `disabled` must NOT
@@ -2391,25 +2416,43 @@ processes:
             .unwrap()
             .depends_on
             .clear();
+        let env_depends = resolve_process_env(
+            cfg_depends.processes.get("api").unwrap(),
+            &cfg_depends,
+            Path::new("/tmp"),
+            &BTreeMap::new(),
+        );
         assert_eq!(
             hash_a,
-            compute_config_hash(cfg_depends.processes.get("api").unwrap()),
+            compute_config_hash(cfg_depends.processes.get("api").unwrap(), &env_depends),
             "depends_on change must NOT affect hash"
         );
 
         let mut cfg_replicas = cfg_a.clone();
         cfg_replicas.processes.get_mut("api").unwrap().replicas = 7;
+        let env_rep = resolve_process_env(
+            cfg_replicas.processes.get("api").unwrap(),
+            &cfg_replicas,
+            Path::new("/tmp"),
+            &BTreeMap::new(),
+        );
         assert_eq!(
             hash_a,
-            compute_config_hash(cfg_replicas.processes.get("api").unwrap()),
+            compute_config_hash(cfg_replicas.processes.get("api").unwrap(), &env_rep),
             "replicas change must NOT affect hash"
         );
 
         let mut cfg_disabled = cfg_a.clone();
         cfg_disabled.processes.get_mut("api").unwrap().disabled = true;
+        let env_dis = resolve_process_env(
+            cfg_disabled.processes.get("api").unwrap(),
+            &cfg_disabled,
+            Path::new("/tmp"),
+            &BTreeMap::new(),
+        );
         assert_eq!(
             hash_a,
-            compute_config_hash(cfg_disabled.processes.get("api").unwrap()),
+            compute_config_hash(cfg_disabled.processes.get("api").unwrap(), &env_dis),
             "disabled change must NOT affect hash"
         );
 
@@ -2422,10 +2465,41 @@ processes:
             .environment
             .0
             .insert("NEW_VAR".to_string(), "x".to_string());
+        let env_new = resolve_process_env(
+            cfg_env.processes.get("api").unwrap(),
+            &cfg_env,
+            Path::new("/tmp"),
+            &BTreeMap::new(),
+        );
         assert_ne!(
             hash_a,
-            compute_config_hash(cfg_env.processes.get("api").unwrap()),
+            compute_config_hash(cfg_env.processes.get("api").unwrap(), &env_new),
             "environment change must change hash"
+        );
+    }
+
+    #[test]
+    fn config_hash_changes_when_dotenv_changes() {
+        let yaml = r#"
+processes:
+  api:
+    command: "run"
+"#;
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let api = cfg.processes.get("api").unwrap();
+        let mut dotenv_a: BTreeMap<String, String> = BTreeMap::new();
+        dotenv_a.insert("K".into(), "v1".into());
+        let env_a = resolve_process_env(api, &cfg, Path::new("/tmp"), &dotenv_a);
+        let hash_a = compute_config_hash(api, &env_a);
+
+        let mut dotenv_b: BTreeMap<String, String> = BTreeMap::new();
+        dotenv_b.insert("K".into(), "v2".into());
+        let env_b = resolve_process_env(api, &cfg, Path::new("/tmp"), &dotenv_b);
+        let hash_b = compute_config_hash(api, &env_b);
+
+        assert_ne!(
+            hash_a, hash_b,
+            "a .env value change must change the hash so reload recreates"
         );
     }
 
@@ -2438,7 +2512,9 @@ processes:
     replicas: 3
 "#;
         let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let expected = compute_config_hash(cfg.processes.get("web").unwrap());
+        let web = cfg.processes.get("web").unwrap();
+        let env = resolve_process_env(web, &cfg, Path::new("/tmp"), &BTreeMap::new());
+        let expected = compute_config_hash(web, &env);
         let out = build_process_instances(&cfg, Path::new("/tmp"), &BTreeMap::new());
         assert_eq!(out.len(), 3);
         for runtime in out.values() {

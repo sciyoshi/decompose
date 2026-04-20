@@ -5941,3 +5941,75 @@ processes:
         "disabled service must have no pid after toggle (had pid {first_pid} before)"
     );
 }
+
+/// Editing .env between `up` runs must recreate the service so the new
+/// value reaches the child. The fix hinges on including the resolved
+/// post-merge env in compute_config_hash — otherwise the reload diff
+/// treats the service as unchanged and never restarts it.
+#[test]
+fn dotenv_changes_propagate_to_running_process_on_reload() {
+    let mut env = TestEnv::new();
+    let outfile = env.project.join("out.txt");
+    let script = env.project.join("write_token.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$API_TOKEN\" > {out}\nexec sleep 30\n",
+            out = outfile.display()
+        ),
+    )
+    .expect("write script");
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod");
+
+    let yaml = format!(
+        r#"
+processes:
+  svc:
+    command: "{script}"
+"#,
+        script = script.display()
+    );
+    env.with_config(&yaml);
+    fs::write(env.project.join(".env"), "API_TOKEN=first\n").expect("write .env");
+
+    env.up_detach_json();
+
+    // Wait for the service to have written to the file.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !outfile.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(outfile.exists(), "service never wrote output file");
+    let first = fs::read_to_string(&outfile)
+        .expect("read out")
+        .trim()
+        .to_string();
+    assert_eq!(first, "first", "baseline value must come from .env");
+
+    // Edit .env and re-run up. Reload should detect the env change via the
+    // hash and recreate svc; the new child writes the new value.
+    fs::write(env.project.join(".env"), "API_TOKEN=second\n").expect("update .env");
+    fs::remove_file(&outfile).expect("clear output");
+
+    let up2 = env.run(&["up", "-d", "--json"]);
+    assert_success(&up2, "second up after .env edit");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(&outfile) {
+            observed = contents.trim().to_string();
+            if observed == "second" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        observed, "second",
+        "after .env edit + up, child must see the new value"
+    );
+}
