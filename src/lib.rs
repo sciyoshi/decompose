@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod model;
 pub mod output;
 pub mod paths;
+pub mod tui;
 pub mod tuning;
 
 use std::env;
@@ -293,6 +294,15 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     if got_ctrl_c {
         emit_detach(output_mode);
         return Ok(());
+    }
+
+    if args.tui {
+        // Drop the ctrl-c listener before the TUI takes over raw mode; the
+        // TUI translates Ctrl-C to a clean quit via its own input handling.
+        if let Some(handle) = ctrl_c_task {
+            handle.abort();
+        }
+        return tui::run(paths).await;
     }
 
     stream_logs_until_ctrl_c(&paths, output_mode, state == "already_running", ctrl_c_task).await

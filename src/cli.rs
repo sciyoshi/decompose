@@ -175,6 +175,11 @@ pub struct UpArgs {
     pub no_start: bool,
     /// Start only these processes (and their dependencies, unless --no-deps).
     pub processes: Vec<String>,
+    /// Attach an interactive TUI instead of streaming logs to stdout.
+    /// Quitting the TUI leaves services running — use `decompose down`
+    /// to stop them. Ignored with `--detach`.
+    #[arg(long = "tui", conflicts_with = "detach")]
+    pub tui: bool,
 }
 
 #[derive(Args, Debug, Clone)]
