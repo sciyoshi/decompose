@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
 use std::time::Duration;
 
+use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -50,10 +51,13 @@ enum Focus {
 }
 
 struct LogLine {
-    /// Plain text without ANSI sequences — used for render today; kept as the
-    /// canonical form for future search/yank. ANSI-to-span parsing is
-    /// tracked as a follow-up (see decompose-tog).
+    /// Plain text without ANSI sequences. Search and yank (follow-ups) will
+    /// operate on this form; keeping it here so ingest parses once.
+    #[allow(dead_code)]
     plain: String,
+    /// ANSI parsed into styled spans once at ingest. Rendering a 10k-line
+    /// buffer at 60fps means we can't reparse per frame.
+    styled: Line<'static>,
 }
 
 struct App {
@@ -97,14 +101,39 @@ impl App {
 
     fn push_log_line(&mut self, raw: &str) {
         let plain = strip_ansi(raw);
+        let styled = parse_ansi_line(raw, &plain);
         if self.logs.len() >= BUFFER_CAP {
             self.logs.pop_front();
         }
-        self.logs.push_back(LogLine { plain });
+        self.logs.push_back(LogLine { plain, styled });
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((Instant::now(), msg.into()));
+    }
+}
+
+/// Parse a single log line's ANSI SGR sequences into a `Line` of styled
+/// spans. Falls back to a plain `Line` if the byte sequence isn't valid
+/// ANSI. ansi-to-tui returns a `Text` that may contain multiple `Line`s
+/// (if the input embeds `\n`); we flatten to one `Line` since the daemon
+/// log is already split line-by-line upstream.
+fn parse_ansi_line(raw: &str, plain: &str) -> Line<'static> {
+    match raw.as_bytes().into_text() {
+        Ok(text) => {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for line in text.lines {
+                for span in line.spans {
+                    spans.push(span);
+                }
+            }
+            if spans.is_empty() {
+                Line::from(plain.to_string())
+            } else {
+                Line::from(spans)
+            }
+        }
+        Err(_) => Line::from(plain.to_string()),
     }
 }
 
@@ -520,7 +549,7 @@ fn draw_log_pane(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .iter()
         .skip(start)
         .take(end - start)
-        .map(|l| Line::from(l.plain.clone()))
+        .map(|l| l.styled.clone())
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -584,5 +613,47 @@ fn health_glyph(p: &ProcessSnapshot) -> String {
         "-".to_string()
     } else {
         parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ansi_line_preserves_red_span() {
+        // ANSI "31" is red, "0" resets. The parsed line must split the input
+        // into at least two spans and the red span must carry a red fg — a
+        // regression here means colored daemon log output falls back to a
+        // single monochrome span.
+        let raw = "\x1b[31merror\x1b[0m tail";
+        let line = parse_ansi_line(raw, &strip_ansi(raw));
+        assert!(
+            line.spans.len() >= 2,
+            "expected multiple spans, got {:?}",
+            line.spans
+        );
+        let red = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("error"))
+            .expect("error span present");
+        assert_eq!(red.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn parse_ansi_line_falls_back_for_plain_text() {
+        // Plain text has no escape sequences — must come through as a single
+        // span equal to the input.
+        let raw = "just a line";
+        let line = parse_ansi_line(raw, raw);
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "just a line");
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_sequences() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("plain"), "plain");
     }
 }
