@@ -60,6 +60,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Down(args) => run_down(global, args.output.resolve(), args.timeout).await,
         Commands::Ps(args) => run_ps(global, args.output.resolve()).await,
         Commands::Attach(args) => run_attach(global, args.output.resolve()).await,
+        Commands::Tui => run_tui(global).await,
         Commands::Logs(args) => run_logs(global, args).await,
         Commands::Start(args) => run_service_command(global, args, ServiceOp::Start).await,
         Commands::Stop(args) => run_service_command(global, args, ServiceOp::Stop).await,
@@ -247,7 +248,12 @@ enum ServiceOp {
 
 async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     let output_mode = args.output.resolve();
-    let attached = !args.detach;
+    // `--tui` means "start services, then hand off to the TUI". Like `-d`,
+    // the caller is no longer tethered to the daemon while the TUI runs,
+    // so we treat it as detached for daemon-lifetime purposes (no
+    // parent_pid → daemon outlives the TUI process) and skip the log
+    // stream. The TUI handles its own Ctrl-C.
+    let attached = !args.detach && !args.tui;
     let ctrl_c_task = if attached {
         Some(tokio::spawn(async {
             let _ = ctrl_c().await;
@@ -289,20 +295,14 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         if args.wait {
             wait_for_services_ready(&paths, output_mode).await?;
         }
+        if args.tui {
+            return tui::run(paths).await;
+        }
         return Ok(());
     }
     if got_ctrl_c {
         emit_detach(output_mode);
         return Ok(());
-    }
-
-    if args.tui {
-        // Drop the ctrl-c listener before the TUI takes over raw mode; the
-        // TUI translates Ctrl-C to a clean quit via its own input handling.
-        if let Some(handle) = ctrl_c_task {
-            handle.abort();
-        }
-        return tui::run(paths).await;
     }
 
     stream_logs_until_ctrl_c(&paths, output_mode, state == "already_running", ctrl_c_task).await
@@ -576,6 +576,17 @@ async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
         Response::Error { message } => bail!("{message}"),
         _ => bail!("unexpected response from daemon"),
     }
+}
+
+async fn run_tui(global: GlobalConfig) -> Result<()> {
+    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    match send_request(&paths, Request::Ping).await {
+        Ok(Response::Pong { .. }) => {}
+        _ => bail!(
+            "no running environment for this project — start one with `decompose up -d` first"
+        ),
+    }
+    tui::run(paths).await
 }
 
 async fn run_attach(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {

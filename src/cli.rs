@@ -52,6 +52,10 @@ pub enum Commands {
     Ps(OutputOnlyArgs),
     /// Reattach to a running environment's logs.
     Attach(OutputOnlyArgs),
+    /// Open an interactive TUI attached to a running environment.
+    /// Services keep running after the TUI exits; use `decompose down`
+    /// (or press `Q` in the TUI) to stop them.
+    Tui,
     /// View process logs.
     Logs(LogsArgs),
     /// Start one or more previously-stopped services. With no args, starts all.
@@ -175,10 +179,10 @@ pub struct UpArgs {
     pub no_start: bool,
     /// Start only these processes (and their dependencies, unless --no-deps).
     pub processes: Vec<String>,
-    /// Attach an interactive TUI instead of streaming logs to stdout.
-    /// Quitting the TUI leaves services running — use `decompose down`
-    /// to stop them. Ignored with `--detach`.
-    #[arg(long = "tui", conflicts_with = "detach")]
+    /// Start services, then open the interactive TUI. Implies `--detach`:
+    /// the daemon keeps running after the TUI exits. Same as
+    /// `decompose up -d` followed by `decompose tui`.
+    #[arg(long = "tui")]
     pub tui: bool,
 }
 

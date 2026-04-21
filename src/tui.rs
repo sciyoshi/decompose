@@ -307,6 +307,22 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
+        (KeyCode::Char('Q'), _) => {
+            // Shift-Q: stop everything and quit, mirroring `decompose down`.
+            // Lower-case q detaches without touching services.
+            match send_request(
+                &app.paths,
+                Request::Down {
+                    timeout_seconds: None,
+                },
+            )
+            .await
+            {
+                Ok(_) => app.set_status("stopping services…"),
+                Err(e) => app.set_status(format!("down failed: {e}")),
+            }
+            app.should_quit = true;
+        }
         (KeyCode::Tab, _) => {
             app.focus = match app.focus {
                 Focus::List => Focus::Logs,
@@ -576,8 +592,12 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
 fn default_help(focus: Focus) -> String {
     match focus {
-        Focus::List => "↑↓ select · s stop · r restart · u start · tab logs · q quit".to_string(),
-        Focus::Logs => "PgUp/PgDn scroll · p pause · End follow · tab list · q quit".to_string(),
+        Focus::List => {
+            "↑↓ select · s stop · r restart · u start · tab logs · q detach · Q down".to_string()
+        }
+        Focus::Logs => {
+            "PgUp/PgDn scroll · p pause · End follow · tab list · q detach · Q down".to_string()
+        }
     }
 }
 
