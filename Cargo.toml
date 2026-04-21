@@ -2,7 +2,7 @@
 name = "decompose"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Samuel Cormier-Iijima <samuel@cormier-iijima.com>"]
 description = "A simple and flexible scheduler and orchestrator to manage non-containerized applications"
 license = "MIT OR Apache-2.0"

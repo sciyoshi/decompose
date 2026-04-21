@@ -192,11 +192,11 @@ impl DaemonState {
     /// which all share this "best-effort targeted shutdown" shape.
     fn stop_instances(&mut self, names: &[String]) {
         for name in names {
-            if let Some(runtime) = self.processes.get_mut(name) {
-                if matches!(runtime.status, ProcessStatus::Pending) {
-                    runtime.status = ProcessStatus::Stopped;
-                    continue;
-                }
+            if let Some(runtime) = self.processes.get_mut(name)
+                && matches!(runtime.status, ProcessStatus::Pending)
+            {
+                runtime.status = ProcessStatus::Stopped;
+                continue;
             }
             if let Some(tx) = self.controllers.get(name) {
                 let _ = tx.send(true);
@@ -1141,14 +1141,15 @@ fn attach_output_readers(
             while let Ok(Some(line)) = lines.next_line().await {
                 let proc_name = crate::model::read_name(&handle);
                 println!("[{proc_name}] {line}");
-                if let Some(ref re) = pattern {
-                    if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
-                        flag.store(true, Ordering::Relaxed);
-                        with_process_mut(&state_clone, &handle, |runtime| {
-                            runtime.log_ready = true;
-                        })
-                        .await;
-                    }
+                if let Some(ref re) = pattern
+                    && !flag.load(Ordering::Relaxed)
+                    && re.is_match(&line)
+                {
+                    flag.store(true, Ordering::Relaxed);
+                    with_process_mut(&state_clone, &handle, |runtime| {
+                        runtime.log_ready = true;
+                    })
+                    .await;
                 }
             }
         });
@@ -1164,14 +1165,15 @@ fn attach_output_readers(
             while let Ok(Some(line)) = lines.next_line().await {
                 let proc_name = crate::model::read_name(&handle);
                 eprintln!("[{proc_name}] {line}");
-                if let Some(ref re) = pattern {
-                    if !flag.load(Ordering::Relaxed) && re.is_match(&line) {
-                        flag.store(true, Ordering::Relaxed);
-                        with_process_mut(&state_clone, &handle, |runtime| {
-                            runtime.log_ready = true;
-                        })
-                        .await;
-                    }
+                if let Some(ref re) = pattern
+                    && !flag.load(Ordering::Relaxed)
+                    && re.is_match(&line)
+                {
+                    flag.store(true, Ordering::Relaxed);
+                    with_process_mut(&state_clone, &handle, |runtime| {
+                        runtime.log_ready = true;
+                    })
+                    .await;
                 }
             }
         });
@@ -1659,31 +1661,31 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
 
             let mut started = 0;
             for name in &to_start {
-                if let Some(runtime) = guard.processes.get_mut(name) {
-                    if runtime.status.is_terminal() {
-                        // Skip disabled services under a blanket start: only
-                        // an explicit `start NAME` (or a transitive dep pulled
-                        // in by one) overrides the disabled flag.
-                        if !explicit_start && runtime.spec.disabled {
-                            continue;
-                        }
-                        runtime.status = ProcessStatus::Pending;
-                        runtime.log_ready = false;
-                        runtime.ready = false;
-                        // `alive` defaults to true for a fresh
-                        // instance — see ProcessRuntime docs.
-                        runtime.alive = true;
-                        // Explicit `start` overrides the disabled flag for
-                        // this instance; otherwise the supervisor filter
-                        // would immediately skip the Pending runtime and
-                        // the service would never launch. Transitive deps
-                        // pulled in above are overridden too so `start A`
-                        // can bring up a disabled dep.
-                        if explicit_start {
-                            runtime.spec.disabled = false;
-                        }
-                        started += 1;
+                if let Some(runtime) = guard.processes.get_mut(name)
+                    && runtime.status.is_terminal()
+                {
+                    // Skip disabled services under a blanket start: only
+                    // an explicit `start NAME` (or a transitive dep pulled
+                    // in by one) overrides the disabled flag.
+                    if !explicit_start && runtime.spec.disabled {
+                        continue;
                     }
+                    runtime.status = ProcessStatus::Pending;
+                    runtime.log_ready = false;
+                    runtime.ready = false;
+                    // `alive` defaults to true for a fresh
+                    // instance — see ProcessRuntime docs.
+                    runtime.alive = true;
+                    // Explicit `start` overrides the disabled flag for
+                    // this instance; otherwise the supervisor filter
+                    // would immediately skip the Pending runtime and
+                    // the service would never launch. Transitive deps
+                    // pulled in above are overridden too so `start A`
+                    // can bring up a disabled dep.
+                    if explicit_start {
+                        runtime.spec.disabled = false;
+                    }
+                    started += 1;
                 }
             }
             if started == 0 {
@@ -1708,17 +1710,17 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
         Err(resp) => resp,
         Ok(names) => {
             for name in &names {
-                if let Some(runtime) = guard.processes.get(name) {
-                    if let ProcessStatus::Running { pid } = runtime.status {
-                        #[cfg(unix)]
-                        {
-                            use nix::sys::signal::{self, Signal};
-                            use nix::unistd::Pid;
-                            if let Ok(sig) = Signal::try_from(signal) {
-                                // Signal the whole process group so
-                                // backgrounded grandchildren exit too.
-                                let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
-                            }
+                if let Some(runtime) = guard.processes.get(name)
+                    && let ProcessStatus::Running { pid } = runtime.status
+                {
+                    #[cfg(unix)]
+                    {
+                        use nix::sys::signal::{self, Signal};
+                        use nix::unistd::Pid;
+                        if let Ok(sig) = Signal::try_from(signal) {
+                            // Signal the whole process group so
+                            // backgrounded grandchildren exit too.
+                            let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
                         }
                     }
                 }

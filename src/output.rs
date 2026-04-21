@@ -67,10 +67,10 @@ pub fn print_json<T: Serialize>(value: &T) {
 /// - `NO_COLOR` env var is set (to any non-empty value)
 /// - stdout is not a TTY (and --table was not forced)
 pub fn use_color() -> bool {
-    if let Some(val) = env::var_os("NO_COLOR") {
-        if !val.is_empty() {
-            return false;
-        }
+    if let Some(val) = env::var_os("NO_COLOR")
+        && !val.is_empty()
+    {
+        return false;
     }
     std::io::stdout().is_terminal()
 }

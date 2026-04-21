@@ -2182,21 +2182,19 @@ processes:
         if !ps.status.success() {
             continue;
         }
-        if let Ok(ps_json) = serde_json::from_slice::<Value>(&ps.stdout) {
-            if let Some(server) = ps_json["processes"]
+        if let Ok(ps_json) = serde_json::from_slice::<Value>(&ps.stdout)
+            && let Some(server) = ps_json["processes"]
                 .as_array()
                 .and_then(|a| a.iter().find(|p| p["name"].as_str() == Some("server")))
-            {
-                if server["ready"].as_bool() == Some(true) {
-                    assert_eq!(
-                        server["has_readiness_probe"].as_bool(),
-                        Some(true),
-                        "has_readiness_probe should be true"
-                    );
-                    healthy = true;
-                    break;
-                }
-            }
+            && server["ready"].as_bool() == Some(true)
+        {
+            assert_eq!(
+                server["has_readiness_probe"].as_bool(),
+                Some(true),
+                "has_readiness_probe should be true"
+            );
+            healthy = true;
+            break;
         }
     }
     assert!(

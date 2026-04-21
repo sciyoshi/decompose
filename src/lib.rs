@@ -453,10 +453,10 @@ async fn wait_for_daemon_ready(
         if let Ok(Response::Pong { pid, .. }) = send_request(paths, Request::Ping).await {
             return Ok((pid, got_ctrl_c));
         }
-        if let Some(task) = ctrl_c_task {
-            if task.is_finished() {
-                got_ctrl_c = true;
-            }
+        if let Some(task) = ctrl_c_task
+            && task.is_finished()
+        {
+            got_ctrl_c = true;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -726,31 +726,31 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
 /// `$PAGER` (or `less -R`) when stdout is a TTY. See [`should_page`] for the
 /// gate.
 fn write_logs_maybe_paged(lines: &[String], no_pager: bool) {
-    if should_page(no_pager) {
-        if let Some(mut child) = spawn_pager() {
-            let status = {
-                let stdin = child.stdin.as_mut();
-                if let Some(stdin) = stdin {
-                    // BrokenPipe just means the user quit the pager — stop
-                    // writing without treating it as an error.
-                    let mut bw = std::io::BufWriter::new(stdin);
-                    for line in lines {
-                        if writeln!(bw, "{line}").is_err() {
-                            break;
-                        }
+    if should_page(no_pager)
+        && let Some(mut child) = spawn_pager()
+    {
+        let status = {
+            let stdin = child.stdin.as_mut();
+            if let Some(stdin) = stdin {
+                // BrokenPipe just means the user quit the pager — stop
+                // writing without treating it as an error.
+                let mut bw = std::io::BufWriter::new(stdin);
+                for line in lines {
+                    if writeln!(bw, "{line}").is_err() {
+                        break;
                     }
-                    let _ = bw.flush();
                 }
-                // Drop stdin (via the end of this block) so the pager sees
-                // EOF and exits. Then wait for it.
-                drop(child.stdin.take());
-                child.wait()
-            };
-            let _ = status;
-            return;
-        }
-        // Falls through to direct stdout on pager spawn failure.
+                let _ = bw.flush();
+            }
+            // Drop stdin (via the end of this block) so the pager sees
+            // EOF and exits. Then wait for it.
+            drop(child.stdin.take());
+            child.wait()
+        };
+        let _ = status;
+        return;
     }
+    // Falls through to direct stdout on pager spawn failure.
     for line in lines {
         println!("{line}");
     }
@@ -775,10 +775,10 @@ fn should_page(no_pager: bool) -> bool {
         if v.is_empty() {
             return false;
         }
-    } else if let Some(v) = env::var_os("PAGER") {
-        if v.is_empty() {
-            return false;
-        }
+    } else if let Some(v) = env::var_os("PAGER")
+        && v.is_empty()
+    {
+        return false;
     }
     true
 }
@@ -1373,21 +1373,20 @@ async fn stream_filtered_logs(
         // Periodically check if filtered processes have all exited
         if !processes.is_empty() {
             poll_counter += 1;
-            if poll_counter % 10 == 0 {
-                if let Ok(Response::Ps {
+            if poll_counter.is_multiple_of(10)
+                && let Ok(Response::Ps {
                     processes: snapshots,
                     ..
                 }) = send_request(&paths, Request::Ps).await
-                {
-                    let all_exited = processes.iter().all(|p| {
-                        snapshots
-                            .iter()
-                            .filter(|s| s.base == *p || s.name == *p)
-                            .all(|s| s.state == "exited" || s.state == "failed")
-                    });
-                    if all_exited {
-                        break;
-                    }
+            {
+                let all_exited = processes.iter().all(|p| {
+                    snapshots
+                        .iter()
+                        .filter(|s| s.base == *p || s.name == *p)
+                        .all(|s| s.state == "exited" || s.state == "failed")
+                });
+                if all_exited {
+                    break;
                 }
             }
         }

@@ -261,15 +261,14 @@ pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
             if !cfg.processes.contains_key(dep) {
                 bail!("process `{name}` depends on unknown process `{dep}`");
             }
-            if dep_cfg.condition == DependencyCondition::ProcessLogReady {
-                if let Some(dep_proc) = cfg.processes.get(dep) {
-                    if dep_proc.ready_log_line.is_none() {
-                        bail!(
-                            "process `{name}` depends on `{dep}` with condition process_log_ready, \
+            if dep_cfg.condition == DependencyCondition::ProcessLogReady
+                && let Some(dep_proc) = cfg.processes.get(dep)
+                && dep_proc.ready_log_line.is_none()
+            {
+                bail!(
+                    "process `{name}` depends on `{dep}` with condition process_log_ready, \
                              but `{dep}` has no ready_log_line defined"
-                        );
-                    }
-                }
+                );
             }
         }
     }
