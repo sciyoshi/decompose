@@ -359,6 +359,7 @@ dependencies = [
  "ansi-to-tui",
  "anstyle",
  "anyhow",
+ "base64",
  "clap",
  "clap_complete",
  "crossterm",

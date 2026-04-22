@@ -11,8 +11,10 @@ use std::time::Duration;
 
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
+use crossterm::style::Print;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -51,9 +53,9 @@ enum Focus {
 }
 
 struct LogLine {
-    /// Plain text without ANSI sequences. Search and yank (follow-ups) will
-    /// operate on this form; keeping it here so ingest parses once.
-    #[allow(dead_code)]
+    /// Plain text without ANSI sequences. Search operates on this form;
+    /// yank uses it so clipboard content is plain text even when the log
+    /// line has color spans. Parsing once at ingest keeps render cheap.
     plain: String,
     /// ANSI parsed into styled spans once at ingest. Rendering a 10k-line
     /// buffer at 60fps means we can't reparse per frame.
@@ -75,6 +77,10 @@ struct App {
     log_scrollback: usize,
     status_message: Option<(Instant, String)>,
     should_quit: bool,
+    /// Inner height of the log pane on the last render. Used by the yank
+    /// handler to know which slice of the buffer was actually visible.
+    /// 0 before the first draw.
+    log_viewport_height: usize,
 }
 
 impl App {
@@ -90,6 +96,7 @@ impl App {
             log_scrollback: 0,
             status_message: None,
             should_quit: false,
+            log_viewport_height: 0,
         }
     }
 
@@ -110,6 +117,20 @@ impl App {
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((Instant::now(), msg.into()));
+    }
+
+    /// Plain-text slice of the log buffer currently on screen. Mirrors the
+    /// windowing done in `draw_log_pane` so yanks reflect exactly what the
+    /// user sees. Returns an empty slice if the pane hasn't been drawn yet.
+    fn visible_log_lines(&self) -> impl Iterator<Item = &str> {
+        let total = self.logs.len();
+        let end = total.saturating_sub(self.log_scrollback);
+        let start = end.saturating_sub(self.log_viewport_height);
+        self.logs
+            .iter()
+            .skip(start)
+            .take(end - start)
+            .map(|l| l.plain.as_str())
     }
 }
 
@@ -135,6 +156,31 @@ fn parse_ansi_line(raw: &str, plain: &str) -> Line<'static> {
         }
         Err(_) => Line::from(plain.to_string()),
     }
+}
+
+/// Build an OSC 52 clipboard-set escape for `text`. When running inside
+/// tmux, wrap the inner sequence so tmux forwards it to the outer
+/// terminal rather than swallowing it. This works over plain SSH since
+/// the terminal emulator on the user's end parses OSC 52 regardless of
+/// how many hops the bytes travelled.
+fn osc52_sequence(text: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    let inner = format!("\x1b]52;c;{b64}\x07");
+    if std::env::var_os("TMUX").is_some() {
+        // tmux passthrough: DCS ... ST with a literal ESC before the OSC.
+        format!("\x1bPtmux;\x1b{inner}\x1b\\")
+    } else {
+        inner
+    }
+}
+
+/// Emit an OSC 52 clipboard-set escape on the terminal. Errors are
+/// swallowed — clipboard failures shouldn't crash the TUI; the caller
+/// still sets a status-bar message, so the user sees whether the yank
+/// "took".
+fn copy_to_clipboard(text: &str) -> bool {
+    let seq = osc52_sequence(text);
+    execute!(stdout(), Print(seq)).is_ok()
 }
 
 /// Lossy ANSI strip — enough for search/yank without pulling in a full
@@ -351,6 +397,40 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             app.follow = !app.follow;
             app.set_status(if app.follow { "following" } else { "paused" });
         }
+        (KeyCode::Char('y'), _) if app.focus == Focus::Logs => {
+            let lines: Vec<&str> = app.visible_log_lines().collect();
+            if lines.is_empty() {
+                app.set_status("nothing to yank");
+            } else {
+                let n = lines.len();
+                let text = lines.join("\n");
+                let ok = copy_to_clipboard(&text);
+                app.set_status(if ok {
+                    format!("yanked {n} visible line{}", if n == 1 { "" } else { "s" })
+                } else {
+                    "clipboard copy failed".to_string()
+                });
+            }
+        }
+        (KeyCode::Char('Y'), _) if app.focus == Focus::Logs => {
+            if app.logs.is_empty() {
+                app.set_status("nothing to yank");
+            } else {
+                let n = app.logs.len();
+                let text = app
+                    .logs
+                    .iter()
+                    .map(|l| l.plain.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let ok = copy_to_clipboard(&text);
+                app.set_status(if ok {
+                    format!("yanked {n} lines (full buffer)")
+                } else {
+                    "clipboard copy failed".to_string()
+                });
+            }
+        }
         (KeyCode::Char('s'), _) => send_service_action(app, ServiceAction::Stop).await,
         (KeyCode::Char('r'), _) => send_service_action(app, ServiceAction::Restart).await,
         (KeyCode::Char('u'), _) => send_service_action(app, ServiceAction::Start).await,
@@ -532,7 +612,7 @@ fn draw_process_list(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, list_area, &mut app.list_state);
 }
 
-fn draw_log_pane(f: &mut ratatui::Frame, area: Rect, app: &App) {
+fn draw_log_pane(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Logs;
     let indicator = if app.follow { "●" } else { "❚❚" };
     let title = format!(
@@ -552,6 +632,7 @@ fn draw_log_pane(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let height = inner.height as usize;
+    app.log_viewport_height = height;
     if height == 0 {
         return;
     }
@@ -596,7 +677,7 @@ fn default_help(focus: Focus) -> String {
             "↑↓ select · s stop · r restart · u start · tab logs · q detach · Q down".to_string()
         }
         Focus::Logs => {
-            "PgUp/PgDn scroll · p pause · End follow · tab list · q detach · Q down".to_string()
+            "PgUp/PgDn scroll · p pause · y yank · Y yank all · End follow · q detach".to_string()
         }
     }
 }
@@ -675,5 +756,22 @@ mod tests {
     fn strip_ansi_removes_sgr_sequences() {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn osc52_sequence_encodes_payload_and_wraps_framing() {
+        // The OSC 52 wire format is ESC ] 52 ; c ; <base64> BEL. Regression
+        // test: mis-framing here means terminals silently ignore the copy
+        // and users get "nothing pasted" with no feedback.
+        // Skip the tmux-wrapping branch for determinism.
+        unsafe { std::env::remove_var("TMUX") };
+        let seq = osc52_sequence("hello");
+        assert!(
+            seq.starts_with("\x1b]52;c;"),
+            "missing OSC 52 prefix: {seq:?}"
+        );
+        assert!(seq.ends_with('\x07'), "missing BEL terminator: {seq:?}");
+        // "hello" in base64 is "aGVsbG8=".
+        assert!(seq.contains("aGVsbG8="), "unexpected payload: {seq:?}");
     }
 }
