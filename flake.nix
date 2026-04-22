@@ -26,8 +26,14 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.installShellFiles ];
           nativeCheckInputs = [ pkgs.python3 ];
+          postInstall = ''
+            installShellCompletion --cmd decompose \
+              --bash <($out/bin/decompose completion bash) \
+              --fish <($out/bin/decompose completion fish) \
+              --zsh  <($out/bin/decompose completion zsh)
+          '';
           meta = {
             description = cargoToml.package.description;
             homepage = cargoToml.package.homepage;
