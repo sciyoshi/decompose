@@ -52,6 +52,57 @@ enum Focus {
     Logs,
 }
 
+/// Top-level input mode. When in `SearchInput`, the footer turns into a
+/// `/regex_` prompt and most normal keybindings are suppressed so users
+/// can type search queries freely. `Normal` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    SearchInput,
+}
+
+/// Active search state. `input` is the text the user is composing (or
+/// has committed); `regex` is the compiled form, `None` when the input
+/// is empty or fails to parse. Matches are computed on demand during
+/// n/N navigation — the log buffer isn't large enough (5000 lines max)
+/// for the per-frame cost to matter for highlighting.
+struct Search {
+    input: String,
+    regex: Option<regex::Regex>,
+    error: Option<String>,
+}
+
+impl Search {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            regex: None,
+            error: None,
+        }
+    }
+
+    fn recompile(&mut self) {
+        if self.input.is_empty() {
+            self.regex = None;
+            self.error = None;
+            return;
+        }
+        match regex::RegexBuilder::new(&self.input)
+            .case_insensitive(!self.input.chars().any(|c| c.is_uppercase()))
+            .build()
+        {
+            Ok(re) => {
+                self.regex = Some(re);
+                self.error = None;
+            }
+            Err(e) => {
+                self.regex = None;
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+}
+
 struct LogLine {
     /// Plain text without ANSI sequences. Search operates on this form;
     /// yank uses it so clipboard content is plain text even when the log
@@ -81,6 +132,8 @@ struct App {
     /// handler to know which slice of the buffer was actually visible.
     /// 0 before the first draw.
     log_viewport_height: usize,
+    mode: Mode,
+    search: Search,
 }
 
 impl App {
@@ -97,6 +150,8 @@ impl App {
             status_message: None,
             should_quit: false,
             log_viewport_height: 0,
+            mode: Mode::Normal,
+            search: Search::new(),
         }
     }
 
@@ -156,6 +211,31 @@ fn parse_ansi_line(raw: &str, plain: &str) -> Line<'static> {
         }
         Err(_) => Line::from(plain.to_string()),
     }
+}
+
+/// Render a single plain-text log line with regex matches highlighted.
+/// Non-matching runs become unstyled spans; matches get a yellow
+/// background. All find-iter ranges are byte offsets into the plain
+/// string, so we slice with standard string indexing.
+fn highlight_line(plain: &str, re: &regex::Regex) -> Line<'static> {
+    let matches: Vec<(usize, usize)> = re.find_iter(plain).map(|m| (m.start(), m.end())).collect();
+    if matches.is_empty() {
+        return Line::from(plain.to_string());
+    }
+    let hl = Style::default().bg(Color::Yellow).fg(Color::Black);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(matches.len() * 2 + 1);
+    let mut pos = 0;
+    for (s, e) in matches {
+        if s > pos {
+            spans.push(Span::raw(plain[pos..s].to_string()));
+        }
+        spans.push(Span::styled(plain[s..e].to_string(), hl));
+        pos = e;
+    }
+    if pos < plain.len() {
+        spans.push(Span::raw(plain[pos..].to_string()));
+    }
+    Line::from(spans)
 }
 
 /// Build an OSC 52 clipboard-set escape for `text`. When running inside
@@ -349,6 +429,10 @@ async fn poll_log(app: &mut App) {
 }
 
 async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if app.mode == Mode::SearchInput {
+        handle_search_input(app, code, mods);
+        return;
+    }
     match (code, mods) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -431,10 +515,88 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 });
             }
         }
+        (KeyCode::Char('/'), _) => {
+            app.mode = Mode::SearchInput;
+            app.search.input.clear();
+            app.search.recompile();
+        }
+        (KeyCode::Esc, _) if app.search.regex.is_some() || !app.search.input.is_empty() => {
+            // Clear a committed search when not in input mode.
+            app.search = Search::new();
+        }
+        (KeyCode::Char('n'), _) if app.search.regex.is_some() => {
+            jump_to_match(app, 1);
+        }
+        (KeyCode::Char('N'), _) if app.search.regex.is_some() => {
+            jump_to_match(app, -1);
+        }
         (KeyCode::Char('s'), _) => send_service_action(app, ServiceAction::Stop).await,
         (KeyCode::Char('r'), _) => send_service_action(app, ServiceAction::Restart).await,
         (KeyCode::Char('u'), _) => send_service_action(app, ServiceAction::Start).await,
         _ => {}
+    }
+}
+
+fn handle_search_input(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    match code {
+        KeyCode::Esc => {
+            app.search = Search::new();
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            app.mode = Mode::Normal;
+            if app.search.regex.is_some() {
+                jump_to_match(app, 1);
+            }
+        }
+        KeyCode::Backspace => {
+            app.search.input.pop();
+            app.search.recompile();
+        }
+        KeyCode::Char(c) => {
+            app.search.input.push(c);
+            app.search.recompile();
+        }
+        _ => {}
+    }
+}
+
+/// Jump `direction` (+1 = forward/towards newer, -1 = backward) to the
+/// next line in the buffer that matches the current regex. On hit,
+/// pause follow and position the match so it's visible. Wraps around
+/// at either end.
+fn jump_to_match(app: &mut App, direction: i32) {
+    let Some(re) = app.search.regex.clone() else {
+        return;
+    };
+    if app.logs.is_empty() {
+        return;
+    }
+    let total = app.logs.len();
+    // Current "cursor" line = the bottom-most visible line when paused,
+    // or end-of-buffer when following. Map both back to a buffer index.
+    let visible_end = total.saturating_sub(app.log_scrollback);
+    let cursor = visible_end.saturating_sub(1);
+    let next = if direction > 0 {
+        // Search forward from (cursor+1), wrapping to 0.
+        (cursor + 1..total)
+            .chain(0..=cursor)
+            .find(|&i| re.is_match(&app.logs[i].plain))
+    } else {
+        // Search backward from (cursor-1), wrapping to (total-1).
+        (0..cursor)
+            .rev()
+            .chain((cursor..total).rev())
+            .find(|&i| re.is_match(&app.logs[i].plain))
+    };
+    match next {
+        Some(i) => {
+            app.follow = false;
+            // Position the matching line at the bottom of the viewport.
+            app.log_scrollback = total.saturating_sub(i + 1);
+            app.set_status(format!("match on line {} of {total}", i + 1));
+        }
+        None => app.set_status(format!("no match for /{}/", app.search.input)),
     }
 }
 
@@ -646,39 +808,71 @@ fn draw_log_pane(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .iter()
         .skip(start)
         .take(end - start)
-        .map(|l| l.styled.clone())
+        .map(|l| match &app.search.regex {
+            // When a search is active, re-render from plain text with match
+            // highlights. Loses ANSI coloring in the log itself during
+            // search — worth it for visible highlights, and rare enough
+            // that trading off once is the right call.
+            Some(re) => highlight_line(&l.plain, re),
+            None => l.styled.clone(),
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    // Input mode wins over everything else — show the search prompt with
+    // a block cursor so users see what they're typing.
+    if app.mode == Mode::SearchInput {
+        let mut spans = vec![
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(app.search.input.clone()),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ];
+        if let Some(err) = &app.search.error {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("invalid regex: {err}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let now = Instant::now();
     let text = if let Some((t, msg)) = &app.status_message {
         if now.duration_since(*t) < Duration::from_secs(3) {
             msg.clone()
         } else {
-            default_help(app.focus)
+            default_help(app)
         }
     } else {
-        default_help(app.focus)
+        default_help(app)
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        area,
-    );
+    let mut spans = Vec::new();
+    if let Some(re) = &app.search.regex {
+        spans.push(Span::styled(
+            format!("[/{}/ ] ", re.as_str()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn default_help(focus: Focus) -> String {
-    match focus {
-        Focus::List => {
-            "↑↓ select · s stop · r restart · u start · tab logs · q detach · Q down".to_string()
-        }
-        Focus::Logs => {
-            "PgUp/PgDn scroll · p pause · y yank · Y yank all · End follow · q detach".to_string()
-        }
+fn default_help(app: &App) -> String {
+    let search_hint = if app.search.regex.is_some() {
+        " · n/N navigate · Esc clear"
+    } else {
+        " · / search"
+    };
+    match app.focus {
+        Focus::List => format!(
+            "↑↓ select · s stop · r restart · u start · tab logs{search_hint} · q detach · Q down"
+        ),
+        Focus::Logs => format!(
+            "PgUp/PgDn scroll · p pause · y yank · Y yank all · End follow{search_hint} · q detach"
+        ),
     }
 }
 
@@ -756,6 +950,44 @@ mod tests {
     fn strip_ansi_removes_sgr_sequences() {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn highlight_line_splits_on_matches() {
+        // Regression: the match ranges returned by regex::find_iter are
+        // byte offsets. Slicing the original &str at those byte offsets
+        // must land on char boundaries — test with ASCII where match bytes
+        // == char offsets.
+        let re = regex::Regex::new("err").unwrap();
+        let line = highlight_line("an error line", &re);
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts, vec!["an ", "err", "or line"]);
+        // Highlighted span carries the yellow background.
+        assert_eq!(line.spans[1].style.bg, Some(Color::Yellow));
+        // Surrounding spans are unstyled.
+        assert_eq!(line.spans[0].style.bg, None);
+        assert_eq!(line.spans[2].style.bg, None);
+    }
+
+    #[test]
+    fn highlight_line_with_no_match_returns_single_span() {
+        let re = regex::Regex::new("nope").unwrap();
+        let line = highlight_line("an error line", &re);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content.as_ref(), "an error line");
+    }
+
+    #[test]
+    fn search_recompile_case_smartcase() {
+        // Lowercase query → case-insensitive (so /error matches "ERROR").
+        let mut s = Search::new();
+        s.input = "error".into();
+        s.recompile();
+        assert!(s.regex.as_ref().unwrap().is_match("ERROR boom"));
+        // Uppercase anywhere → case-sensitive.
+        s.input = "Error".into();
+        s.recompile();
+        assert!(!s.regex.as_ref().unwrap().is_match("error boom"));
     }
 
     #[test]
