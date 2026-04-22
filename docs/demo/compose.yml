@@ -1,11 +1,13 @@
 processes:
   api:
-    description: HTTP API server (colored logs)
+    description: HTTP API server
     command: >
       while true; do
-        printf '\033[32m%s INFO\033[0m  request served status=200 path=/healthz\n' "$(date +%H:%M:%S)";
+        printf '\033[32m%s INFO\033[0m  GET  /healthz 200 2ms\n' "$(date +%H:%M:%S)";
         sleep 1;
-        printf '\033[31m%s ERROR\033[0m upstream timeout retry=2\n' "$(date +%H:%M:%S)";
+        printf '\033[32m%s INFO\033[0m  POST /users   201 14ms\n' "$(date +%H:%M:%S)";
+        sleep 1;
+        printf '\033[32m%s INFO\033[0m  GET  /users/42 200 6ms\n' "$(date +%H:%M:%S)";
         sleep 2;
       done
 
@@ -13,22 +15,24 @@ processes:
     description: Background job runner
     command: >
       while true; do
-        printf '\033[36m%s worker\033[0m processed batch of 42 jobs\n' "$(date +%H:%M:%S)";
-        sleep 2;
+        printf '\033[36m%s worker\033[0m processed batch of %s jobs\n' \
+          "$(date +%H:%M:%S)" "$((RANDOM % 50 + 10))";
+        sleep 3;
       done
 
   cache:
     description: Cache warmer
     command: >
       while true; do
-        printf '\033[35m%s cache\033[0m refreshed keys=%s\n' "$(date +%H:%M:%S)" "$((RANDOM % 200))";
-        sleep 3;
+        printf '\033[35m%s cache\033[0m refreshed keys=%s\n' \
+          "$(date +%H:%M:%S)" "$((RANDOM % 200))";
+        sleep 4;
       done
 
   migrate:
     description: One-shot migration
     command: >
-      for step in 001_init 002_users 003_index 004_sessions; do
+      for step in 001_init 002_users 003_index; do
         printf 'applying migration %s\n' "$step";
         sleep 1;
       done;
