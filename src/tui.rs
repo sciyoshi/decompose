@@ -315,12 +315,7 @@ fn restore_terminal(term: &mut Term) -> Result<()> {
 async fn run_app(term: &mut Term, paths: RuntimePaths) -> Result<()> {
     let mut app = App::new(paths);
 
-    // Start tailing the log file at its current end so we don't flood the
-    // buffer with historical output on open. A later improvement: preload
-    // the last N lines for context.
-    if let Ok(meta) = tokio::fs::metadata(&app.paths.daemon_log).await {
-        app.log_offset = meta.len();
-    }
+    preload_log_tail(&mut app).await;
 
     // Prime the process list so the first render isn't empty.
     refresh_processes(&mut app).await;
@@ -357,6 +352,54 @@ async fn run_app(term: &mut Term, paths: RuntimePaths) -> Result<()> {
         term.draw(|f| draw(f, &mut app))?;
     }
     Ok(())
+}
+
+/// Max bytes to read from the tail of the log file at startup. 256 KiB is
+/// plenty for ~500 colourful lines — more than enough context without
+/// slowing the first render on a long-lived daemon whose log ran to MB.
+const PRELOAD_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Max lines from the preload window to actually push into the buffer.
+/// Well under BUFFER_CAP so users still have headroom for live tail.
+const PRELOAD_LINES: usize = 500;
+
+/// Load recent lines from the end of the daemon log so the TUI opens with
+/// context instead of an empty pane. Skips a partial first line when the
+/// tail window starts mid-line. Advances `log_offset` to end-of-file so
+/// the regular poll loop picks up from exactly where we stopped.
+async fn preload_log_tail(app: &mut App) {
+    let path = app.paths.daemon_log.clone();
+    let Ok(meta) = tokio::fs::metadata(&path).await else {
+        return;
+    };
+    let len = meta.len();
+    let start = len.saturating_sub(PRELOAD_TAIL_BYTES);
+    let Ok(mut file) = File::open(&path).await else {
+        app.log_offset = len;
+        return;
+    };
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        app.log_offset = len;
+        return;
+    }
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    if file.read_to_end(&mut buf).await.is_err() {
+        app.log_offset = len;
+        return;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Drop the leading partial line if we started mid-file.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let skip = lines.len().saturating_sub(PRELOAD_LINES);
+    for line in lines.iter().skip(skip) {
+        if !line.is_empty() {
+            app.push_log_line(line);
+        }
+    }
+    app.log_offset = len;
 }
 
 async fn refresh_processes(app: &mut App) {
@@ -693,40 +736,48 @@ fn process_list_height(n: usize, total: u16) -> u16 {
 }
 
 fn draw_process_list(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    // Leading two spaces match the List highlight gutter ("▸ ") so header
+    // columns line up with the rows beneath.
     let header = Line::from(vec![
-        Span::styled(
-            format!("{:<18}", "NAME"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{:<12}", "STATUS"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{:<8}", "PID"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("HEALTH", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(format!("{:<12}", "STATE"), bold),
+        Span::styled(format!("{:<22}", "NAME"), bold),
+        Span::styled(format!("{:>8}", "PID"), bold),
+        Span::styled(format!("{:>8}", "RESTART"), bold),
     ]);
 
     let items: Vec<ListItem> = app
         .processes
         .iter()
         .map(|p| {
-            let status_color = status_color(&p.state);
+            let (glyph, label, _astyle) =
+                crate::output::unified_state(&p.state, p.has_readiness_probe, p.ready, false);
+            let state_color = state_color(&p.state, p.has_readiness_probe, p.ready);
             let pid = p
                 .pid
                 .map(|x| x.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let health = health_glyph(p);
+            // For exited processes the state column carries the exit code
+            // so users see "exited 0" vs. "exited 1" at a glance.
+            let state_text = match (p.state.as_str(), p.exit_code) {
+                ("exited", Some(c)) | ("failed", Some(c)) => format!("{label} {c}"),
+                _ => label.to_string(),
+            };
+            let restarts = if p.restart_count > 0 {
+                p.restart_count.to_string()
+            } else {
+                "-".to_string()
+            };
             let row = Line::from(vec![
-                Span::raw(format!("{:<18}", truncate(&p.name, 18))),
+                Span::styled(format!("{glyph} "), Style::default().fg(state_color)),
                 Span::styled(
-                    format!("{:<12}", p.status),
-                    Style::default().fg(status_color),
+                    format!("{:<10}", truncate(&state_text, 10)),
+                    Style::default().fg(state_color),
                 ),
-                Span::raw(format!("{:<8}", pid)),
-                Span::raw(health),
+                Span::raw(format!("{:<22}", truncate(&p.name, 22))),
+                Span::raw(format!("{:>8}", pid)),
+                Span::raw(format!("{:>8}", restarts)),
             ]);
             ListItem::new(row)
         })
@@ -886,28 +937,15 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn status_color(state: &str) -> Color {
+/// Color for the STATE column. Matches the palette used by the CLI `ps`
+/// table so users see the same thing in both views.
+fn state_color(state: &str, has_readiness_probe: bool, healthy: bool) -> Color {
     match state {
-        "running" => Color::Green,
-        "starting" | "pending" => Color::Yellow,
-        "exited" => Color::DarkGray,
-        "failed" | "stopped" => Color::Red,
+        "running" if !has_readiness_probe || healthy => Color::Green,
+        "running" | "pending" | "restarting" => Color::Yellow,
+        "failed" | "failed_to_start" => Color::Red,
+        "exited" | "stopped" | "disabled" | "not_started" => Color::DarkGray,
         _ => Color::White,
-    }
-}
-
-fn health_glyph(p: &ProcessSnapshot) -> String {
-    let mut parts = Vec::new();
-    if p.has_readiness_probe {
-        parts.push(if p.ready { "✓ ready" } else { "✗ ready" });
-    }
-    if p.has_liveness_probe {
-        parts.push(if p.alive { "✓ alive" } else { "✗ alive" });
-    }
-    if parts.is_empty() {
-        "-".to_string()
-    } else {
-        parts.join(" ")
     }
 }
 
