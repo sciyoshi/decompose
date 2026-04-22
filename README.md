@@ -8,6 +8,8 @@
 No image builds. No container cold starts. No bridge-network translation overhead.  
 Just your real processes, fast, with a familiar compose-like interface.
 
+![decompose tui demo](assets/tui-demo.gif)
+
 ## Installing
 
 ### From crates.io
