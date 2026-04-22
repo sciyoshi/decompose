@@ -5697,6 +5697,36 @@ fn completion_subcommand_emits_shell_scripts() {
         bash_out.contains("__decompose_services"),
         "bash completion should include the dynamic service helper",
     );
+    assert!(
+        bash_out.contains("__decompose_collect_globals"),
+        "bash completion should forward global flags to decompose config --json",
+    );
+    assert!(
+        bash_out.contains("__decompose_sessions"),
+        "bash completion should include the dynamic session helper",
+    );
+    for cmd in [
+        "up",
+        "down",
+        "ps",
+        "attach",
+        "tui",
+        "logs",
+        "start",
+        "stop",
+        "restart",
+        "kill",
+        "config",
+        "ls",
+        "run",
+        "exec",
+        "completion",
+    ] {
+        assert!(
+            bash_out.contains(cmd),
+            "bash completion should mention subcommand {cmd}: {bash_out}"
+        );
+    }
 
     // Zsh: should contain `#compdef decompose` and our `compdef
     // __decompose_dyn_wrap decompose` re-registration.
@@ -5719,6 +5749,14 @@ fn completion_subcommand_emits_shell_scripts() {
         zsh_out.contains("compdef __decompose_dyn_wrap decompose"),
         "zsh completion should re-register with the dynamic wrapper",
     );
+    assert!(
+        zsh_out.contains("__decompose_collect_globals"),
+        "zsh completion should forward global flags to decompose config --json",
+    );
+    assert!(
+        zsh_out.contains("__decompose_sessions"),
+        "zsh completion should include the dynamic session helper",
+    );
 
     // Fish: should contain `complete -c decompose ...` entries.
     let fish = run_cmd(
@@ -5736,6 +5774,22 @@ fn completion_subcommand_emits_shell_scripts() {
         fish_out.contains("complete -c decompose"),
         "fish completion should contain decompose completions",
     );
+    assert!(
+        fish_out.contains("__decompose_services"),
+        "fish completion should include the dynamic service helper: {fish_out}",
+    );
+    assert!(
+        fish_out.contains("__decompose_sessions"),
+        "fish completion should include the dynamic session helper",
+    );
+    assert!(
+        fish_out.contains("__decompose_collect_globals"),
+        "fish completion should forward global flags",
+    );
+    assert!(
+        fish_out.contains("__fish_seen_subcommand_from"),
+        "fish completion should gate service completion on subcommand context",
+    );
 
     // PowerShell + elvish: just assert non-empty + expected marker.
     let ps = run_cmd(
@@ -5752,6 +5806,18 @@ fn completion_subcommand_emits_shell_scripts() {
     assert!(
         ps_out.contains("Register-ArgumentCompleter"),
         "powershell completion should use Register-ArgumentCompleter",
+    );
+    assert!(
+        ps_out.contains("__DecomposeServices"),
+        "powershell completion should define the dynamic service helper",
+    );
+    assert!(
+        ps_out.contains("__DecomposeSessions"),
+        "powershell completion should define the dynamic session helper",
+    );
+    assert!(
+        ps_out.contains("__DecomposeCollectGlobals"),
+        "powershell completion should forward global flags",
     );
 
     let elv = run_cmd(
