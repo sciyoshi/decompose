@@ -1029,19 +1029,209 @@ mod tests {
     }
 
     #[test]
-    fn osc52_sequence_encodes_payload_and_wraps_framing() {
-        // The OSC 52 wire format is ESC ] 52 ; c ; <base64> BEL. Regression
-        // test: mis-framing here means terminals silently ignore the copy
-        // and users get "nothing pasted" with no feedback.
-        // Skip the tmux-wrapping branch for determinism.
+    fn osc52_sequence_framing_plain_and_tmux() {
+        // The OSC 52 wire format is ESC ] 52 ; c ; <base64> BEL. Under tmux
+        // we wrap the inner sequence in a DCS tmux; ... ST envelope so tmux
+        // forwards it to the outer terminal instead of swallowing it.
+        // Both branches tested in one test because they share the TMUX env
+        // var — running them in parallel would race.
         unsafe { std::env::remove_var("TMUX") };
-        let seq = osc52_sequence("hello");
+        let plain = osc52_sequence("hello");
         assert!(
-            seq.starts_with("\x1b]52;c;"),
-            "missing OSC 52 prefix: {seq:?}"
+            plain.starts_with("\x1b]52;c;"),
+            "missing OSC 52 prefix: {plain:?}"
         );
-        assert!(seq.ends_with('\x07'), "missing BEL terminator: {seq:?}");
+        assert!(plain.ends_with('\x07'), "missing BEL terminator: {plain:?}");
         // "hello" in base64 is "aGVsbG8=".
-        assert!(seq.contains("aGVsbG8="), "unexpected payload: {seq:?}");
+        assert!(plain.contains("aGVsbG8="), "unexpected payload: {plain:?}");
+
+        unsafe { std::env::set_var("TMUX", "/tmp/fake,1,0") };
+        let wrapped = osc52_sequence("hi");
+        unsafe { std::env::remove_var("TMUX") };
+        assert!(
+            wrapped.starts_with("\x1bPtmux;\x1b"),
+            "missing DCS: {wrapped:?}"
+        );
+        assert!(wrapped.ends_with("\x1b\\"), "missing ST: {wrapped:?}");
+        assert!(
+            wrapped.contains("\x1b]52;c;"),
+            "missing inner OSC: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn search_recompile_reports_invalid_regex() {
+        // An unbalanced paren must surface as a user-visible error instead
+        // of silently dropping the query — otherwise / reports "no match"
+        // and users can't tell the difference between "no hits" and "my
+        // regex is broken".
+        let mut s = Search::new();
+        s.input = "(unclosed".into();
+        s.recompile();
+        assert!(s.regex.is_none());
+        assert!(s.error.is_some(), "expected error message for bad regex");
+    }
+
+    #[test]
+    fn search_recompile_empty_input_clears_state() {
+        let mut s = Search::new();
+        s.input = "err".into();
+        s.recompile();
+        assert!(s.regex.is_some());
+        s.input.clear();
+        s.recompile();
+        assert!(s.regex.is_none());
+        assert!(s.error.is_none());
+    }
+
+    #[test]
+    fn highlight_line_handles_multibyte_utf8() {
+        // Regression: find_iter returns byte offsets. If we ever sliced at
+        // char boundaries instead, a match after an emoji would panic.
+        let re = regex::Regex::new("err").unwrap();
+        let line = highlight_line("🔥 error here", &re);
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "🔥 error here");
+        let hit = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "err")
+            .expect("match span present");
+        assert_eq!(hit.style.bg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn truncate_preserves_short_and_ellipsizes_long() {
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abcdef", 5), "abcd…");
+        // Counts chars, not bytes — multi-byte must not blow up.
+        assert_eq!(truncate("é".repeat(3).as_str(), 5), "ééé");
+    }
+
+    #[test]
+    fn process_list_height_grows_caps_and_floors() {
+        // Small N with tall screen: 5 rows min (borders + header + a row).
+        assert_eq!(process_list_height(0, 40), 5);
+        assert_eq!(process_list_height(1, 40), 5);
+        // Growth: N=5 needs 5+3=8.
+        assert_eq!(process_list_height(5, 40), 8);
+        // Cap at half-screen so the log pane keeps its share.
+        assert_eq!(process_list_height(100, 40), 20);
+        // Tiny screen — floor at 5 wins over the half-cap.
+        assert_eq!(process_list_height(10, 6), 5);
+    }
+
+    #[test]
+    fn state_color_matches_cli_palette() {
+        // Running with no probe or passing probe: green.
+        assert_eq!(state_color("running", false, false), Color::Green);
+        assert_eq!(state_color("running", true, true), Color::Green);
+        // Running with failing probe: yellow, so users see "not ready".
+        assert_eq!(state_color("running", true, false), Color::Yellow);
+        // Pending/restarting: yellow (in-flight).
+        assert_eq!(state_color("pending", false, false), Color::Yellow);
+        assert_eq!(state_color("restarting", false, false), Color::Yellow);
+        // Failure variants: red.
+        assert_eq!(state_color("failed", false, false), Color::Red);
+        assert_eq!(state_color("failed_to_start", false, false), Color::Red);
+        // Neutral terminal states: dim.
+        assert_eq!(state_color("exited", false, false), Color::DarkGray);
+        assert_eq!(state_color("stopped", false, false), Color::DarkGray);
+        // Unknown state falls back to white so nothing is silently hidden.
+        assert_eq!(state_color("martian", false, false), Color::White);
+    }
+
+    #[test]
+    fn default_help_tracks_focus_and_search_state() {
+        let mut app = App::new(sample_paths());
+        // List focus, no search: mentions process actions and "/ search".
+        let list_help = default_help(&app);
+        assert!(list_help.contains("stop"), "list help: {list_help}");
+        assert!(list_help.contains("/ search"), "list help: {list_help}");
+        // Logs focus surfaces yank/scroll hints.
+        app.focus = Focus::Logs;
+        let logs_help = default_help(&app);
+        assert!(logs_help.contains("yank"), "logs help: {logs_help}");
+        assert!(logs_help.contains("pause"), "logs help: {logs_help}");
+        // Active search swaps the search hint to n/N navigation.
+        app.search.input = "e".into();
+        app.search.recompile();
+        let searching = default_help(&app);
+        assert!(searching.contains("n/N"), "search help: {searching}");
+        assert!(!searching.contains("/ search"), "search help: {searching}");
+    }
+
+    #[test]
+    fn jump_to_match_navigates_and_wraps() {
+        let mut app = App::new(sample_paths());
+        for line in ["alpha", "bravo error", "charlie", "delta error", "echo"] {
+            app.push_log_line(line);
+        }
+        app.search.input = "error".into();
+        app.search.recompile();
+
+        // Forward from top lands on the first match (idx 1 → scrollback = 3).
+        jump_to_match(&mut app, 1);
+        assert_eq!(app.log_scrollback, 3, "first forward hit at idx 1");
+        assert!(!app.follow, "jumping must pause follow");
+
+        // Another forward: idx 3 → scrollback = 1.
+        jump_to_match(&mut app, 1);
+        assert_eq!(app.log_scrollback, 1);
+
+        // Wrap: forward from last match returns to the first.
+        jump_to_match(&mut app, 1);
+        assert_eq!(app.log_scrollback, 3);
+
+        // Backward from the first match wraps to the last.
+        jump_to_match(&mut app, -1);
+        assert_eq!(app.log_scrollback, 1);
+    }
+
+    #[test]
+    fn move_selection_clamps_and_no_ops_when_empty() {
+        let mut app = App::new(sample_paths());
+        // Empty process list: must not panic, selection stays unset.
+        move_selection(&mut app, 1);
+        assert_eq!(app.list_state.selected(), None);
+
+        app.processes = vec![
+            sample_snapshot("a"),
+            sample_snapshot("b"),
+            sample_snapshot("c"),
+        ];
+        app.list_state.select(Some(0));
+        move_selection(&mut app, 10); // clamps at len-1
+        assert_eq!(app.list_state.selected(), Some(2));
+        move_selection(&mut app, -99); // clamps at 0
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    fn sample_paths() -> RuntimePaths {
+        RuntimePaths {
+            socket: "/tmp/decompose-test.sock".into(),
+            pid: "/tmp/decompose-test.pid".into(),
+            daemon_log: "/tmp/decompose-test.log".into(),
+            lock: "/tmp/decompose-test.lock".into(),
+        }
+    }
+
+    fn sample_snapshot(name: &str) -> ProcessSnapshot {
+        ProcessSnapshot {
+            name: name.to_string(),
+            base: name.to_string(),
+            replica: 0,
+            status: "running".to_string(),
+            state: "running".to_string(),
+            description: None,
+            restart_count: 0,
+            log_ready: false,
+            ready: false,
+            alive: true,
+            has_readiness_probe: false,
+            has_liveness_probe: false,
+            pid: Some(1),
+            exit_code: None,
+        }
     }
 }
