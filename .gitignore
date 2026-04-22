@@ -1,5 +1,6 @@
 /target
 /result
+/.direnv/
 **/*.rs.bk
 .DS_Store
 .decompose/
