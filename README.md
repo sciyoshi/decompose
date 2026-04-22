@@ -71,11 +71,15 @@ The binary will be at `target/release/decompose`. You can also use `cargo instal
 ### Shell completions
 
 `decompose completion <shell>` prints a ready-to-source completion script for
-`bash`, `zsh`, `fish`, `powershell`, or `elvish`. The bash and zsh scripts
-also do dynamic service-name completion: on `start`, `stop`, `restart`,
-`kill`, `logs`, `exec`, `run`, and `up`, tab-completion pulls service names
-from `decompose config --json` (uses `jq` if available, falls back to a
-`sed` parser otherwise).
+`bash`, `zsh`, `fish`, `powershell`, or `elvish`. The bash, zsh, fish, and
+PowerShell scripts also do dynamic completion: on `start`, `stop`,
+`restart`, `kill`, `logs`, `exec`, `run`, and `up`, tab-completion pulls
+service names from `decompose config --json`, and `--session` /
+`--project-name` values are pulled from `decompose ls --json`. The helpers
+forward `--file`, `-e`/`--env-file`, `--session`/`--project-name`, and
+`--disable-dotenv` to the backing config call so completion is correct in
+multi-project and multi-session setups. `jq` is optional but recommended;
+without it, a `sed` fallback parses the JSON.
 
 **bash** — add to your `~/.bashrc`:
 
