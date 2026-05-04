@@ -543,35 +543,35 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
 
         {
             let mut guard = state.lock().await;
-            let snapshot = guard.processes.clone();
 
-            // Check exit mode triggers
             if !guard.shutdown_requested {
                 let triggered = match guard.exit_mode {
                     ExitMode::WaitAll => false,
-                    ExitMode::ExitOnFailure => snapshot.values().any(|p| {
+                    ExitMode::ExitOnFailure => guard.processes.values().any(|p| {
                         matches!(p.status, ProcessStatus::Exited { code } if code != 0)
                             || matches!(p.status, ProcessStatus::FailedToStart { .. })
                     }),
-                    ExitMode::ExitOnEnd => snapshot
+                    ExitMode::ExitOnEnd => guard
+                        .processes
                         .values()
                         .any(|p| matches!(p.status, ProcessStatus::Exited { .. })),
                 };
                 if triggered {
-                    drop(guard);
-                    let mut guard = state.lock().await;
                     guard.request_shutdown();
                     request_shutdown = true;
                 } else {
-                    for (name, proc_runtime) in &snapshot {
-                        if !matches!(proc_runtime.status, ProcessStatus::Pending) {
-                            continue;
-                        }
-                        if proc_runtime.spec.disabled {
-                            continue;
-                        }
-                        if dependencies_met(proc_runtime, &snapshot) {
-                            launchable.push(name.clone());
+                    {
+                        let by_base = index_processes_by_base(&guard.processes);
+                        for (name, proc_runtime) in &guard.processes {
+                            if !matches!(proc_runtime.status, ProcessStatus::Pending) {
+                                continue;
+                            }
+                            if proc_runtime.spec.disabled {
+                                continue;
+                            }
+                            if dependencies_met_with_index(proc_runtime, &by_base) {
+                                launchable.push(name.clone());
+                            }
                         }
                     }
 
@@ -679,15 +679,31 @@ async fn orphan_watchdog(state: SharedState, parent_pid: u32) {
     }
 }
 
-pub(crate) fn dependencies_met(
+/// Bucket the live process map by `base_name` so dependency resolution can
+/// look up all replicas of a service in O(1) instead of rescanning the map
+/// per dependency edge. The returned map borrows from `processes`, so it
+/// lives only as long as the caller holds the daemon-state guard.
+pub(crate) fn index_processes_by_base(
+    processes: &BTreeMap<String, ProcessRuntime>,
+) -> BTreeMap<&str, Vec<&ProcessRuntime>> {
+    let mut by_base: BTreeMap<&str, Vec<&ProcessRuntime>> = BTreeMap::new();
+    for runtime in processes.values() {
+        by_base
+            .entry(runtime.spec.base_name.as_str())
+            .or_default()
+            .push(runtime);
+    }
+    by_base
+}
+
+pub(crate) fn dependencies_met_with_index(
     candidate: &ProcessRuntime,
-    snapshot: &BTreeMap<String, ProcessRuntime>,
+    by_base: &BTreeMap<&str, Vec<&ProcessRuntime>>,
 ) -> bool {
     for (dep_base, cond) in &candidate.spec.depends_on {
-        let dep_instances: Vec<&ProcessRuntime> = snapshot
-            .values()
-            .filter(|p| p.spec.base_name == *dep_base)
-            .collect();
+        let Some(dep_instances) = by_base.get(dep_base.as_str()) else {
+            return false;
+        };
         if dep_instances.is_empty() {
             return false;
         }
@@ -719,6 +735,15 @@ pub(crate) fn dependencies_met(
     }
 
     true
+}
+
+#[cfg(test)]
+pub(crate) fn dependencies_met(
+    candidate: &ProcessRuntime,
+    snapshot: &BTreeMap<String, ProcessRuntime>,
+) -> bool {
+    let by_base = index_processes_by_base(snapshot);
+    dependencies_met_with_index(candidate, &by_base)
 }
 
 async fn start_process(name: String, state: SharedState) {
