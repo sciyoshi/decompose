@@ -85,20 +85,36 @@ pub struct ProcessInstanceSpec {
     pub config_hash: String,
 }
 
+/// User-facing definition of a readiness or liveness probe. Exactly one of
+/// `exec` and `http_get` must be set (validated when the config is loaded).
+/// Threshold semantics mirror Kubernetes: a probe must succeed
+/// `success_threshold` consecutive times to flip the flag on, and fail
+/// `failure_threshold` consecutive times to flip it off.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HealthProbe {
+    /// Run a shell command; exit code 0 = success, non-zero = failure. Most
+    /// useful for probes that need access to the service's environment.
     #[serde(default)]
     pub exec: Option<ExecCheck>,
+    /// Make an HTTP GET request; any 2xx response = success.
     #[serde(default)]
     pub http_get: Option<HttpCheck>,
+    /// Interval between probe attempts, in seconds.
     #[serde(default = "default_period")]
     pub period_seconds: u64,
+    /// Per-attempt timeout, in seconds. Exceeding it counts as a failure.
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+    /// Delay before the first probe runs, giving the process time to come
+    /// up. Counted from `Running` transition, not from probe scheduling.
     #[serde(default = "default_initial_delay")]
     pub initial_delay_seconds: u64,
+    /// Consecutive successes required before the probe flips the
+    /// `ready`/`alive` flag on. Defaults to 1.
     #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
+    /// Consecutive failures required before the probe flips the flag off
+    /// (and, for liveness, triggers a SIGKILL restart). Defaults to 3.
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
 }
@@ -123,18 +139,30 @@ fn default_failure_threshold() -> u32 {
     3
 }
 
+/// `exec` probe: a shell command whose exit code is interpreted as
+/// success (`0`) or failure (non-zero). Runs with the same environment as
+/// the parent service, so tools like `curl localhost:$PORT/health` pick up
+/// the interpolated `PORT`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExecCheck {
+    /// Shell command to execute via `sh -c`. Subject to the same `${VAR}`
+    /// interpolation as the service `command`.
     pub command: String,
 }
 
+/// `http_get` probe: a synchronous HTTP request; any 2xx response counts as
+/// success.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HttpCheck {
+    /// Hostname or IP to connect to. Defaults to `127.0.0.1`.
     #[serde(default = "default_host")]
     pub host: String,
+    /// TCP port. Required.
     pub port: u16,
+    /// `http` or `https`. Defaults to `http`.
     #[serde(default = "default_scheme")]
     pub scheme: String,
+    /// Path component of the URL. Defaults to `/`.
     #[serde(default = "default_path")]
     pub path: String,
 }
@@ -151,24 +179,37 @@ fn default_path() -> String {
     "/".to_string()
 }
 
+/// Lifecycle state of a single process instance, as tracked by the daemon.
+/// Transitions are driven by the supervisor loop and the per-process
+/// `process_lifecycle` task; clients see a serialised projection via
+/// [`ProcessSnapshot`].
 #[derive(Debug, Clone)]
 pub enum ProcessStatus {
     /// Defined in config but not yet selected for launch (e.g. not part of
     /// the initial `up` subset). Will not be started by the supervisor until
     /// explicitly requested via `start` or `up`.
     NotStarted,
+    /// Selected to run but waiting on `depends_on` conditions or for the
+    /// supervisor's next tick to spawn the child.
     Pending,
-    Running {
-        pid: u32,
-    },
-    Exited {
-        code: i32,
-    },
-    FailedToStart {
-        reason: String,
-    },
+    /// Live child process; `pid` is the OS PID of the immediate child (the
+    /// shell, since commands are executed via `sh -c`).
+    Running { pid: u32 },
+    /// Child exited on its own. `code` is the OS exit code (`-N` for
+    /// signal-terminated processes follows the standard mapping).
+    Exited { code: i32 },
+    /// Spawn or pre-spawn failed (bad command, missing working dir, etc.).
+    /// `reason` is the contextualised error from the spawn attempt.
+    FailedToStart { reason: String },
+    /// Stopped by an explicit client request (`stop`, `down`, scale-down,
+    /// reload removal). Distinct from `Exited` so reload diffing can tell
+    /// the two apart.
     Stopped,
+    /// Transient state between `Exited`/SIGKILL-after-liveness-failure and
+    /// the next spawn under a `restart_policy` other than `no`.
     Restarting,
+    /// Service has `disabled: true` in config; visible in `ps` and
+    /// `config` output but never spawned.
     Disabled,
 }
 
