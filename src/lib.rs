@@ -1,3 +1,36 @@
+//! Decompose: a process orchestrator for local development with
+//! Docker-Compose-compatible config and CLI surface.
+//!
+//! The crate is split into a thin client and a long-running daemon. The
+//! `decompose` binary always runs as the client; on `up` it spawns a detached
+//! daemon process per project (identified by a SHA-256 of the config
+//! directory plus file set, or by `--session NAME`) and then talks to it
+//! over a local socket.
+//!
+//! # Module map
+//!
+//! - [`cli`]      — `clap` argument definitions for every subcommand.
+//! - [`config`]   — YAML parsing, merge/overlay, `.env` loading, `${VAR}`
+//!   interpolation, and validation.
+//! - [`daemon`]   — supervisor loop, IPC server, process lifecycle, signal
+//!   handling, reload/diff, health-probe scheduling.
+//! - [`ipc`]      — request/response wire types and a JSON-over-local-socket
+//!   transport used by both halves.
+//! - [`model`]    — runtime types shared by the daemon and its clients
+//!   (`ProcessInstanceSpec`, `ProcessRuntime`, `ProcessSnapshot`,
+//!   `HealthProbe`, …).
+//! - [`output`]   — JSON / table formatting and TTY-aware mode resolution.
+//! - [`paths`]    — XDG path management and instance-ID hashing.
+//! - [`tui`]      — the optional interactive terminal UI built on `ratatui`.
+//! - [`tuning`]   — env-var-overridable timing knobs (supervisor tick, IPC
+//!   timeout, orphan grace period).
+//! - [`completion`] — shell completion script generator.
+//! - [`health_probes`] — exec/HTTP probe execution for readiness and
+//!   liveness checks.
+//!
+//! [`run_cli`] is the single entry point used by `main.rs`. See `CLAUDE.md`
+//! for the full design notes and project conventions.
+
 pub mod cli;
 pub mod completion;
 pub mod config;
@@ -699,12 +732,12 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
         };
         let lines: Vec<&str> = content.lines().collect();
         let filtered = filter_log_lines(&lines, &args.processes);
-        let output = match args.tail {
+        let output: &[&str] = match args.tail {
             Some(n) => {
                 let start = filtered.len().saturating_sub(n);
-                filtered[start..].to_vec()
+                &filtered[start..]
             }
-            None => filtered,
+            None => &filtered[..],
         };
         if output.is_empty() {
             if args.processes.is_empty() {
@@ -716,7 +749,7 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
                 );
             }
         }
-        write_logs_maybe_paged(&output, args.no_pager);
+        write_logs_maybe_paged(output, args.no_pager);
     }
 
     Ok(())
@@ -725,7 +758,7 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
 /// Write filtered, one-shot log output to stdout, optionally paging through
 /// `$PAGER` (or `less -R`) when stdout is a TTY. See [`should_page`] for the
 /// gate.
-fn write_logs_maybe_paged(lines: &[String], no_pager: bool) {
+fn write_logs_maybe_paged(lines: &[&str], no_pager: bool) {
     if should_page(no_pager)
         && let Some(mut child) = spawn_pager()
     {
@@ -994,34 +1027,29 @@ async fn runtime_context(
     Ok((cwd, config_files, paths))
 }
 
-fn filter_log_lines(lines: &[&str], processes: &[String]) -> Vec<String> {
+fn filter_log_lines<'a>(lines: &[&'a str], processes: &[String]) -> Vec<&'a str> {
     if processes.is_empty() {
-        return lines.iter().map(|l| l.to_string()).collect();
+        return lines.to_vec();
     }
     let strip = processes.len() == 1;
+    let prefixes: Vec<(String, String)> = processes
+        .iter()
+        .map(|p| (format!("[{p}] "), format!("[{p}[")))
+        .collect();
     lines
         .iter()
         .filter_map(|line| {
-            for p in processes {
-                let prefix = format!("[{p}] ");
-                if line.starts_with(&prefix) {
-                    return Some(if strip {
-                        line[prefix.len()..].to_string()
-                    } else {
-                        line.to_string()
-                    });
+            for (plain, replica) in &prefixes {
+                if let Some(rest) = line.strip_prefix(plain.as_str()) {
+                    return Some(if strip { rest } else { *line });
                 }
-                let prefix2 = format!("[{p}[");
-                if line.starts_with(&prefix2) {
+                if line.starts_with(replica.as_str()) {
                     return Some(if strip {
-                        // For replica-style prefix like [proc[1]] msg, strip it
-                        if let Some(end) = line.find("] ") {
-                            line[end + 2..].to_string()
-                        } else {
-                            line.to_string()
-                        }
+                        // Replica prefix like `[proc[1]] msg`: strip up to and
+                        // including the trailing `] `.
+                        line.find("] ").map_or(*line, |end| &line[end + 2..])
                     } else {
-                        line.to_string()
+                        *line
                     });
                 }
             }
