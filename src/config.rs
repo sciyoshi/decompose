@@ -920,7 +920,7 @@ pub fn compute_config_hash(cfg: &ProcessConfig, resolved_env: &BTreeMap<String, 
     let bytes = serde_json::to_vec(&view).expect("ProcessConfigHashView is serializable");
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    format!("{:x}", hasher.finalize())
+    crate::paths::hex_encode(&hasher.finalize())
 }
 
 /// Build the fully-resolved environment that will be passed to the child at

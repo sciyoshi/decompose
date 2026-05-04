@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -7,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
+
+/// Lowercase hex-encode a byte slice. Used for sha256 digests where the
+/// `digest`/`sha2` 0.11 output type (`hybrid_array::Array`) no longer
+/// implements `LowerHex` directly.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 use crate::model::RuntimePaths;
 
@@ -93,7 +105,7 @@ pub fn build_instance_id(
     }
 
     let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = hex_encode(&digest);
     hex.chars().take(16).collect()
 }
 
