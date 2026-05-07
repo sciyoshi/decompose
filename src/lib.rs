@@ -64,7 +64,7 @@ use crate::config::{
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{
-    FooterInfo, OutputMode, print_footer, print_json, style_for_status, styled, unified_state,
+    OutputMode, UpResult, UpStatusInfo, print_json, print_up_status, styled, unified_state,
     use_color,
 };
 use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
@@ -302,7 +302,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         paths,
     } = resolve_up_context(&global)?;
 
-    let (pid, state, got_ctrl_c) = ensure_daemon_running(
+    let (pid, state, got_ctrl_c, reload_summary) = ensure_daemon_running(
         &global,
         &args,
         &cwd,
@@ -322,7 +322,15 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     // Request::RemoveOrphans variant is still used by other code paths.
 
     emit_up_status(output_mode, state, pid);
-    maybe_print_footer(output_mode, &paths, &global, attached).await;
+    maybe_print_up_block(
+        output_mode,
+        &paths,
+        &global,
+        attached,
+        state,
+        reload_summary,
+    )
+    .await;
 
     if !attached {
         if args.wait {
@@ -365,8 +373,9 @@ fn resolve_up_context(global: &GlobalConfig) -> Result<UpContext> {
 
 /// Ensure a daemon is running for this project: either reload/start against
 /// an existing daemon, or spawn a fresh one. Returns the daemon PID, the
-/// textual state ("started" or "already_running"), and a flag indicating
-/// whether the user hit Ctrl-C while we were waiting for the new daemon.
+/// textual state ("started" or "already_running"), a flag indicating
+/// whether the user hit Ctrl-C while we were waiting for the new daemon,
+/// and (for the already-running branch) the parsed reload summary.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_daemon_running(
     global: &GlobalConfig,
@@ -378,10 +387,10 @@ async fn ensure_daemon_running(
     output_mode: OutputMode,
     ctrl_c_task: Option<&tokio::task::JoinHandle<()>>,
     attached: bool,
-) -> Result<(u32, &'static str, bool)> {
+) -> Result<(u32, &'static str, bool, Option<ReloadSummary>)> {
     if let Ok(Response::Pong { pid, .. }) = send_request(paths, Request::Ping).await {
-        reload_and_start_existing_daemon(args, paths, output_mode).await?;
-        Ok((pid, "already_running", false))
+        let summary = reload_and_start_existing_daemon(args, paths, output_mode).await?;
+        Ok((pid, "already_running", false, summary))
     } else {
         // Clean up stale socket/pid from a previously killed daemon so the
         // new daemon can bind the socket without interference.
@@ -408,18 +417,92 @@ async fn ensure_daemon_running(
             parent_pid,
         )?;
         let (pid, got_ctrl_c) = wait_for_daemon_ready(paths, ctrl_c_task).await?;
-        Ok((pid, "started", got_ctrl_c))
+        Ok((pid, "started", got_ctrl_c, None))
     }
+}
+
+/// Parsed counts from the daemon's reload Ack message. Used to render the
+/// human-readable summary on the `up` status line, and to distinguish a
+/// no-op reload from one that applied changes.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReloadSummary {
+    added: u32,
+    changed: u32,
+    scaled: u32,
+    removed: u32,
+    renamed: u32,
+}
+
+impl ReloadSummary {
+    fn is_noop(&self) -> bool {
+        self.added == 0
+            && self.changed == 0
+            && self.scaled == 0
+            && self.removed == 0
+            && self.renamed == 0
+    }
+
+    /// Render as `"+2 added, 1 changed"`, skipping zero fields. Returns an
+    /// empty string for a no-op summary; callers should branch on `is_noop`.
+    fn human(&self) -> String {
+        let mut parts = Vec::with_capacity(5);
+        if self.added > 0 {
+            parts.push(format!("+{} added", self.added));
+        }
+        if self.changed > 0 {
+            parts.push(format!("{} changed", self.changed));
+        }
+        if self.scaled > 0 {
+            parts.push(format!("{} scaled", self.scaled));
+        }
+        if self.removed > 0 {
+            parts.push(format!("{} removed", self.removed));
+        }
+        if self.renamed > 0 {
+            parts.push(format!("{} renamed", self.renamed));
+        }
+        parts.join(", ")
+    }
+}
+
+/// Parse the daemon's `reloaded: ...` Ack message into a [`ReloadSummary`].
+/// Returns `None` if the message doesn't match the expected shape; callers
+/// fall back to printing the raw text in that case.
+fn parse_reload_message(msg: &str) -> Option<ReloadSummary> {
+    // Format: "reloaded: +N added, N changed, N scaled (DELTA replicas),
+    //          N orphan|removed[, N renamed]"
+    let rest = msg.strip_prefix("reloaded: ")?;
+    let mut summary = ReloadSummary::default();
+    for part in rest.split(", ") {
+        let part = part.trim();
+        if let Some(n) = part.strip_suffix(" added") {
+            summary.added = n.trim_start_matches('+').parse().ok()?;
+        } else if let Some(n) = part.strip_suffix(" changed") {
+            summary.changed = n.parse().ok()?;
+        } else if let Some((n, _delta)) = part.split_once(" scaled (") {
+            summary.scaled = n.parse().ok()?;
+        } else if let Some(n) = part
+            .strip_suffix(" orphan")
+            .or_else(|| part.strip_suffix(" removed"))
+        {
+            summary.removed = n.parse().ok()?;
+        } else if let Some(n) = part.strip_suffix(" renamed") {
+            summary.renamed = n.parse().ok()?;
+        }
+    }
+    Some(summary)
 }
 
 /// Reload and (optionally) start services against an already-running daemon.
 /// On parse/validation failure the reload request errors out before the
-/// start call, so users see config errors directly.
+/// start call, so users see config errors directly. Returns the parsed
+/// reload counts so the caller can render the status block; in JSON mode
+/// the raw Ack message is also emitted inline for backward compatibility.
 async fn reload_and_start_existing_daemon(
     args: &UpArgs,
     paths: &crate::model::RuntimePaths,
     output_mode: OutputMode,
-) -> Result<()> {
+) -> Result<Option<ReloadSummary>> {
     let reload_resp = send_request(
         paths,
         Request::Reload {
@@ -432,7 +515,14 @@ async fn reload_and_start_existing_daemon(
     .await
     .map_err(|e| anyhow::anyhow!("failed to reload daemon config: {e}"))?;
     let reload_message = expect_ack(reload_resp)?;
-    emit_message(output_mode, "ok", &reload_message);
+    let summary = parse_reload_message(&reload_message);
+    if output_mode == OutputMode::Json {
+        emit_message(output_mode, "ok", &reload_message);
+    } else if summary.is_none() {
+        // Unrecognised Ack shape — fall back to printing it verbatim so the
+        // user isn't left wondering what happened.
+        println!("{reload_message}");
+    }
 
     // Start is idempotent on already-running processes and picks up any
     // newly-added ones that reload inserted as Pending. Skipped under
@@ -448,7 +538,7 @@ async fn reload_and_start_existing_daemon(
         .map_err(|e| anyhow::anyhow!("failed to start services on running daemon: {e}"))?;
         let _ = expect_ack(start_resp)?;
     }
-    Ok(())
+    Ok(summary)
 }
 
 /// Validate the merged config and the requested service names before
@@ -499,13 +589,17 @@ async fn wait_for_daemon_ready(
     );
 }
 
-/// Print the table-mode footer describing service/process counts, session,
-/// and socket. Silently no-ops in JSON mode or if the daemon doesn't reply.
-async fn maybe_print_footer(
+/// Print the table-mode `up` status block: glyph + service count headline,
+/// followed by a dim hint line. Silently no-ops in JSON mode or if the
+/// daemon doesn't reply (the JSON `status`/`pid` line emitted earlier is
+/// enough on its own).
+async fn maybe_print_up_block(
     output_mode: OutputMode,
     paths: &crate::model::RuntimePaths,
     global: &GlobalConfig,
     attached: bool,
+    state: &str,
+    reload_summary: Option<ReloadSummary>,
 ) {
     if output_mode != OutputMode::Table {
         return;
@@ -520,13 +614,19 @@ async fn maybe_print_footer(
         }
         bases.len()
     };
-    let process_count = processes.len();
-    print_footer(&FooterInfo {
+    let result = match (state, reload_summary) {
+        ("already_running", Some(s)) if s.is_noop() => UpResult::NoChange,
+        ("already_running", Some(s)) => UpResult::Reloaded(s.human()),
+        // Unparseable Ack on the already-running branch: we already printed
+        // the raw message, so don't try to summarise — treat as no-change.
+        ("already_running", None) => UpResult::NoChange,
+        _ => UpResult::Fresh,
+    };
+    print_up_status(&UpStatusInfo {
         service_count,
-        process_count,
         session_name: global.session.as_deref(),
-        socket_path: &paths.socket,
         attached,
+        result,
     });
 }
 
@@ -1060,16 +1160,10 @@ fn filter_log_lines<'a>(lines: &[&'a str], processes: &[String]) -> Vec<&'a str>
 
 fn emit_up_status(mode: OutputMode, status: &str, pid: u32) {
     match mode {
-        OutputMode::Table => {
-            let color = use_color();
-            let green = style_for_status("running", color);
-            let (glyph, human) = match status {
-                "started" => ("\u{2713}", "decompose started"),
-                "already_running" => ("\u{2713}", "decompose already running"),
-                _ => ("*", "decompose"),
-            };
-            println!("{} {human} \u{00b7} pid {pid}", styled(glyph, green),);
-        }
+        // Table mode now renders the `up` outcome via `print_up_status`,
+        // which folds status, count, session, and the next-step hint into a
+        // single two-line block. This function only emits the JSON record.
+        OutputMode::Table => {}
         OutputMode::Json => print_json(&json!({
             "status": status,
             "pid": pid

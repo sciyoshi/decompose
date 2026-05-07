@@ -161,62 +161,78 @@ pub fn styled(text: &str, style: Style) -> Styled<'_> {
     Styled { style, text }
 }
 
-/// Info about the footer to print after `up` completes.
-pub struct FooterInfo<'a> {
+/// Outcome of an `up` invocation, used to render the headline and hint line.
+pub enum UpResult {
+    /// Fresh daemon was just spawned.
+    Fresh,
+    /// Daemon was already running and reload found no changes.
+    NoChange,
+    /// Daemon was already running and reload applied changes. The string is a
+    /// pre-rendered, human-readable summary like `"+2 added, 1 changed"`.
+    Reloaded(String),
+}
+
+/// Info about the post-`up` status block.
+pub struct UpStatusInfo<'a> {
     pub service_count: usize,
-    pub process_count: usize,
     pub session_name: Option<&'a str>,
-    pub socket_path: &'a std::path::Path,
     pub attached: bool,
+    pub result: UpResult,
 }
 
-/// Print the footer block after `up`.
-pub fn print_footer(info: &FooterInfo<'_>) {
+/// Print the two-line status block after `up`. Renders a colored glyph + count
+/// headline and a dim hint line pointing at the next likely command.
+pub fn print_up_status(info: &UpStatusInfo<'_>) {
     let color = use_color();
+    let dim = maybe(DIM, color);
 
-    // Line 1: "N services · M processes · session NAME          ctrl-c detaches"
-    let mut left = format!(
-        "{} {} · {} {}",
-        info.service_count,
-        if info.service_count == 1 {
-            "service"
-        } else {
-            "services"
-        },
-        info.process_count,
-        if info.process_count == 1 {
-            "process"
-        } else {
-            "processes"
-        },
-    );
-    if let Some(name) = info.session_name {
-        left.push_str(&format!(" · session {name}"));
-    }
+    let (glyph, glyph_style) = match info.result {
+        UpResult::Fresh | UpResult::NoChange => ("\u{2713}", maybe(GREEN, color)), // ✓
+        UpResult::Reloaded(_) => ("\u{21bb}", maybe(YELLOW, color)),               // ↻
+    };
 
-    if info.attached {
-        let hint = "ctrl-c detaches";
-        let dim_style = maybe(DIM, color);
-        println!("{left}    {}", styled(hint, dim_style),);
+    let count_label = if info.service_count == 1 {
+        "service"
     } else {
-        println!("{left}");
-    }
+        "services"
+    };
 
-    // Line 2: "daemon supervising · socket PATH"
-    let socket_display = shorten_socket_path(info.socket_path);
-    println!("daemon supervising · socket {socket_display}");
-}
-
-/// Replace the `$XDG_RUNTIME_DIR` prefix in a socket path with the literal
-/// env-var reference, keeping output portable.
-fn shorten_socket_path(path: &std::path::Path) -> String {
-    if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR") {
-        let xdg_path = std::path::Path::new(&xdg);
-        if let Ok(suffix) = path.strip_prefix(xdg_path) {
-            return format!("$XDG_RUNTIME_DIR/{}", suffix.display());
+    // Build the dim suffix: " · already running", " · +2 added, 1 changed",
+    // optionally followed by " · session NAME".
+    let mut suffix = String::new();
+    match &info.result {
+        UpResult::NoChange => suffix.push_str(" · already running"),
+        UpResult::Reloaded(summary) => {
+            suffix.push_str(" · ");
+            suffix.push_str(summary);
         }
+        UpResult::Fresh => {}
     }
-    path.display().to_string()
+    if let Some(name) = info.session_name {
+        suffix.push_str(&format!(" · session {name}"));
+    }
+
+    println!(
+        "{} {} {}{}",
+        styled(glyph, glyph_style),
+        info.service_count,
+        count_label,
+        styled(&suffix, dim),
+    );
+
+    // Hint line: dim, two-space indent. Attached `up` will start streaming
+    // logs immediately so the only useful hint is the detach key. Detached
+    // `up` points at `ps`, plus `logs -f` when output is likely interesting.
+    let hint = if info.attached {
+        "  ctrl-c detaches".to_string()
+    } else {
+        let mut parts: Vec<&str> = vec!["decompose ps"];
+        if !matches!(info.result, UpResult::NoChange) {
+            parts.push("decompose logs -f");
+        }
+        format!("  {}", parts.join(" · "))
+    };
+    println!("{}", styled(&hint, dim));
 }
 
 #[cfg(test)]
@@ -367,28 +383,5 @@ mod tests {
     fn styled_display_with_width_pads() {
         let s = styled("hi", Style::new());
         assert_eq!(format!("{s:<10}"), "hi        ");
-    }
-
-    #[test]
-    fn shorten_socket_path_substitutes_xdg_prefix() {
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
-        }
-        let path = std::path::Path::new("/run/user/1000/decompose/abc.sock");
-        let result = shorten_socket_path(path);
-        assert_eq!(result, "$XDG_RUNTIME_DIR/decompose/abc.sock");
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-    }
-
-    #[test]
-    fn shorten_socket_path_keeps_absolute_when_no_xdg() {
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        let path = std::path::Path::new("/tmp/decompose/abc.sock");
-        let result = shorten_socket_path(path);
-        assert_eq!(result, "/tmp/decompose/abc.sock");
     }
 }
