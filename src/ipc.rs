@@ -71,6 +71,11 @@ pub enum Response {
     Pong {
         pid: u32,
         instance: String,
+        /// `true` once the daemon has accepted a `Down` request and is
+        /// tearing down its services. Newer daemons set this; older ones
+        /// will omit the field entirely (see the `serde(default)` below).
+        #[serde(default)]
+        shutting_down: bool,
     },
     Ps {
         pid: u32,

@@ -1572,6 +1572,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             Response::Pong {
                 pid: std::process::id(),
                 instance: guard.instance.clone(),
+                shutting_down: guard.shutdown_requested,
             }
         }
         Request::Ps => handle_ps(&state).await,

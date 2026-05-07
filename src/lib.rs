@@ -388,7 +388,19 @@ async fn ensure_daemon_running(
     ctrl_c_task: Option<&tokio::task::JoinHandle<()>>,
     attached: bool,
 ) -> Result<(u32, &'static str, bool, Option<ReloadSummary>)> {
-    if let Ok(Response::Pong { pid, .. }) = send_request(paths, Request::Ping).await {
+    if let Ok(Response::Pong {
+        pid, shutting_down, ..
+    }) = send_request(paths, Request::Ping).await
+    {
+        if shutting_down {
+            // Reload/Start would race against the supervisor's tear-down loop:
+            // newly-started services would be immediately stopped again, and
+            // `ps` would show an empty environment. Make the user wait for
+            // the previous environment to finish exiting first.
+            bail!(
+                "decompose is stopping for this project — wait for it to finish, then run `decompose up` again"
+            );
+        }
         let summary = reload_and_start_existing_daemon(args, paths, output_mode).await?;
         Ok((pid, "already_running", false, summary))
     } else {
@@ -1387,12 +1399,22 @@ async fn wait_for_services_ready(
     }
 }
 
+/// Poll the daemon socket until Ping fails, indicating the daemon has
+/// finished shutting down. Bounded so a stuck daemon doesn't wedge `down`
+/// indefinitely — the budget needs to cover the worst-case process
+/// shutdown_timeout (default 10s, then SIGKILL) plus IPC slack so a typical
+/// `down` returns only after the environment is fully torn down. Callers
+/// who want a hard sub-second `down` can rely on the daemon's immediate
+/// Ack and skip this wait.
 async fn wait_for_daemon_stop(paths: &crate::model::RuntimePaths) {
-    for _ in 0..60 {
+    let poll_interval = Duration::from_millis(50);
+    let budget = Duration::from_secs(30);
+    let iterations = (budget.as_millis() / poll_interval.as_millis()) as usize;
+    for _ in 0..iterations {
         if send_request(paths, Request::Ping).await.is_err() {
             break;
         }
-        sleep(Duration::from_millis(25)).await;
+        sleep(poll_interval).await;
     }
 }
 
