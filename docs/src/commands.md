@@ -13,7 +13,7 @@ These appear *before* the subcommand, matching `docker compose -f FILE <cmd>`.
 | `-f`, `--file FILE` | Config file path. Repeatable; later files overlay earlier ones. |
 | `--session NAME` | Override the project/session name (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
 | `-e`, `--env-file FILE` | Extra `.env` file(s) to load on top of the auto-discovered `.env`. |
-| `--disable-dotenv` | Don't auto-load `.env` from the config directory. |
+| `--disable-dotenv` | Don't auto-load `.env` from the current working directory. |
 | `--json` / `--table` | Force output format. Without either flag, JSON is used in non-TTY/CI/LLM contexts and a table is used at an interactive terminal. |
 
 ## Process lifecycle
@@ -25,7 +25,7 @@ Start services and (by default) attach to streaming logs until Ctrl-C.
 | Flag | Description |
 |------|-------------|
 | `-d`, `--detach` | Start the daemon and return immediately. |
-| `--wait` | With `-d`, wait until every selected service is started/healthy before returning. |
+| `--wait` | With `-d`, wait until every selected service is started/healthy before returning. Ignored in attached mode. |
 | `--no-deps` | Don't auto-start dependencies of the named services. |
 | `--remove-orphans` | Stop and drop services that exist in the daemon but not in the current config. |
 | `--force-recreate` | Recreate every service regardless of whether its config hash changed. Conflicts with `--no-recreate`. |
@@ -101,13 +101,12 @@ Ctrl-C) to leave. See [Configuration](configuration.md) for keybindings.
 
 ### `decompose config`
 
-Validate and print the fully-resolved configuration (after merge,
-interpolation, and overlay) without starting anything.
+Validate and print the merged configuration without starting anything.
 
 ### `decompose ls`
 
-List every running decompose environment on the machine — instance ID,
-session name, daemon pid, and config directory.
+List decompose environments discovered in the runtime socket directory,
+showing each instance ID and whether it responds to IPC.
 
 ## Ad-hoc commands
 

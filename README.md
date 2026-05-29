@@ -18,7 +18,7 @@ Just your real processes, fast, with a familiar compose-like interface.
 cargo install decompose
 ```
 
-Requires Rust 1.85 or later. If you don't have Rust installed, grab it from [rustup.rs](https://rustup.rs/).
+Requires Rust 1.88 or later. If you don't have Rust installed, grab it from [rustup.rs](https://rustup.rs/).
 
 ### Prebuilt binaries
 
@@ -386,9 +386,9 @@ processes:
 |---|---|---|---|
 | `command` | string | *required* | Shell command to run. Executed via the system shell. |
 | `description` | string | `null` | Optional human-readable description. |
-| `working_dir` | string | config file directory | Working directory for the process. Relative paths resolve from the config file location. |
+| `working_dir` | string | current working directory | Working directory for the process. Relative paths resolve from the directory where `decompose` is run. |
 | `environment` | map or list | `{}` | Per-process environment variables. Same format as the global `environment` (map or list of `KEY=VALUE`). Merged on top of global vars. |
-| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Paths are relative to the config file directory. |
+| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Paths are relative to the directory where `decompose` is run. |
 | `disabled` | bool | `false` | When `true`, the process is visible in `ps` output but not auto-started by `up`. Can be started explicitly with `start`. |
 | `replicas` | integer | `1` | Number of instances to run. When greater than 1, instances are named `service[1]`, `service[2]`, etc. Must be at least 1. |
 | `ready_log_line` | string (regex) | `null` | A regex pattern matched against process stdout/stderr. When a line matches, the process is marked as "log ready". Required if any other process depends on this one with `process_log_ready` condition. |
@@ -519,7 +519,7 @@ processes:
 Environment variables are merged in this order. Later sources override
 earlier ones:
 
-1. `.env` file in the config directory (auto-loaded unless `--disable-dotenv`)
+1. `.env` file in the current working directory (auto-loaded unless `--disable-dotenv`)
 2. Explicit env files via `-e` CLI flag
 3. Global `environment` block in the YAML
 4. Per-process `env_file` entries
@@ -573,7 +573,7 @@ These fields work the same way (or very similarly) in both tools:
 | `command` | `command` | Runs as a native shell command instead of inside a container |
 | `environment` | `environment` | Map or list of `KEY=VALUE` entries |
 | `env_file` | `env_file` | Additional `.env` files to load |
-| `working_dir` | `working_dir` | Defaults to the config file directory |
+| `working_dir` | `working_dir` | Defaults to the directory where `decompose` is run |
 | `depends_on` | `depends_on` | Supports conditions: `process_started`, `process_completed`, `process_completed_successfully`, `process_healthy`, `process_log_ready` |
 | `healthcheck` | `readiness_probe` / `liveness_probe` | Similar concept, slightly different schema (see below) |
 | `restart` | `restart_policy` | Supports `no`, `on_failure`, `always` |
