@@ -67,11 +67,7 @@ fn to_clap_shell(shell: CompletionShell) -> Shell {
 /// - completes `--session`/`--project-name` values from `decompose ls --json`,
 /// - otherwise falls through to the clap-generated `_decompose` function.
 fn inject_bash_dynamic(script: &str) -> String {
-    let svc_list = SERVICE_CMDS
-        .iter()
-        .map(|s| format!("\"{s}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let svc_list = SERVICE_CMDS.join(" ");
     let snippet = BASH_DYNAMIC_SNIPPET.replace("__SVC_LIST__", &svc_list);
     format!("{script}{snippet}")
 }
@@ -219,7 +215,7 @@ __decompose_wrap() {
 
     __decompose_collect_globals
     case " __SVC_LIST__ " in
-        *" \"${__DECOMPOSE_SUBCMD}\" "*)
+        *" ${__DECOMPOSE_SUBCMD} "*)
             if [[ "${cur}" != -* ]]; then
                 __decompose_services
                 return 0

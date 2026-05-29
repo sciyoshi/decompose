@@ -5974,6 +5974,79 @@ fn completion_subcommand_emits_shell_scripts() {
 }
 
 #[test]
+fn bash_completion_completes_services_for_up_detach() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  api:
+    command: "sleep 30"
+  web:
+    command: "sleep 30"
+"#,
+    );
+
+    let completion = env.run(&["completion", "bash"]);
+    assert_success(&completion, "completion bash");
+
+    let script_path = env.project.join("decompose.bash");
+    fs::write(&script_path, completion.stdout).expect("write completion script");
+
+    let bin_dir = Path::new(bin_path()).parent().expect("binary parent");
+    let path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut paths = vec![bin_dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&existing));
+            std::env::join_paths(paths).expect("join PATH")
+        }
+        None => bin_dir.as_os_str().to_os_string(),
+    };
+    let script = format!(
+        r#"
+complete() {{ :; }}
+compgen() {{
+    local words="" prefix=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -W) words="$2"; shift 2;;
+            --) prefix="$2"; shift 2;;
+            *) shift;;
+        esac
+    done
+    for w in $words; do
+        [[ $w == "$prefix"* ]] && printf '%s\n' "$w"
+    done
+}}
+source {:?}
+COMP_WORDS=(decompose up -d "")
+COMP_CWORD=3
+__decompose_wrap
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+        script_path
+    );
+
+    let out = Command::new("bash")
+        .arg("-lc")
+        .arg(script)
+        .current_dir(&env.project)
+        .env("PATH", path)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("HOME", &env.home)
+        .output()
+        .expect("run bash completion");
+    assert_success(&out, "bash completion for up -d");
+
+    let completed = String::from_utf8(out.stdout).expect("completion stdout utf8");
+    let services: Vec<&str> = completed.lines().collect();
+    assert!(
+        services.contains(&"api") && services.contains(&"web"),
+        "expected api and web service completions, got: {services:?}"
+    );
+}
+
+#[test]
 fn completion_rejects_unknown_shell() {
     let tmp = tempdir().expect("tempdir");
     let project = tmp.path().join("project");

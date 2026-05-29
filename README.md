@@ -83,6 +83,12 @@ forward `--file`, `-e`/`--env-file`, `--session`/`--project-name`, and
 multi-project and multi-session setups. `jq` is optional but recommended;
 without it, a `sed` fallback parses the JSON.
 
+The Nix flake installs bash, zsh, and fish completion files into the package
+output automatically. `cargo install decompose` installs the same completion
+generator as part of the `decompose` binary; Cargo does not support installing
+shell completion files or editing shell startup files during `cargo install`,
+so Cargo users should source or write the generated script as shown below.
+
 **bash** — add to your `~/.bashrc`:
 
 ```bash
