@@ -23,8 +23,36 @@
           pname = cargoToml.package.name;
           version = cargoToml.package.version;
           src = ./.;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
+          cargoDeps = pkgs.stdenvNoCC.mkDerivation {
+            name = "${cargoToml.package.name}-${cargoToml.package.version}-vendor";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.cargo pkgs.cacert ];
+            outputHash = "sha256-e+cuFjGL7mKQ/4d3ifmNgOdOQFo5Tm3OAEv2DantMK8=";
+            outputHashAlgo = "sha256";
+            outputHashMode = "recursive";
+            dontConfigure = true;
+            dontFixup = true;
+            buildPhase = ''
+              runHook preBuild
+              export CARGO_HOME="$TMPDIR/cargo-home"
+              export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              cargo vendor --locked --versioned-dirs vendor >/dev/null
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/.cargo"
+              cp -R vendor/. "$out/"
+              cp Cargo.lock "$out/Cargo.lock"
+              cat > "$out/.cargo/config.toml" <<'EOF'
+              [source.crates-io]
+              replace-with = "vendored-sources"
+
+              [source.vendored-sources]
+              directory = "@vendor@"
+              EOF
+              runHook postInstall
+            '';
           };
           nativeBuildInputs = [ pkgs.pkg-config pkgs.installShellFiles ];
           nativeCheckInputs = [ pkgs.python3 ];
