@@ -126,9 +126,9 @@ processes:
 |---|---|---|---|
 | `command` | string | **required** | Shell command to run. Executed via the system shell (`sh -c`). Must not be empty. |
 | `description` | string | `null` | Optional human-readable description shown in `ps` output. |
-| `working_dir` | string | current working directory | Working directory for the process. Relative paths resolve from the directory where `decompose` is run. |
+| `working_dir` | string | config file directory | Working directory for the process. Relative paths resolve from the config file location. |
 | `environment` | map or list | `{}` | Per-process environment variables. Same format as the global `environment` field. Merged on top of global vars. |
-| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Paths are relative to the directory where `decompose` is run. |
+| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Paths are relative to the config file directory. |
 | `disabled` | bool | `false` | When `true`, the process is visible in `ps` output but not auto-started by `up`. Can be started explicitly with `decompose start`. |
 | `replicas` | integer | `1` | Number of instances to run. When greater than 1, instances are named `service[1]`, `service[2]`, etc. Must be at least 1. |
 | `ready_log_line` | string (regex) | `null` | A regex pattern matched against process stdout/stderr. When a line matches, the process is marked as "log ready". Required if another process depends on this one with the `process_log_ready` condition. |
@@ -314,7 +314,7 @@ override earlier ones:
 
 | Priority | Source | Notes |
 |---|---|---|
-| 1 (lowest) | `.env` file | Auto-loaded from the current working directory unless `--disable-dotenv` is passed. |
+| 1 (lowest) | `.env` file | Auto-loaded from the config directory unless `--disable-dotenv` is passed. |
 | 2 | `-e` CLI flag | Explicit env files passed on the command line. |
 | 3 | Global `environment` block | Top-level `environment` in the YAML config. |
 | 4 | Per-process `env_file` entries | Files listed in each process's `env_file` array. |

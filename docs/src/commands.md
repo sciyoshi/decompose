@@ -13,7 +13,7 @@ These appear *before* the subcommand, matching `docker compose -f FILE <cmd>`.
 | `-f`, `--file FILE` | Config file path. Repeatable; later files overlay earlier ones. |
 | `--session NAME` | Override the project/session name (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
 | `-e`, `--env-file FILE` | Extra `.env` file(s) to load on top of the auto-discovered `.env`. |
-| `--disable-dotenv` | Don't auto-load `.env` from the current working directory. |
+| `--disable-dotenv` | Don't auto-load `.env` from the config directory. |
 | `--json` / `--table` | Force output format. Without either flag, JSON is used in non-TTY/CI/LLM contexts and a table is used at an interactive terminal. |
 
 ## Process lifecycle

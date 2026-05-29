@@ -116,10 +116,11 @@ fn resolve_service_context(
 ) -> Result<(PathBuf, std::collections::BTreeMap<String, String>)> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config_files = resolve_config_paths(&global.config_files, &cwd)?;
-    let dotenv = load_dotenv_files(&cwd, &global.env_files, global.disable_dotenv)?;
+    let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
+    let dotenv = load_dotenv_files(&config_dir, &global.env_files, global.disable_dotenv)?;
     let mut cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
     apply_interpolation(&mut cfg);
-    crate::config::validate_project_paths(&cfg, &cwd)?;
+    crate::config::validate_project_paths(&cfg, &config_dir)?;
     if !cfg.processes.contains_key(service) {
         let known: Vec<&str> = cfg.processes.keys().map(|k| k.as_str()).collect();
         bail!(
@@ -127,7 +128,7 @@ fn resolve_service_context(
             known.join(", ")
         );
     }
-    let instances = build_process_instances(&cfg, &cwd, &dotenv);
+    let instances = build_process_instances(&cfg, &config_dir, &dotenv);
     // Pick the first replica (or the bare service name when replicas == 1).
     let (_, runtime) = instances
         .iter()
@@ -364,7 +365,7 @@ fn resolve_up_context(global: &GlobalConfig) -> Result<UpContext> {
     let instance = build_instance_id(global.session.as_deref(), &config_dir, &config_files);
     let paths = runtime_paths_for(&instance)?;
     Ok(UpContext {
-        cwd,
+        cwd: config_dir,
         config_files,
         instance,
         paths,

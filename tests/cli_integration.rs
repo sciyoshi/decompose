@@ -489,6 +489,91 @@ processes:
 }
 
 #[test]
+fn explicit_config_paths_resolve_service_paths_from_config_dir() {
+    let root = tempdir().expect("tempdir");
+    let project = root.path().join("project");
+    let caller = root.path().join("caller");
+    let app = project.join("app");
+    let runtime = root.path().join("runtime");
+    let state = root.path().join("state");
+    let home = root.path().join("home");
+    fs::create_dir_all(&app).expect("create app");
+    fs::create_dir_all(&caller).expect("create caller");
+    fs::create_dir_all(&runtime).expect("create runtime");
+    fs::create_dir_all(&state).expect("create state");
+    fs::create_dir_all(&home).expect("create home");
+
+    fs::write(project.join(".env"), "BASE=from_dotenv\n").expect("write dotenv");
+    fs::write(project.join("service.env"), "EXTRA=from_env_file\n").expect("write env file");
+    fs::write(
+        project.join("decompose.yaml"),
+        r#"
+processes:
+  writer:
+    command: "sh -c 'printf \"$$PWD|$$BASE|$$EXTRA\" > up.txt; sleep 30'"
+    working_dir: app
+    env_file:
+      - service.env
+"#,
+    )
+    .expect("write config");
+
+    let cfg = "../project/decompose.yaml";
+    let run = run_cmd(
+        &caller,
+        &runtime,
+        &state,
+        &home,
+        &[
+            "--file",
+            cfg,
+            "run",
+            "writer",
+            "sh",
+            "-c",
+            "printf \"$PWD|$BASE|$EXTRA\" > run.txt",
+        ],
+        &[],
+        &[],
+    );
+    assert_success(&run, "run from outside config dir");
+
+    let canonical_app = app.canonicalize().expect("canonical app path");
+    let expected = format!("{}|from_dotenv|from_env_file", canonical_app.display());
+    let run_out = fs::read_to_string(app.join("run.txt")).expect("read run output");
+    assert_eq!(run_out, expected);
+
+    let up = run_cmd(
+        &caller,
+        &runtime,
+        &state,
+        &home,
+        &["--file", cfg, "up", "--detach", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&up, "up from outside config dir");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !app.join("up.txt").exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let up_out = fs::read_to_string(app.join("up.txt")).expect("read up output");
+    assert_eq!(up_out, expected);
+
+    let down = run_cmd(
+        &caller,
+        &runtime,
+        &state,
+        &home,
+        &["--file", cfg, "down", "--json"],
+        &[],
+        &[],
+    );
+    assert_success(&down, "down from outside config dir");
+}
+
+#[test]
 fn config_errors_on_invalid_yaml() {
     let root = tempdir().expect("tempdir");
     let project = root.path().join("project");
