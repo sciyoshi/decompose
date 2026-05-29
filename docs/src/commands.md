@@ -25,7 +25,7 @@ Start services and (by default) attach to streaming logs until Ctrl-C.
 | Flag | Description |
 |------|-------------|
 | `-d`, `--detach` | Start the daemon and return immediately. |
-| `--wait` | With `-d`, wait until every selected service is started/healthy before returning. Ignored in attached mode. |
+| `--wait` | With `-d`, wait until every selected service is started/healthy before returning. Requires `-d`/`--detach`. |
 | `--no-deps` | Don't auto-start dependencies of the named services. |
 | `--remove-orphans` | Stop and drop services that exist in the daemon but not in the current config. |
 | `--force-recreate` | Recreate every service regardless of whether its config hash changed. Conflicts with `--no-recreate`. |

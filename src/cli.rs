@@ -160,7 +160,7 @@ pub struct UpArgs {
     #[arg(short = 'd', long = "detach")]
     pub detach: bool,
     /// Wait until all services are healthy/started before returning (requires -d).
-    #[arg(long = "wait")]
+    #[arg(long = "wait", requires = "detach")]
     pub wait: bool,
     /// Do not start dependency processes automatically.
     #[arg(long = "no-deps")]

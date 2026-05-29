@@ -1332,6 +1332,20 @@ processes:
 }
 
 #[test]
+fn up_wait_requires_detach() {
+    let env = TestEnv::new();
+
+    let up = env.run(&["up", "--wait", "--json"]);
+    assert!(!up.status.success(), "up --wait without -d should fail");
+
+    let stderr = String::from_utf8_lossy(&up.stderr);
+    assert!(
+        stderr.contains("--detach") || stderr.contains("-d"),
+        "stderr should mention detach requirement, got: {stderr}"
+    );
+}
+
+#[test]
 fn shutdown_normal_sigterm_clean_exit() {
     let mut env = TestEnv::new();
     env.with_config(
