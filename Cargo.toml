@@ -19,7 +19,6 @@ exclude = [
     "/.decompose",
     "/examples",
     "CLAUDE.md",
-    "TASKS.md",
 ]
 
 [dependencies]
