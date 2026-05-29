@@ -101,7 +101,8 @@ Ctrl-C) to leave. See [Configuration](configuration.md) for keybindings.
 
 ### `decompose config`
 
-Validate and print the merged configuration without starting anything.
+Validate and print the resolved configuration after merge and interpolation
+without starting anything.
 
 ### `decompose ls`
 

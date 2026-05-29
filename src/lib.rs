@@ -983,8 +983,10 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
 async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config_files = resolve_config_paths(&global.config_files, &cwd)?;
-    let cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
-    crate::config::validate_project_paths(&cfg, &cwd)?;
+    let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
+    let mut cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
+    apply_interpolation(&mut cfg);
+    crate::config::validate_project_paths(&cfg, &config_dir)?;
 
     match output_mode {
         OutputMode::Json => {

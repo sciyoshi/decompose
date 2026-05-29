@@ -450,7 +450,9 @@ fn config_prints_resolved_json() {
         r#"
 processes:
   web:
-    command: "node server.js"
+    command: "node ${ENTRYPOINT}"
+    environment:
+      ENTRYPOINT: server.js
   worker:
     command: "python worker.py"
 "#,
@@ -472,6 +474,13 @@ processes:
     let procs = parsed.get("processes").expect("has processes field");
     assert!(procs.get("web").is_some(), "contains web process");
     assert!(procs.get("worker").is_some(), "contains worker process");
+    assert_eq!(
+        procs
+            .get("web")
+            .and_then(|p| p.get("command"))
+            .and_then(Value::as_str),
+        Some("node server.js")
+    );
 
     let out_yaml = run_cmd(
         &project,
@@ -486,6 +495,10 @@ processes:
     let yaml_text = String::from_utf8_lossy(&out_yaml.stdout);
     assert!(yaml_text.contains("web"), "yaml contains web");
     assert!(yaml_text.contains("worker"), "yaml contains worker");
+    assert!(
+        yaml_text.contains("node server.js"),
+        "yaml should contain interpolated command, got: {yaml_text}"
+    );
 }
 
 #[test]

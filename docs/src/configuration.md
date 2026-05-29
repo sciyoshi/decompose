@@ -409,5 +409,5 @@ decompose -f base.yml -f dev.yml up -d
 - `process_log_ready` condition on a dependency that has no `ready_log_line`
 - Circular dependencies in the `depends_on` graph
 
-Use `decompose config` to validate and inspect the merged configuration
-without starting any processes.
+Use `decompose config` to validate and inspect the resolved configuration
+after merge and interpolation without starting any processes.
