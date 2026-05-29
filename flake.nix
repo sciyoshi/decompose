@@ -27,7 +27,7 @@
             name = "${cargoToml.package.name}-${cargoToml.package.version}-vendor";
             src = ./.;
             nativeBuildInputs = [ pkgs.cargo pkgs.cacert ];
-            outputHash = "sha256-e+cuFjGL7mKQ/4d3ifmNgOdOQFo5Tm3OAEv2DantMK8=";
+            outputHash = "sha256-6cmz9N9J1itbIrtHF/o8mw25imB2AQoVIgAibgyZ1fo=";
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
             dontConfigure = true;
@@ -56,6 +56,12 @@
           };
           nativeBuildInputs = [ pkgs.pkg-config pkgs.installShellFiles ];
           nativeCheckInputs = [ pkgs.python3 ];
+          checkFlags = [
+            # The full integration suite is run in CI and before releases.
+            # This localhost HTTP-server probe is unreliable in the Nix build
+            # sandbox, while the rest of the package checks remain useful.
+            "--skip=http_get_readiness_probe_flips_healthy_flag"
+          ];
           postInstall = ''
             installShellCompletion --cmd decompose \
               --bash <($out/bin/decompose completion bash) \
