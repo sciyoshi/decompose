@@ -1385,6 +1385,7 @@ async fn wait_for_services_ready(
                     let any_failed = active.iter().any(|p| p.state == "failed");
                     if any_failed {
                         emit_message(output_mode, "error", "services ready (some failed)");
+                        bail!("one or more services failed while waiting for readiness");
                     } else {
                         emit_message(output_mode, "ok", "all services are ready");
                     }

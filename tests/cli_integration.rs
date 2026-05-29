@@ -1308,6 +1308,30 @@ fn up_detach_wait_returns_when_services_running() {
 }
 
 #[test]
+fn up_detach_wait_fails_when_service_fails() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  failer:
+    command: "sh -c 'exit 1'"
+"#,
+    );
+
+    let up = env.run(&["up", "-d", "--wait", "--json"]);
+    env.up_started = true;
+    assert!(!up.status.success(), "up -d --wait should fail");
+
+    let stdout = String::from_utf8_lossy(&up.stdout);
+    assert!(
+        stdout.contains(r#""status":"error""#) && stdout.contains("services ready (some failed)"),
+        "stdout should include JSON error status, got: {stdout}"
+    );
+
+    env.down_json();
+}
+
+#[test]
 fn shutdown_normal_sigterm_clean_exit() {
     let mut env = TestEnv::new();
     env.with_config(
