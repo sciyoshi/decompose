@@ -162,10 +162,28 @@ __decompose_services() {
     if command -v jq >/dev/null 2>&1; then
         svcs=$(printf '%s' "$raw" | jq -r '.processes | keys[]' 2>/dev/null)
     else
-        svcs=$(printf '%s' "$raw" \
-            | sed -n 's/^  *"\([A-Za-z0-9_][A-Za-z0-9_-]*\)": *{.*/\1/p')
+        svcs=$(__decompose_parse_process_keys "$raw")
     fi
     COMPREPLY=( $(compgen -W "${svcs}" -- "${cur}") )
+}
+
+__decompose_parse_process_keys() {
+    local raw="$1"
+    local line in_processes=0
+    while IFS= read -r line; do
+        if (( ! in_processes )); then
+            if [[ "$line" =~ ^[[:space:]]{2}\"processes\"[[:space:]]*:[[:space:]]*\{ ]]; then
+                in_processes=1
+            fi
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]{2}\} ]]; then
+            break
+        fi
+        if [[ "$line" =~ ^[[:space:]]{4}\"([A-Za-z0-9_][A-Za-z0-9_-]*)\"[[:space:]]*:[[:space:]]*\{ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        fi
+    done <<< "$raw"
 }
 
 __decompose_sessions() {

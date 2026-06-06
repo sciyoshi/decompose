@@ -6003,6 +6003,7 @@ processes:
     };
     let script = format!(
         r#"
+PATH={:?}
 complete() {{ :; }}
 compgen() {{
     local words="" prefix=""
@@ -6023,7 +6024,7 @@ COMP_CWORD=3
 __decompose_wrap
 printf '%s\n' "${{COMPREPLY[@]}}"
 "#,
-        script_path
+        bin_dir, script_path
     );
 
     let out = Command::new("bash")
