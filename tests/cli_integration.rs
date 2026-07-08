@@ -1,6 +1,7 @@
 #![cfg(not(windows))]
 
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -72,6 +73,14 @@ fn assert_success(output: &Output, context: &str) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+fn unused_local_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+    listener
+        .local_addr()
+        .expect("ephemeral port local addr")
+        .port()
 }
 
 /// Fluent test fixture that wraps `setup_project` + `run_cmd` with:
@@ -2268,25 +2277,28 @@ processes:
 fn http_get_readiness_probe_flips_healthy_flag() {
     let (_root, project, runtime, state, _config) = setup_project();
     let home = project.parent().expect("parent").join("home");
+    let port = unused_local_port();
 
     // Use a simple HTTP server via Python
     let cfg_path = project.join("decompose.yaml");
     fs::write(
         &cfg_path,
-        r#"
+        format!(
+            r#"
 processes:
   server:
-    command: "python3 -m http.server 18931"
+    command: "python3 -m http.server {port} --bind 127.0.0.1"
     readiness_probe:
       http_get:
         host: "127.0.0.1"
-        port: 18931
+        port: {port}
         path: "/"
       period_seconds: 2
       timeout_seconds: 1
       success_threshold: 1
       failure_threshold: 1
-"#,
+"#
+        ),
     )
     .expect("write config");
     let cfg = cfg_path.to_string_lossy().to_string();
