@@ -1,9 +1,14 @@
 #![cfg(not(windows))]
 
 use std::fs;
+use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -75,12 +80,35 @@ fn assert_success(output: &Output, context: &str) {
     }
 }
 
-fn unused_local_port() -> u16 {
+fn spawn_http_ok_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    listener
+    let port = listener
         .local_addr()
         .expect("ephemeral port local addr")
-        .port()
+        .port();
+    listener
+        .set_nonblocking(true)
+        .expect("set test server nonblocking");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (port, stop, handle)
 }
 
 /// Fluent test fixture that wraps `setup_project` + `run_cmd` with:
@@ -2277,9 +2305,8 @@ processes:
 fn http_get_readiness_probe_flips_healthy_flag() {
     let (_root, project, runtime, state, _config) = setup_project();
     let home = project.parent().expect("parent").join("home");
-    let port = unused_local_port();
+    let (port, stop_server, server_thread) = spawn_http_ok_server();
 
-    // Use a simple HTTP server via Python
     let cfg_path = project.join("decompose.yaml");
     fs::write(
         &cfg_path,
@@ -2287,7 +2314,7 @@ fn http_get_readiness_probe_flips_healthy_flag() {
             r#"
 processes:
   server:
-    command: "python3 -m http.server {port} --bind 127.0.0.1"
+    command: "sleep 30"
     readiness_probe:
       http_get:
         host: "127.0.0.1"
@@ -2360,6 +2387,9 @@ processes:
         &[],
     );
     assert_success(&down, "down");
+
+    stop_server.store(true, Ordering::Relaxed);
+    server_thread.join().expect("test http server thread");
 }
 
 #[test]
