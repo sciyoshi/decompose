@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release, for example v0.2.4
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,14 +18,31 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# The GitHub release itself is created by the `/release` Claude skill via
-# `gh release create`, which also pushes the tag that triggers this workflow.
 # Release notes live on the GitHub release and are the source of truth for
-# the changelog — there is no CHANGELOG.md in this repo.
+# the changelog -- there is no CHANGELOG.md in this repo.
 
 jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" --title "$TAG_NAME"
+          else
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes
+          fi
+
   upload-assets:
     name: Upload ${{ matrix.target }}
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -27,14 +50,16 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-26.04-arm
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest-large
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -46,10 +71,12 @@ jobs:
           bin: decompose
           target: ${{ matrix.target }}
           include: README.md,LICENSE-MIT,LICENSE-APACHE
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-crate:
     name: Publish to crates.io
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
