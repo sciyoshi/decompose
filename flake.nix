@@ -27,7 +27,7 @@
             name = "${cargoToml.package.name}-${cargoToml.package.version}-vendor";
             src = ./.;
             nativeBuildInputs = [ pkgs.cargo pkgs.cacert ];
-            outputHash = "sha256-k2iHqRl9rlaJ/Z0rXjzTk0l1Op2+PN9hsou7cJejb2A=";
+            outputHash = "sha256-FYBCPuXrVCHNaJQYEWoVslANhqeLgjerY0N0ehcK8a4=";
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
             dontConfigure = true;
