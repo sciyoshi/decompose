@@ -128,6 +128,7 @@ struct App {
     log_scrollback: usize,
     status_message: Option<(Instant, String)>,
     should_quit: bool,
+    shutdown_task: Option<tokio::task::JoinHandle<Result<()>>>,
     /// Inner height of the log pane on the last render. Used by the yank
     /// handler to know which slice of the buffer was actually visible.
     /// 0 before the first draw.
@@ -149,6 +150,7 @@ impl App {
             log_scrollback: 0,
             status_message: None,
             should_quit: false,
+            shutdown_task: None,
             log_viewport_height: 0,
             mode: Mode::Normal,
             search: Search::new(),
@@ -349,6 +351,18 @@ async fn run_app(term: &mut Term, paths: RuntimePaths) -> Result<()> {
                 poll_log(&mut app).await;
             }
         }
+        if app
+            .shutdown_task
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            let result = app.shutdown_task.take().expect("finished task").await;
+            match result {
+                Ok(Ok(())) => app.should_quit = true,
+                Ok(Err(e)) => app.set_status(format!("down failed: {e}")),
+                Err(e) => app.set_status(format!("shutdown task failed: {e}")),
+            }
+        }
         term.draw(|f| draw(f, &mut app))?;
     }
     Ok(())
@@ -472,6 +486,18 @@ async fn poll_log(app: &mut App) {
 }
 
 async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if app.shutdown_task.is_some()
+        && (code == KeyCode::Char('Q')
+            || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL)))
+    {
+        match send_request(&app.paths, Request::ForceDown).await {
+            Ok(Response::Ack { .. }) => app.set_status("forcing shutdown…"),
+            Ok(Response::Error { message }) => app.set_status(message),
+            Ok(_) => app.set_status("unexpected shutdown response"),
+            Err(e) => app.set_status(format!("forced shutdown failed: {e}")),
+        }
+        return;
+    }
     if app.mode == Mode::SearchInput {
         handle_search_input(app, code, mods);
         return;
@@ -483,19 +509,15 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         (KeyCode::Char('Q'), _) => {
             // Shift-Q: stop everything and quit, mirroring `decompose down`.
             // Lower-case q detaches without touching services.
-            let result = async {
-                let pid = match send_request(&app.paths, Request::Ping).await? {
+            let paths = app.paths.clone();
+            app.set_status("stopping services… (Ctrl-C or Q to force)");
+            app.shutdown_task = Some(tokio::spawn(async move {
+                let pid = match send_request(&paths, Request::Ping).await? {
                     Response::Pong { pid, .. } => pid,
                     _ => anyhow::bail!("unexpected daemon response"),
                 };
-                crate::stop_environment(&app.paths, pid, None).await
-            }
-            .await;
-            if let Err(e) = result {
-                app.set_status(format!("down failed: {e}"));
-                return;
-            }
-            app.should_quit = true;
+                crate::stop_environment(&paths, pid, None).await
+            }));
         }
         (KeyCode::Tab, _) => {
             app.focus = match app.focus {

@@ -396,3 +396,81 @@ fn interrupting_up_on_existing_environment_only_detaches() {
     assert!(alive(leader));
     assert!(alive(env.daemon.unwrap()));
 }
+
+#[test]
+fn tui_stays_responsive_and_accepts_force_during_shutdown() {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut env = Env::new(&CONFIG.replace(
+        "timeout_seconds: 1",
+        "timeout_seconds: 60\n      command: exec sh hook.sh",
+    ));
+    fs::write(env.path("service.sh"), FORKER).unwrap();
+    fs::write(env.path("hook.sh"), "echo $$ > hook.pid\nexec sleep 120\n").unwrap();
+    env.up();
+    let worker = env.pidfile("worker.pid");
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty receives valid writable fd pointers and a valid size;
+    // optional terminal settings/name pointers are null.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    // SAFETY: successful openpty returned two new, uniquely owned descriptors.
+    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+    // SAFETY: as above; this descriptor is distinct from master_fd.
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    let mut command = env.command(&["tui"]);
+    command
+        .env("TERM", "xterm-256color")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    // SAFETY: only async-signal-safe libc calls run between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1
+                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut tui = command.spawn().unwrap();
+    // Drain screen updates so terminal output never blocks the event loop.
+    let mut reader = master.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+    wait(|| {
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr writes a complete termios on success.
+        unsafe {
+            libc::tcgetattr(slave.as_raw_fd(), settings.as_mut_ptr()) == 0
+                && settings.assume_init().c_lflag & libc::ICANON == 0
+        }
+    });
+    master.write_all(b"Q").unwrap();
+    let hook = env.pidfile("hook.pid");
+    assert!(tui.try_wait().unwrap().is_none());
+    master.write_all(b"\x03").unwrap();
+    wait(|| tui.try_wait().unwrap().is_some());
+    assert!(tui.wait().unwrap().success());
+    assert!(!alive(worker));
+    assert!(!alive(hook));
+}
