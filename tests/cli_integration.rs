@@ -2922,6 +2922,7 @@ processes:
     // restart_count > 0 as evidence the liveness path fired.
     let mut saw_ready_and_not_alive = false;
     let mut saw_restart = false;
+    let mut last_snapshot = Value::Null;
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(500));
         let ps = run_cmd(
@@ -2945,6 +2946,8 @@ processes:
         else {
             continue;
         };
+
+        last_snapshot = svc.clone();
 
         // Additive JSON fields must be present and typed correctly.
         assert!(
@@ -2978,7 +2981,7 @@ processes:
     );
     assert!(
         saw_restart,
-        "liveness probe failure must still trigger a restart after the flag split"
+        "liveness probe failure must still trigger a restart after the flag split: {last_snapshot}"
     );
 
     let down = run_cmd(

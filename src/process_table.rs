@@ -264,8 +264,13 @@ mod tests {
             )
         };
         let result = group_alive(child.id());
+        let signaled = crate::shutdown::signal_group(child.id(), 15);
         child.wait().unwrap();
         assert_eq!(waited, 0);
         assert!(!result.unwrap());
+        assert!(
+            signaled.is_ok(),
+            "signaling a zombie-only group: {signaled:?}"
+        );
     }
 }

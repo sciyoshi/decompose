@@ -51,6 +51,11 @@ pub(crate) fn signal_group(pgid: u32, signal: i32) -> Result<()> {
         let signal = Signal::try_from(signal).context("invalid shutdown signal")?;
         match kill(Pid::from_raw(-(pgid as i32)), signal) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            // macOS reports EPERM for zombie-only groups. A member can
+            // exit between inspection and kill, so verify the group again
+            // before treating this as a real permission failure.
+            #[cfg(target_os = "macos")]
+            Err(Errno::EPERM) if !crate::process_table::group_alive(pgid)? => Ok(()),
             Err(e) => Err(e).context("failed to signal process group"),
         }
     }
