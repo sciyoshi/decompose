@@ -395,7 +395,7 @@ fn interrupting_up_on_existing_environment_only_detaches() {
 #[test]
 fn tui_stays_responsive_and_accepts_force_during_shutdown() {
     use std::io::Write;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     let mut env = Env::new(&CONFIG.replace(
         "timeout_seconds: 1",
         "timeout_seconds: 60\n      command: exec sh hook.sh",
@@ -404,31 +404,7 @@ fn tui_stays_responsive_and_accepts_force_during_shutdown() {
     fs::write(env.path("hook.sh"), "echo $$ > hook.pid\nexec sleep 120\n").unwrap();
     env.up();
     let worker = env.pidfile("worker.pid");
-    let (mut master_fd, mut slave_fd) = (-1, -1);
-    let mut size = libc::winsize {
-        ws_row: 24,
-        ws_col: 100,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: openpty receives valid writable fd pointers and a valid size;
-    // optional terminal settings/name pointers are null.
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::addr_of_mut!(size),
-            )
-        },
-        0
-    );
-    // SAFETY: successful openpty returned two new, uniquely owned descriptors.
-    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
-    // SAFETY: as above; this descriptor is distinct from master_fd.
-    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    let (mut master, slave) = terminal_pair();
     let mut command = env.command(&["tui"]);
     command
         .env("TERM", "xterm-256color")
@@ -501,4 +477,81 @@ fn shutdown_needs_no_process_utilities_on_path() {
     // The daemon inherited an empty PATH, so any internal ps invocation fails.
     env.run(&["down"]);
     assert!(!alive(worker));
+}
+
+fn terminal_pair() -> (fs::File, fs::File) {
+    use std::os::fd::FromRawFd;
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty receives valid writable fd pointers and a valid size;
+    // optional terminal settings/name pointers are null.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    // SAFETY: successful openpty returned two new, uniquely owned descriptors.
+    let master = unsafe { fs::File::from_raw_fd(master_fd) };
+    // SAFETY: as above; this descriptor is distinct from master_fd.
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    (master, slave)
+}
+
+#[test]
+fn default_pager_launches_directly_without_shell_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut env = Env::new("processes:\n  app:\n    command: echo pager-output; exec sleep 120\n");
+    env.up();
+    wait(|| {
+        fs::read_dir(env.path("state/decompose"))
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                entry.path().extension().is_some_and(|ext| ext == "log")
+                    && fs::read_to_string(entry.path())
+                        .unwrap()
+                        .contains("pager-output")
+            })
+    });
+    fs::create_dir(env.path("pager-bin")).unwrap();
+    let pager = env.path("pager-bin/less");
+    fs::write(
+        &pager,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > pager-args\n/bin/cat > pager-input\n",
+    )
+    .unwrap();
+    fs::set_permissions(&pager, fs::Permissions::from_mode(0o755)).unwrap();
+    let (_master, slave) = terminal_pair();
+    let out = env
+        .command(&["logs"])
+        .env_remove("PAGER")
+        .env_remove("DECOMPOSE_PAGER")
+        .env("PATH", env.path("pager-bin"))
+        .stdin(Stdio::null())
+        .stdout(slave)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(env.path("pager-args")).unwrap(), "-R\n");
+    assert!(
+        fs::read_to_string(env.path("pager-input"))
+            .unwrap()
+            .contains("pager-output")
+    );
 }

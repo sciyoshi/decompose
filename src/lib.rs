@@ -1018,20 +1018,21 @@ fn should_page(no_pager: bool) -> bool {
 /// colorized log lines render correctly). Returns `None` on spawn failure so
 /// the caller can fall back to direct stdout.
 fn spawn_pager() -> Option<std::process::Child> {
-    let cmd_str = env::var("DECOMPOSE_PAGER")
+    let configured = env::var("DECOMPOSE_PAGER")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| env::var("PAGER").ok().filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "less -R".to_string());
-
-    // Run the pager via the shell so users can set things like
-    // `PAGER="less -FRX"` or `PAGER="bat --paging=always"`.
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd_str)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .ok()
+        .or_else(|| env::var("PAGER").ok().filter(|s| !s.trim().is_empty()));
+    let mut cmd = if let Some(command) = configured {
+        // Explicit pager commands support shell arguments and pipelines.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new("less");
+        cmd.arg("-R");
+        cmd
+    };
+    cmd.stdin(std::process::Stdio::piped()).spawn().ok()
 }
 
 async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: ServiceOp) -> Result<()> {
