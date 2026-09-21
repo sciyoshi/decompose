@@ -60,7 +60,7 @@ pub enum Commands {
     Logs(LogsArgs),
     /// Start one or more previously-stopped services. With no args, starts all.
     Start(ServiceArgs),
-    /// Stop one or more services. With no args, stops all.
+    /// Stop one or more services and wait for cleanup. With no args, stops all.
     Stop(ServiceArgs),
     /// Restart one or more services. With no args, restarts all.
     Restart(ServiceArgs),
@@ -236,9 +236,8 @@ pub struct DaemonArgs {
     pub processes: Vec<String>,
     #[arg(long = "no-deps")]
     pub no_deps: bool,
-    /// PID to watch for orphan detection. When the PID exits and no IPC
-    /// client has talked to the daemon for the configured grace period,
-    /// the daemon self-terminates. Omitted in detached mode so the daemon
+    /// Owner PID to watch. If it exits, stop after the configured grace
+    /// period, regardless of other IPC traffic. Omitted in detached mode so the daemon
     /// survives its launching process by design.
     #[arg(long = "parent-pid")]
     pub parent_pid: Option<u32>,

@@ -221,10 +221,14 @@ pub fn print_up_status(info: &UpStatusInfo<'_>) {
     );
 
     // Hint line: dim, two-space indent. Attached `up` will start streaming
-    // logs immediately so the only useful hint is the detach key. Detached
+    // logs immediately; distinguish ownership from viewing. Detached
     // `up` points at `ps`, plus `logs -f` when output is likely interesting.
     let hint = if info.attached {
-        "  ctrl-c detaches".to_string()
+        if matches!(info.result, UpResult::Fresh) {
+            "  ctrl-c stops the environment".to_string()
+        } else {
+            "  ctrl-c detaches".to_string()
+        }
     } else {
         let mut parts: Vec<&str> = vec!["decompose ps"];
         if !matches!(info.result, UpResult::NoChange) {

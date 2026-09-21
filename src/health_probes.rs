@@ -15,8 +15,7 @@
 //! (on process spawn) and observes the flag changes via its own state
 //! inspection (dependency gating, restart decisions).
 //!
-//! Semantics must stay bit-identical to the previous inline implementation;
-//! this is a pure refactor.
+//! Probe tasks are cancelled and joined before a service generation finishes.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -42,46 +41,33 @@ pub(crate) enum ProbeKind {
 
 /// Spawn a probe task if a `HealthProbe` is configured. Combines the
 /// previously-duplicated readiness/liveness setup blocks into one call.
-pub(crate) fn spawn_probe_if_present(
-    probe: Option<&HealthProbe>,
-    kind: ProbeKind,
-    name_handle: &NameHandle,
-    working_dir: &Path,
-    environment: &BTreeMap<String, String>,
-    state: &SharedState,
-) {
-    if let Some(probe) = probe {
-        tokio::spawn(run_probe(
-            kind,
-            name_handle.clone(),
-            probe.clone(),
-            state.clone(),
-            working_dir.to_path_buf(),
-            environment.clone(),
-        ));
-    }
-}
-
 /// Run a health probe periodically. The polling/threshold scaffolding is
 /// identical between readiness and liveness probes; only the success and
 /// failure actions differ. See [`ProbeKind`] for the per-kind semantics.
-async fn run_probe(
+pub(crate) async fn run_probe(
     kind: ProbeKind,
     name_handle: NameHandle,
     probe: HealthProbe,
     state: SharedState,
     working_dir: PathBuf,
     environment: BTreeMap<String, String>,
-) {
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     // Initial delay
     if probe.initial_delay_seconds > 0 {
-        sleep(Duration::from_secs(probe.initial_delay_seconds)).await;
+        tokio::select! {
+            _ = cancel.changed() => return Ok(()),
+            _ = sleep(Duration::from_secs(probe.initial_delay_seconds)) => {}
+        }
     }
 
     let mut consecutive_successes: u32 = 0;
     let mut consecutive_failures: u32 = 0;
 
     loop {
+        if *cancel.borrow() {
+            break;
+        }
         // Check if process is still running
         let keep_going = with_process(&state, &name_handle, |r| !r.status.is_terminal())
             .await
@@ -90,7 +76,10 @@ async fn run_probe(
             break;
         }
 
-        let success = run_single_check(&probe, &working_dir, &environment).await;
+        let success = run_single_check(&probe, &working_dir, &environment, &mut cancel).await?;
+        if *cancel.borrow() {
+            break;
+        }
 
         if success {
             consecutive_successes += 1;
@@ -126,7 +115,7 @@ async fn run_probe(
                                     use nix::sys::signal::{self, Signal};
                                     use nix::unistd::Pid;
                                     let _ =
-                                        signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                                        signal::kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
                                 }
                                 #[cfg(not(unix))]
                                 {
@@ -144,46 +133,52 @@ async fn run_probe(
                         // Wait for the process to actually restart before
                         // probing again so we don't immediately kill the
                         // new instance.
-                        sleep(Duration::from_secs(probe.period_seconds)).await;
+                        tokio::select! {
+                            _ = cancel.changed() => break,
+                            _ = sleep(Duration::from_secs(probe.period_seconds)) => {}
+                        }
                         continue;
                     }
                 }
             }
         }
 
-        sleep(Duration::from_secs(probe.period_seconds)).await;
+        tokio::select! {
+            _ = cancel.changed() => break,
+            _ = sleep(Duration::from_secs(probe.period_seconds)) => {}
+        }
     }
+    Ok(())
 }
 
 async fn run_single_check(
     probe: &HealthProbe,
     working_dir: &Path,
     environment: &BTreeMap<String, String>,
-) -> bool {
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<bool> {
     if let Some(ref exec) = probe.exec {
         let timeout = Duration::from_secs(probe.timeout_seconds);
         let mut cmd = match build_shell_command(&exec.command) {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
         cmd.current_dir(working_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .envs(environment);
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => return output.status.success(),
-            _ => return false,
-        }
+        return crate::shutdown::probe_command(cmd, timeout, cancel).await;
     }
 
     if let Some(ref http) = probe.http_get {
         let timeout = Duration::from_secs(probe.timeout_seconds);
-        return tokio::time::timeout(timeout, http_get_check(http))
-            .await
-            .unwrap_or(false);
+        return Ok(tokio::select! {
+            _ = cancel.changed() => false,
+            result = tokio::time::timeout(timeout, http_get_check(http)) => result.unwrap_or(false),
+        });
     }
 
-    false
+    Ok(false)
 }
 
 async fn http_get_check(http: &HttpCheck) -> bool {

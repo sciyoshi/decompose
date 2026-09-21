@@ -483,16 +483,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         (KeyCode::Char('Q'), _) => {
             // Shift-Q: stop everything and quit, mirroring `decompose down`.
             // Lower-case q detaches without touching services.
-            match send_request(
-                &app.paths,
-                Request::Down {
-                    timeout_seconds: None,
-                },
-            )
-            .await
-            {
-                Ok(_) => app.set_status("stopping services…"),
-                Err(e) => app.set_status(format!("down failed: {e}")),
+            let result = async {
+                let pid = match send_request(&app.paths, Request::Ping).await? {
+                    Response::Pong { pid, .. } => pid,
+                    _ => anyhow::bail!("unexpected daemon response"),
+                };
+                crate::stop_environment(&app.paths, pid, None).await
+            }
+            .await;
+            if let Err(e) = result {
+                app.set_status(format!("down failed: {e}"));
+                return;
             }
             app.should_quit = true;
         }

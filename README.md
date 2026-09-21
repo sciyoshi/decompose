@@ -147,7 +147,8 @@ decompose completion elvish > ~/.config/elvish/lib/decompose.elv
 ## Built for humans and agents
 
 - `decompose up` starts and attaches.
-- `Ctrl-C` detaches your terminal session while keeping the daemon alive.
+- `Ctrl-C` or TERM stops an environment launched by foreground `up` and waits for cleanup. When `up` attaches to an existing environment, Ctrl-C only detaches.
+- `up -d` and `up --tui` start environments that outlive their client. Leaving `attach`, `logs -f`, or the TUI does not stop services.
 - `decompose up -d` starts and returns immediately.
 - `decompose ps` reports empty state instead of error when nothing is running.
 - Use `decompose down` from any tab/agent to stop the environment.
@@ -515,8 +516,46 @@ processes:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `shutdown.command` | string | `null` | Optional command to run before sending the stop signal. |
-| `shutdown.signal` | integer | `15` | Signal to send to the process (15 = SIGTERM, 2 = SIGINT, etc.). |
-| `shutdown.timeout_seconds` | integer | `10` | Seconds to wait after sending the signal before sending SIGKILL. |
+| `shutdown.signal` | integer | `15` | Signal to send to the service process group (15 = SIGTERM, 2 = SIGINT, etc.). |
+| `shutdown.timeout_seconds` | integer | `10` | Total graceful shutdown budget, including the shutdown command; remaining processes receive SIGKILL when it expires. |
+
+### Shutdown and process ownership
+
+`stop [SERVICE...]` waits for the selected services to finish cleanup and leaves
+the daemon running. `down` stops all services, waits for cleanup, and exits the
+daemon. Both suppress automatic restarts. Dependents stop before their
+dependencies when both are selected; independent services stop concurrently.
+`kill -s SIGNAL` delivers a raw signal to service process groups without running
+shutdown hooks. Restart policies still apply to `kill`.
+
+TERM and INT received by the daemon enter the same shutdown path as `down`.
+The incoming signal does not change the configured service stop signal: TERM is
+the default, and applications requiring INT can use `shutdown.signal: 2`.
+A second TERM/INT during shutdown forces KILL, including any running shutdown
+hooks, while still waiting for cleanup. Repeated `down` requests do not restart
+grace periods. `down --timeout SECONDS` overrides every service's grace budget.
+
+Shutdown runs the optional hook, signals the service group, and waits for all
+live members, even if the original shell has already exited. At the deadline,
+remaining members receive KILL, followed by a bounded cleanup wait. Hooks and
+exec probes are also owned and reaped. Natural exits and automatic restarts
+clean up descendants before declaring completion or starting a replacement.
+Cleanup failures are reported as errors, rather than inferred successful from
+a missing socket. After an unresolved cleanup failure, inspect the daemon log
+and surviving processes before starting another environment.
+
+An environment launched by foreground `up` belongs to that client. If the client
+disappears without requesting shutdown, the daemon stops after
+`DECOMPOSE_ORPHAN_TIMEOUT` seconds (default 30); IPC polling does not extend its
+lifetime. Use `up -d` or `up --tui` for persistent environments. TUI `q`/Ctrl-C
+detaches; `Q` stops the environment and waits for cleanup.
+
+On Unix, ownership covers descendants that remain in the service process group.
+Processes that deliberately create a new session or process group escape that
+boundary and are unsupported. Killing the daemon with SIGKILL cannot run its
+cleanup handlers; surviving descendants then require external cleanup. These
+guarantees do not imply container-style containment.
+
 
 ### Environment variables
 
@@ -722,7 +761,7 @@ processes:
       db:
         condition: process_healthy
   db:
-    command: "pg_ctl start -D /usr/local/var/postgresql@16 -l db.log"
+    command: "postgres -D /usr/local/var/postgresql@16"
     readiness_probe:
       exec:
         command: "pg_isready"

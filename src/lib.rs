@@ -40,6 +40,7 @@ pub mod ipc;
 pub mod model;
 pub mod output;
 pub mod paths;
+mod shutdown;
 pub mod tui;
 pub mod tuning;
 
@@ -289,8 +290,9 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     // stream. The TUI handles its own Ctrl-C.
     let attached = !args.detach && !args.tui;
     let ctrl_c_task = if attached {
-        Some(tokio::spawn(async {
-            let _ = ctrl_c().await;
+        let mut signals = shutdown::Signals::new()?;
+        Some(tokio::spawn(async move {
+            signals.recv().await;
         }))
     } else {
         None
@@ -343,11 +345,22 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         return Ok(());
     }
     if got_ctrl_c {
-        emit_detach(output_mode);
+        if state == "started" {
+            stop_environment(&paths, pid, None).await?;
+        } else {
+            emit_detach(output_mode);
+        }
         return Ok(());
     }
 
-    stream_logs_until_ctrl_c(&paths, output_mode, state == "already_running", ctrl_c_task).await
+    stream_logs_until_ctrl_c(
+        &paths,
+        output_mode,
+        state == "already_running",
+        ctrl_c_task,
+        pid,
+    )
+    .await
 }
 
 /// Resolved paths + config inputs used across the `up` flow.
@@ -650,6 +663,7 @@ async fn stream_logs_until_ctrl_c(
     output_mode: OutputMode,
     start_at_end: bool,
     ctrl_c_task: Option<tokio::task::JoinHandle<()>>,
+    pid: u32,
 ) -> Result<()> {
     let (log_stop_tx, log_stop_rx) = watch::channel(false);
     let log_handle = tokio::spawn(stream_daemon_logs(
@@ -657,14 +671,37 @@ async fn stream_logs_until_ctrl_c(
         log_stop_rx,
         start_at_end,
     ));
-    emit_attach(output_mode);
-    if let Some(task) = ctrl_c_task {
-        task.await
-            .context("failed waiting for Ctrl-C listener task")?;
+    if start_at_end {
+        emit_attach(output_mode);
+    } else {
+        emit_message(output_mode, "attached", "attached (Ctrl-C to stop)");
     }
+    let outcome = if let Some(mut task) = ctrl_c_task {
+        loop {
+            tokio::select! {
+                result = &mut task => {
+                    result.context("failed waiting for shutdown signal")?;
+                    break if start_at_end { Ok(()) } else { stop_environment(paths, pid, None).await };
+                }
+                _ = sleep(Duration::from_millis(100)) => {
+                    if !daemon_pid_matches(paths, pid) {
+                        task.abort();
+                        break read_shutdown_receipt(paths, pid);
+                    }
+                }
+            }
+        }
+    } else {
+        Ok(())
+    };
     let _ = log_stop_tx.send(true);
     let _ = log_handle.await;
-    emit_detach(output_mode);
+    outcome?;
+    if start_at_end {
+        emit_detach(output_mode);
+    } else {
+        emit_message(output_mode, "ok", "environment stopped");
+    }
     Ok(())
 }
 
@@ -675,27 +712,72 @@ async fn run_down(
 ) -> Result<()> {
     let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
-    let response = match send_request(
-        &paths,
-        Request::Down {
-            timeout_seconds: timeout,
-        },
-    )
-    .await
-    {
-        Ok(response) => response,
+    let pid = match send_request(&paths, Request::Ping).await {
+        Ok(Response::Pong { pid, .. }) => pid,
+        Ok(_) => bail!("unexpected response from daemon"),
         Err(err) if is_no_daemon_error(&err, &paths) => {
+            if let Ok(contents) = std::fs::read_to_string(&paths.pid)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                if daemon_pid_matches(&paths, pid) {
+                    return Err(err).context("daemon is alive but unreachable");
+                }
+                read_shutdown_receipt(&paths, pid)?;
+            }
             emit_message(output_mode, "ok", "no running environment");
             return Ok(());
         }
         Err(err) => return Err(err),
     };
-
-    let message = expect_ack(response)?;
-    wait_for_daemon_stop(&paths).await;
-    emit_message(output_mode, "ok", &message);
-
+    stop_environment(&paths, pid, timeout).await?;
+    emit_message(output_mode, "ok", "environment stopped");
     Ok(())
+}
+
+async fn shutdown_budget(
+    paths: &crate::model::RuntimePaths,
+    timeout: Option<u64>,
+) -> Result<Duration> {
+    match send_request(
+        paths,
+        Request::ShutdownBudget {
+            timeout_seconds: timeout,
+        },
+    )
+    .await?
+    {
+        Response::ShutdownBudget { seconds } => Ok(Duration::from_secs(seconds)),
+        Response::Error { message } => bail!("{message}"),
+        _ => bail!("unexpected shutdown budget response"),
+    }
+}
+
+pub(crate) async fn stop_environment(
+    paths: &crate::model::RuntimePaths,
+    pid: u32,
+    timeout: Option<u64>,
+) -> Result<()> {
+    let mut signals = shutdown::Signals::new()?;
+    let budget = shutdown_budget(paths, timeout).await?;
+    expect_ack(
+        send_request(
+            paths,
+            Request::Down {
+                timeout_seconds: timeout,
+            },
+        )
+        .await?,
+    )?;
+    let wait = wait_for_daemon_stop(paths, pid, budget);
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            result = &mut wait => return result,
+            _ = signals.recv() => {
+                expect_ack(send_request(paths, Request::ForceDown).await?)?;
+            }
+        }
+    }
 }
 
 async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
@@ -966,6 +1048,11 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
         },
     };
 
+    let stop_budget = if matches!(op, ServiceOp::Stop) {
+        Some(shutdown_budget(&paths, None).await?)
+    } else {
+        None
+    };
     let response = match send_request(&paths, request).await {
         Ok(response) => response,
         Err(err) if is_no_daemon_error(&err, &paths) => {
@@ -975,6 +1062,35 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
     };
 
     let message = expect_ack(response)?;
+    if let Some(budget) = stop_budget {
+        let wait = async {
+            loop {
+                match send_request(
+                    &paths,
+                    Request::StopStatus {
+                        services: args.services.clone(),
+                    },
+                )
+                .await?
+                {
+                    Response::StopStatus { complete, errors } => {
+                        if !errors.is_empty() {
+                            bail!("{}", errors.join("; "));
+                        }
+                        if complete {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                    Response::Error { message } => bail!("{message}"),
+                    _ => bail!("unexpected stop status response"),
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(budget, wait)
+            .await
+            .context("timed out waiting for services to stop")??;
+    }
     emit_message(output_mode, "ok", &message);
 
     Ok(())
@@ -1403,23 +1519,40 @@ async fn wait_for_services_ready(
     }
 }
 
-/// Poll the daemon socket until Ping fails, indicating the daemon has
-/// finished shutting down. Bounded so a stuck daemon doesn't wedge `down`
-/// indefinitely — the budget needs to cover the worst-case process
-/// shutdown_timeout (default 10s, then SIGKILL) plus IPC slack so a typical
-/// `down` returns only after the environment is fully torn down. Callers
-/// who want a hard sub-second `down` can rely on the daemon's immediate
-/// Ack and skip this wait.
-async fn wait_for_daemon_stop(paths: &crate::model::RuntimePaths) {
-    let poll_interval = Duration::from_millis(50);
-    let budget = Duration::from_secs(30);
-    let iterations = (budget.as_millis() / poll_interval.as_millis()) as usize;
-    for _ in 0..iterations {
-        if send_request(paths, Request::Ping).await.is_err() {
-            break;
-        }
-        sleep(poll_interval).await;
+fn daemon_pid_matches(paths: &crate::model::RuntimePaths, pid: u32) -> bool {
+    std::fs::read_to_string(&paths.pid)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        == Some(pid)
+        && crate::daemon::parent_alive(pid)
+}
+
+fn read_shutdown_receipt(paths: &crate::model::RuntimePaths, pid: u32) -> Result<()> {
+    let bytes = std::fs::read(paths.pid.with_extension("shutdown.json"))
+        .context("daemon exited without confirming process cleanup")?;
+    let receipt: shutdown::Receipt = serde_json::from_slice(&bytes)?;
+    if receipt.pid != pid {
+        bail!("daemon exited without confirming process cleanup for pid {pid}");
     }
+    if !receipt.errors.is_empty() {
+        bail!("{}", receipt.errors.join("; "));
+    }
+    Ok(())
+}
+
+async fn wait_for_daemon_stop(
+    paths: &crate::model::RuntimePaths,
+    pid: u32,
+    budget: Duration,
+) -> Result<()> {
+    tokio::time::timeout(budget, async {
+        while daemon_pid_matches(paths, pid) {
+            sleep(Duration::from_millis(50)).await;
+        }
+        read_shutdown_receipt(paths, pid)
+    })
+    .await
+    .context("timed out waiting for daemon cleanup")?
 }
 
 fn is_no_daemon_error(err: &anyhow::Error, paths: &crate::model::RuntimePaths) -> bool {

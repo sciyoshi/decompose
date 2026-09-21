@@ -300,7 +300,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
 }
 
 #[test]
-fn ctrl_c_detaches_and_daemon_keeps_running() {
+fn ctrl_c_stops_owned_environment() {
     let (_root, project, runtime, state, config) = setup_project();
     let home = project.parent().expect("parent").join("home");
     let cfg = config.to_string_lossy().to_string();
@@ -328,7 +328,7 @@ fn ctrl_c_detaches_and_daemon_keeps_running() {
     assert!(status.success(), "failed to send SIGINT");
 
     let up_exit = child.wait().expect("wait up");
-    assert!(up_exit.success(), "up should detach cleanly");
+    assert!(up_exit.success(), "up should stop cleanly");
 
     let ps = run_cmd(
         &project,
@@ -339,7 +339,9 @@ fn ctrl_c_detaches_and_daemon_keeps_running() {
         &[],
         &[],
     );
-    assert_success(&ps, "ps after ctrl-c detach");
+    assert_success(&ps, "ps after ctrl-c shutdown");
+    let value: Value = serde_json::from_slice(&ps.stdout).unwrap();
+    assert!(value["processes"].as_array().unwrap().is_empty());
 
     let down = run_cmd(
         &project,
@@ -5766,7 +5768,7 @@ fn attached_up_killed_triggers_daemon_auto_exit() {
 }
 
 #[test]
-fn client_activity_keeps_orphaned_daemon_alive() {
+fn client_activity_does_not_extend_owner_lifetime() {
     // An orphaned daemon (parent dead) should remain alive as long as IPC
     // clients keep talking to it. Once activity stops, it exits after the
     // grace period.
@@ -5812,28 +5814,15 @@ fn client_activity_keeps_orphaned_daemon_alive() {
     assert!(kill_status.success(), "failed to SIGKILL up");
     let _ = child.wait();
 
-    // For ~8 seconds (well past the 3s grace), keep hitting the daemon at
-    // 500ms intervals. Each request should reset the activity clock, so
-    // the daemon must still be alive at the end. We use the IPC probe
-    // here deliberately — the whole point is that IPC activity keeps the
-    // daemon alive.
-    let hold_start = std::time::Instant::now();
-    while hold_start.elapsed() < Duration::from_secs(8) {
+    // Polling a dead owner's environment must not keep it alive.
+    let start = std::time::Instant::now();
+    while is_daemon_live_ipc(&project, &runtime, &state, &home, &cfg) {
         assert!(
-            is_daemon_live_ipc(&project, &runtime, &state, &home, &cfg),
-            "daemon exited while IPC activity was ongoing at {:?}",
-            hold_start.elapsed(),
+            start.elapsed() < Duration::from_secs(15),
+            "IPC traffic kept orphan alive"
         );
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(100));
     }
-
-    // Stop poking it. Switch to the no-IPC probe so we don't reset the
-    // watchdog clock while waiting for it to fire.
-    let exited = wait_for_daemon_exit_no_ipc(&state, Duration::from_secs(15));
-    assert!(
-        exited,
-        "daemon should self-exit after IPC activity stops and grace elapses",
-    );
 }
 
 #[test]

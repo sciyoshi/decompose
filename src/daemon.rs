@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -151,11 +151,11 @@ pub(crate) struct DaemonState {
     config_files: Vec<std::path::PathBuf>,
     env_files: Vec<std::path::PathBuf>,
     disable_dotenv: bool,
-    /// Timestamp of the most recent IPC request. The orphan watchdog uses
-    /// this to decide whether the daemon still has active clients talking to
-    /// it after its parent process exits. Seeded at daemon start, then
-    /// updated at the top of every `handle_client` call.
-    last_client_activity: Instant,
+    /// Persistent stop intent, retained until an explicit start or recreate.
+    stopping: BTreeSet<String>,
+    stop_versions: BTreeMap<String, u64>,
+    stop_errors: BTreeMap<String, String>,
+    force_shutdown: Arc<AtomicBool>,
 }
 
 impl DaemonState {
@@ -163,69 +163,73 @@ impl DaemonState {
     /// transition any still-Pending processes directly to Stopped (they have
     /// no controller of their own). Does not set `shutdown_requested`.
     fn broadcast_stop(&mut self) {
-        for tx in self.controllers.values() {
-            let _ = tx.send(true);
-        }
-        for runtime in self.processes.values_mut() {
-            if matches!(runtime.status, ProcessStatus::Pending) {
-                runtime.status = ProcessStatus::Stopped;
-            }
-        }
+        let names = self.processes.keys().cloned().collect::<Vec<_>>();
+        self.stop_instances(&names);
     }
 
-    /// Set `shutdown_requested` and broadcast stop to all controllers. Used
-    /// by callers that want to initiate shutdown (exit-mode trigger, fatal
-    /// accept error, `Down` RPC).
     fn request_shutdown(&mut self) {
         self.shutdown_requested = true;
         self.broadcast_stop();
     }
 
-    /// Stop a specific set of process instances by name. For each name:
-    /// - If the process is `Pending` (has no controller yet), transition it
-    ///   directly to `Stopped`.
-    /// - Otherwise, send the shutdown signal to its controller so the
-    ///   lifecycle task will tear it down.
-    ///
-    /// Unknown names are silently ignored (callers should resolve/validate
-    /// first). Used by the Stop, RemoveOrphans, and Reload IPC handlers,
-    /// which all share this "best-effort targeted shutdown" shape.
     fn stop_instances(&mut self, names: &[String]) {
         for name in names {
-            if let Some(runtime) = self.processes.get_mut(name)
-                && matches!(runtime.status, ProcessStatus::Pending)
-            {
-                runtime.status = ProcessStatus::Stopped;
+            *self.stop_versions.entry(name.clone()).or_default() += 1;
+        }
+        self.stopping.extend(names.iter().cloned());
+        self.advance_stops();
+    }
+
+    /// Stop dependents first, but only order services included in this stop.
+    fn advance_stops(&mut self) {
+        for name in &self.stopping {
+            let Some(runtime) = self.processes.get(name) else {
+                continue;
+            };
+            let blocked = !self.force_shutdown.load(Ordering::Relaxed)
+                && self.stopping.iter().any(|other| {
+                    self.processes.get(other).is_some_and(|r| {
+                        r.spec.depends_on.contains_key(&runtime.spec.base_name)
+                            && (!r.status.is_terminal() || self.controllers.contains_key(other))
+                    })
+                });
+            if blocked {
                 continue;
             }
             if let Some(tx) = self.controllers.get(name) {
-                let _ = tx.send(true);
+                tx.send_replace(true);
+            } else if let Some(runtime) = self.processes.get_mut(name)
+                && matches!(runtime.status, ProcessStatus::Pending)
+            {
+                runtime.status = ProcessStatus::Stopped;
             }
         }
     }
 }
 
 /// Poll the shared state until every instance in `names` has reached a
-/// terminal status, or until `max_ticks` of `tick` elapses. Returns once
-/// either condition holds. Callers use this to gate follow-up work (e.g.
-/// respawning or removing entries) on the preceding stop signal actually
-/// having landed.
-async fn wait_for_terminal(state: &SharedState, names: &[String], tick: Duration, max_ticks: u32) {
-    for _ in 0..max_ticks {
-        let all_stopped = {
+/// terminal status and released its controller. Cleanup errors prevent
+/// callers from replacing a generation whose descendants may still exist.
+async fn wait_for_terminal(state: &SharedState, names: &[String]) -> Result<()> {
+    loop {
+        {
             let guard = state.lock().await;
-            names.iter().all(|name| {
-                guard
-                    .processes
-                    .get(name)
-                    .map(|r| r.status.is_terminal())
-                    .unwrap_or(true)
-            })
-        };
-        if all_stopped {
-            return;
+            if names.iter().all(|name| {
+                !guard.controllers.contains_key(name)
+                    && guard
+                        .processes
+                        .get(name)
+                        .is_none_or(|r| r.status.is_terminal())
+            }) {
+                for name in names {
+                    if let Some(error) = guard.stop_errors.get(name) {
+                        anyhow::bail!("{name}: {error}");
+                    }
+                }
+                return Ok(());
+            }
         }
-        sleep(tick).await;
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -371,11 +375,26 @@ pub fn spawn_daemon_process(
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_err));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A daemon must never receive terminal signals intended for its client.
+        // SAFETY: setsid is async-signal-safe and touches no Rust state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let _child = cmd.spawn().context("failed to spawn daemon process")?;
     Ok(())
 }
 
 pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    let mut signals = crate::shutdown::Signals::new()?;
     env::set_current_dir(&args.cwd).with_context(|| {
         format!(
             "failed to change cwd to {}",
@@ -437,6 +456,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     }
 
+    let _ = fs::remove_file(paths.pid.with_extension("shutdown.json"));
     write_secure(&paths.pid, std::process::id().to_string().as_bytes()).with_context(|| {
         format!(
             "failed to write pid file to {}",
@@ -469,7 +489,10 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         config_files: args.config_files.clone(),
         env_files: args.env_files.clone(),
         disable_dotenv: args.disable_dotenv,
-        last_client_activity: Instant::now(),
+        stopping: BTreeSet::new(),
+        stop_versions: BTreeMap::new(),
+        stop_errors: BTreeMap::new(),
+        force_shutdown: Arc::new(AtomicBool::new(false)),
     }));
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -489,6 +512,13 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
                 if changed.is_ok() && *stop_rx.borrow() {
                     break;
                 }
+            }
+            _ = signals.recv() => {
+                let mut guard = state.lock().await;
+                if guard.shutdown_requested {
+                    guard.force_shutdown.store(true, Ordering::Relaxed);
+                }
+                guard.request_shutdown();
             }
             incoming = listener.accept() => {
                 match incoming {
@@ -519,7 +549,8 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
                             // stop processes and break the outer loop.
                             let mut guard = state.lock().await;
                             guard.request_shutdown();
-                            break;
+                            drop(guard);
+                            sleep(Duration::from_millis(50)).await;
                         } else {
                             eprintln!("socket accept error (transient): {e}");
                             sleep(Duration::from_millis(50)).await;
@@ -530,9 +561,27 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     }
 
+    let errors = state
+        .lock()
+        .await
+        .stop_errors
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let receipt = crate::shutdown::Receipt {
+        pid: std::process::id(),
+        errors,
+    };
+    write_secure(
+        &paths.pid.with_extension("shutdown.json"),
+        &serde_json::to_vec(&receipt)?,
+    )?;
     let _ = fs::remove_file(&paths.socket);
     let _ = fs::remove_file(&paths.pid);
     let _ = fs::remove_file(&paths.lock);
+    if !receipt.errors.is_empty() {
+        anyhow::bail!("shutdown cleanup failed: {}", receipt.errors.join("; "));
+    }
     Ok(())
 }
 
@@ -544,6 +593,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
         {
             let mut guard = state.lock().await;
 
+            guard.advance_stops();
             if !guard.shutdown_requested {
                 let triggered = match guard.exit_mode {
                     ExitMode::WaitAll => false,
@@ -593,6 +643,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
         let done = {
             let guard = state.lock().await;
             request_shutdown
+                && guard.controllers.is_empty()
                 && guard
                     .processes
                     .values()
@@ -615,7 +666,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
 /// `getppid()` returns on macOS after the real parent exits — we detect
 /// orphan state via the caller-supplied PID, not `getppid`).
 #[cfg(unix)]
-fn parent_alive(pid: u32) -> bool {
+pub(crate) fn parent_alive(pid: u32) -> bool {
     if pid == 0 {
         return true;
     }
@@ -631,48 +682,27 @@ fn parent_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn parent_alive(_pid: u32) -> bool {
+pub(crate) fn parent_alive(_pid: u32) -> bool {
     // Best-effort: on non-Unix platforms we skip the check entirely.
     true
 }
 
-/// Periodically check whether the caller that launched this daemon is still
-/// alive. Once the parent PID is gone AND no IPC client has spoken to us in
-/// the configured grace period, initiate a graceful shutdown. The grace
-/// period lets transient tools (`ps`, `logs`, `start`) keep a daemon alive
-/// even after the original terminal disappeared — only a truly abandoned
-/// daemon self-exits.
+/// Stop an owned environment after its launching client disappears. Read-only
+/// IPC traffic never transfers ownership or postpones cleanup.
 async fn orphan_watchdog(state: SharedState, parent_pid: u32) {
-    let tick = crate::tuning::orphan_check_interval();
-    let grace = crate::tuning::orphan_timeout();
+    let mut gone_since = None;
     loop {
-        sleep(tick).await;
-
-        {
-            let guard = state.lock().await;
-            if guard.shutdown_requested {
-                return;
-            }
+        sleep(crate::tuning::orphan_check_interval()).await;
+        let mut guard = state.lock().await;
+        if guard.shutdown_requested {
+            return;
         }
-
         if parent_alive(parent_pid) {
-            continue;
-        }
-
-        // Parent is gone. Check whether any client has been in touch
-        // recently; if so, defer.
-        let should_exit = {
-            let guard = state.lock().await;
-            guard.last_client_activity.elapsed() >= grace
-        };
-
-        if should_exit {
-            eprintln!(
-                "daemon: parent pid {parent_pid} is gone and no IPC activity for \
-                 {}s; initiating shutdown",
-                grace.as_secs()
-            );
-            let mut guard = state.lock().await;
+            gone_since = None;
+        } else if gone_since.get_or_insert_with(Instant::now).elapsed()
+            >= crate::tuning::orphan_timeout()
+        {
+            eprintln!("daemon: owner pid {parent_pid} exited; initiating shutdown");
             guard.request_shutdown();
             return;
         }
@@ -750,15 +780,22 @@ async fn start_process(name: String, state: SharedState) {
     // Pull the spec and the name handle for a pending process. Non-pending
     // (or missing) entries are silent no-ops — callers may fire
     // start_process opportunistically.
+    let (kill_tx, kill_rx) = watch::channel(false);
     let (spec, name_handle) = {
         let mut guard = state.lock().await;
+        if guard.shutdown_requested || guard.stopping.contains(&name) {
+            return;
+        }
         let Some(runtime) = guard.processes.get_mut(&name) else {
             return;
         };
         if !matches!(runtime.status, ProcessStatus::Pending) {
             return;
         }
-        (runtime.spec.clone(), runtime.name_handle.clone())
+        runtime.status = ProcessStatus::Restarting;
+        let pair = (runtime.spec.clone(), runtime.name_handle.clone());
+        guard.controllers.insert(name.clone(), kill_tx);
+        pair
     };
 
     let ready_pattern: Option<Regex> = spec.ready_log_line.as_deref().map(compile_ready_pattern);
@@ -766,6 +803,7 @@ async fn start_process(name: String, state: SharedState) {
     let Some(mut child) =
         spawn_process_child(&name_handle, &spec, &state, SpawnContext::Initial).await
     else {
+        state.lock().await.controllers.remove(&name);
         return;
     };
 
@@ -776,15 +814,7 @@ async fn start_process(name: String, state: SharedState) {
     })
     .await;
 
-    spawn_health_probes(&name_handle, &spec, &state);
     attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
-
-    let (kill_tx, kill_rx) = watch::channel(false);
-    {
-        let current = crate::model::read_name(&name_handle);
-        let mut guard = state.lock().await;
-        guard.controllers.insert(current, kill_tx);
-    }
 
     tokio::spawn(process_lifecycle(
         name_handle,
@@ -889,24 +919,28 @@ fn spawn_health_probes(
     name_handle: &crate::model::NameHandle,
     spec: &crate::model::ProcessInstanceSpec,
     state: &SharedState,
-) {
-    use crate::health_probes::{ProbeKind, spawn_probe_if_present};
-    spawn_probe_if_present(
-        spec.readiness_probe.as_ref(),
-        ProbeKind::Readiness,
-        name_handle,
-        &spec.working_dir,
-        &spec.environment,
-        state,
-    );
-    spawn_probe_if_present(
-        spec.liveness_probe.as_ref(),
-        ProbeKind::Liveness,
-        name_handle,
-        &spec.working_dir,
-        &spec.environment,
-        state,
-    );
+    cancel: &watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+    use crate::health_probes::{ProbeKind, run_probe};
+    [
+        (spec.readiness_probe.as_ref(), ProbeKind::Readiness),
+        (spec.liveness_probe.as_ref(), ProbeKind::Liveness),
+    ]
+    .into_iter()
+    .filter_map(|(probe, kind)| {
+        probe.map(|probe| {
+            tokio::spawn(run_probe(
+                kind,
+                name_handle.clone(),
+                probe.clone(),
+                state.clone(),
+                spec.working_dir.clone(),
+                spec.environment.clone(),
+                cancel.clone(),
+            ))
+        })
+    })
+    .collect()
 }
 
 /// How a child process ended, carrying enough information to render a
@@ -954,37 +988,64 @@ async fn wait_for_child_exit(
     kill_rx: &mut watch::Receiver<bool>,
     state: &SharedState,
 ) -> (ProcessStatus, Option<ExitReason>) {
-    tokio::select! {
-        _ = kill_rx.changed() => {
-            let timeout_override = {
-                let guard = state.lock().await;
-                guard.shutdown_timeout_override
+    let (probe_stop, probe_rx) = watch::channel(false);
+    let probes = spawn_health_probes(name_handle, spec, state, &probe_rx);
+    let pgid = child.id().expect("live child has pid");
+    let outcome = tokio::select! {
+        biased;
+        _ = async { if !*kill_rx.borrow() { let _ = kill_rx.changed().await; } } => None,
+        result = child.wait() => Some(result),
+    };
+    probe_stop.send_replace(true);
+    let mut probe_error = None;
+    for task in probes {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => probe_error = Some(e),
+            Err(e) => probe_error = Some(e.into()),
+        }
+    }
+    let (timeout, force) = {
+        let guard = state.lock().await;
+        (
+            guard
+                .shutdown_timeout_override
+                .unwrap_or(spec.shutdown_timeout_seconds),
+            guard.force_shutdown.clone(),
+        )
+    };
+    let cleanup = crate::shutdown::cleanup(
+        child,
+        pgid,
+        spec,
+        Duration::from_secs(timeout),
+        outcome.is_none(),
+        &force,
+    )
+    .await;
+    if let Err(error) = cleanup.and(probe_error.map_or(Ok(()), Err)) {
+        let name = crate::model::read_name(name_handle);
+        let message = format!("{name}: cleanup failed: {error:#}");
+        eprintln!("{message}");
+        state.lock().await.stop_errors.insert(name, message.clone());
+        return (ProcessStatus::FailedToStart { reason: message }, None);
+    }
+    match outcome {
+        None => (ProcessStatus::Stopped, None),
+        Some(Ok(status)) => {
+            let reason = exit_reason_from_status(&status);
+            let code = match reason {
+                ExitReason::Code(c) => c,
+                ExitReason::Signal(_) => -1,
             };
-            shutdown_child(child, spec, timeout_override).await;
-            let _ = name_handle; // handle retained for future logging hooks
-            (ProcessStatus::Stopped, None)
+            (ProcessStatus::Exited { code }, Some(reason))
         }
-        wait_res = child.wait() => {
-            match wait_res {
-                Ok(exit_status) => {
-                    let reason = exit_reason_from_status(&exit_status);
-                    let status = match reason {
-                        ExitReason::Code(code) => ProcessStatus::Exited { code },
-                        // ProcessStatus doesn't distinguish signal vs. code
-                        // today; collapse to `code=-1` matching prior
-                        // behavior, but keep the richer reason for logging.
-                        ExitReason::Signal(_) => ProcessStatus::Exited { code: -1 },
-                    };
-                    (status, Some(reason))
-                }
-                Err(e) => (
-                    ProcessStatus::FailedToStart {
-                        reason: format!("wait failed: {e}"),
-                    },
-                    None,
-                ),
-            }
-        }
+        Some(Err(e)) => (
+            ProcessStatus::FailedToStart {
+                reason: format!("wait failed: {e}"),
+            },
+            None,
+        ),
     }
 }
 
@@ -1034,18 +1095,31 @@ async fn apply_restart_decision(
     state: &SharedState,
     final_status: ProcessStatus,
 ) -> bool {
-    with_process_mut(state, name_handle, |runtime| {
-        let do_restart = match (&final_status, runtime.spec.restart_policy) {
-            (ProcessStatus::Stopped, _) => false,
-            (_, RestartPolicy::No) => false,
-            (ProcessStatus::Exited { code: 0 }, RestartPolicy::OnFailure) => false,
-            (_, RestartPolicy::OnFailure) | (_, RestartPolicy::Always) => {
-                match runtime.spec.max_restarts {
-                    Some(max) => runtime.restart_count < max,
-                    None => true,
-                }
-            }
+    let name = crate::model::read_name(name_handle);
+    let mut guard = state.lock().await;
+    let stopping = guard.shutdown_requested || guard.stopping.contains(&name);
+    let failed_cleanup = guard.stop_errors.contains_key(&name);
+    let Some(runtime) = guard.processes.get_mut(&name) else {
+        return false;
+    };
+    {
+        let final_status = if stopping && !failed_cleanup {
+            ProcessStatus::Stopped
+        } else {
+            final_status
         };
+        let do_restart = !failed_cleanup
+            && match (&final_status, runtime.spec.restart_policy) {
+                (ProcessStatus::Stopped, _) => false,
+                (_, RestartPolicy::No) => false,
+                (ProcessStatus::Exited { code: 0 }, RestartPolicy::OnFailure) => false,
+                (_, RestartPolicy::OnFailure) | (_, RestartPolicy::Always) => {
+                    match runtime.spec.max_restarts {
+                        Some(max) => runtime.restart_count < max,
+                        None => true,
+                    }
+                }
+            };
         if do_restart {
             runtime.status = ProcessStatus::Restarting;
             runtime.restart_count += 1;
@@ -1054,9 +1128,7 @@ async fn apply_restart_decision(
             runtime.status = final_status;
             false
         }
-    })
-    .await
-    .unwrap_or(false)
+    }
 }
 
 /// Main lifecycle loop for a running process: waits for exit, applies the
@@ -1101,7 +1173,28 @@ async fn process_lifecycle(
         let backoff = with_process(&state, &name_handle, |r| r.spec.backoff_seconds)
             .await
             .unwrap_or(1);
-        sleep(Duration::from_secs(backoff)).await;
+        tokio::select! {
+            biased;
+            _ = async { if !*kill_rx.borrow() { let _ = kill_rx.changed().await; } } => {
+                let name = crate::model::read_name(&name_handle);
+                let mut guard = state.lock().await;
+                if let Some(runtime) = guard.processes.get_mut(&name) { runtime.status = ProcessStatus::Stopped; }
+                guard.controllers.remove(&name);
+                break;
+            }
+            _ = sleep(Duration::from_secs(backoff)) => {}
+        }
+        {
+            let name = crate::model::read_name(&name_handle);
+            let mut guard = state.lock().await;
+            if guard.shutdown_requested || guard.stopping.contains(&name) {
+                if let Some(runtime) = guard.processes.get_mut(&name) {
+                    runtime.status = ProcessStatus::Stopped;
+                }
+                guard.controllers.remove(&name);
+                break;
+            }
+        }
 
         // Pick up any new spec the reload may have installed.
         let next_spec = with_process(&state, &name_handle, |r| r.spec.clone()).await;
@@ -1132,16 +1225,6 @@ async fn process_lifecycle(
         let ready_pattern: Option<Regex> =
             spec.ready_log_line.as_deref().map(compile_ready_pattern);
         attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
-
-        // Fresh kill channel for this restart iteration, replacing the one
-        // whose sender was dropped when `broadcast_stop` last fired.
-        let (new_kill_tx, new_kill_rx) = watch::channel(false);
-        {
-            let name = crate::model::read_name(&name_handle);
-            let mut guard = state.lock().await;
-            guard.controllers.insert(name, new_kill_tx);
-        }
-        kill_rx = new_kill_rx;
     }
 }
 
@@ -1202,108 +1285,6 @@ fn attach_output_readers(
                 }
             }
         });
-    }
-}
-
-async fn shutdown_child(
-    child: &mut tokio::process::Child,
-    spec: &crate::model::ProcessInstanceSpec,
-    timeout_override: Option<u64>,
-) {
-    let total_timeout =
-        Duration::from_secs(timeout_override.unwrap_or(spec.shutdown_timeout_seconds));
-    let deadline = tokio::time::Instant::now() + total_timeout;
-
-    // Step 1: Run optional shutdown command. Bound it by the overall
-    // shutdown timeout so a hung cleanup script can't block us forever.
-    if let Some(ref cmd_str) = spec.shutdown_command {
-        match build_shell_command(cmd_str) {
-            Ok(mut cmd) => {
-                cmd.current_dir(&spec.working_dir).envs(&spec.environment);
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    eprintln!(
-                        "[{}] shutdown command {:?} skipped: no time budget remaining",
-                        spec.name, cmd_str
-                    );
-                } else {
-                    match tokio::time::timeout(remaining, cmd.output()).await {
-                        Ok(Ok(output)) => {
-                            if !output.status.success() {
-                                let code = output
-                                    .status
-                                    .code()
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|| "signal".to_string());
-                                eprintln!(
-                                    "[{}] shutdown command {:?} exited with status {code}",
-                                    spec.name, cmd_str
-                                );
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!(
-                                "[{}] shutdown command {:?} failed to spawn: {e}",
-                                spec.name, cmd_str
-                            );
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "[{}] shutdown command {:?} timed out; proceeding to SIGTERM",
-                                spec.name, cmd_str
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[{}] shutdown command failed to build: {e}", spec.name);
-            }
-        }
-    }
-
-    // Step 2: Send signal to the process group so backgrounded grandchildren
-    // exit too. Each spawned service has its own pgid (set via
-    // `cmd.process_group(0)`), and the leader's pid doubles as the pgid.
-    let signal = spec.shutdown_signal.unwrap_or(15);
-    if let Some(pid) = child.id() {
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            if let Ok(sig) = Signal::try_from(signal) {
-                let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = signal; // suppress unused warning
-            let _ = child.start_kill();
-        }
-    }
-
-    // Step 3: Wait for the remaining portion of the total timeout. If the
-    // shutdown command ate most of it, we'll move on to SIGKILL quickly —
-    // which is the right behaviour: the user's time budget is over.
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let terminated = if remaining.is_zero() {
-        false
-    } else {
-        tokio::time::timeout(remaining, child.wait()).await.is_ok()
-    };
-
-    if !terminated {
-        // Step 4: Force kill the group (covers grandchildren).
-        #[cfg(unix)]
-        {
-            if let Some(pid) = child.id() {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                let _ = signal::kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
-            }
-        }
-        let _ = child.start_kill();
-        let _ = child.wait().await;
     }
 }
 
@@ -1558,14 +1539,20 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
 
     let req: Request = serde_json::from_str(line.trim()).context("invalid request json")?;
 
-    // Refresh the orphan-watchdog activity clock on every request (not on
-    // connection accept), so long-lived connections that drip-feed requests
-    // also keep the daemon alive.
+    if state.lock().await.shutdown_requested
+        && matches!(
+            req,
+            Request::Start { .. } | Request::Restart { .. } | Request::Reload { .. }
+        )
     {
-        let mut guard = state.lock().await;
-        guard.last_client_activity = Instant::now();
+        let response = Response::Error {
+            message: "environment is shutting down".into(),
+        };
+        write_half
+            .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+            .await?;
+        return Ok(());
     }
-
     let response = match req {
         Request::Ping => {
             let guard = state.lock().await;
@@ -1575,13 +1562,54 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 shutting_down: guard.shutdown_requested,
             }
         }
+        Request::ShutdownBudget { timeout_seconds } => {
+            let guard = state.lock().await;
+            Response::ShutdownBudget {
+                seconds: guard.processes.values().fold(10u64, |total, r| {
+                    total.saturating_add(
+                        timeout_seconds
+                            .unwrap_or(r.spec.shutdown_timeout_seconds)
+                            .saturating_add(20),
+                    )
+                }),
+            }
+        }
         Request::Ps => handle_ps(&state).await,
         Request::Down { timeout_seconds } => {
             let mut guard = state.lock().await;
-            guard.shutdown_timeout_override = timeout_seconds;
+            if !guard.shutdown_requested {
+                guard.shutdown_timeout_override = timeout_seconds;
+            }
             guard.request_shutdown();
             Response::Ack {
                 message: "shutdown requested".to_string(),
+            }
+        }
+        Request::StopStatus { services } => {
+            let guard = state.lock().await;
+            match resolve_services_or_error(&guard, &services) {
+                Err(r) => r,
+                Ok(names) => Response::StopStatus {
+                    complete: names.iter().all(|n| {
+                        !guard.controllers.contains_key(n)
+                            && guard
+                                .processes
+                                .get(n)
+                                .is_none_or(|r| r.status.is_terminal())
+                    }),
+                    errors: names
+                        .iter()
+                        .filter_map(|n| guard.stop_errors.get(n).cloned())
+                        .collect(),
+                },
+            }
+        }
+        Request::ForceDown => {
+            let mut guard = state.lock().await;
+            guard.force_shutdown.store(true, Ordering::Relaxed);
+            guard.request_shutdown();
+            Response::Ack {
+                message: "forced shutdown requested".into(),
             }
         }
         Request::Stop { services } => handle_stop(&state, services).await,
@@ -1652,6 +1680,12 @@ async fn handle_stop(state: &SharedState, services: Vec<String>) -> Response {
 /// out of their terminal state, matching the behaviour `up` relies on.
 async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
     let mut guard = state.lock().await;
+    if guard.shutdown_requested {
+        return Response::Error {
+            message: "environment is shutting down".into(),
+        };
+    }
+
     // Empty `services` means "start every eligible service" (e.g. the
     // implicit Start that follows `up`'s Reload). In that mode, services
     // with `disabled: true` must stay parked — they are eligible only when
@@ -1687,6 +1721,15 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
 
             let mut started = 0;
             for name in &to_start {
+                if let Some(error) = guard.stop_errors.get(name) {
+                    return Response::Error {
+                        message: error.clone(),
+                    };
+                }
+                if guard.controllers.contains_key(name) {
+                    continue;
+                }
+                guard.stopping.remove(name);
                 if let Some(runtime) = guard.processes.get_mut(name)
                     && runtime.status.is_terminal()
                 {
@@ -1738,17 +1781,11 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
             for name in &names {
                 if let Some(runtime) = guard.processes.get(name)
                     && let ProcessStatus::Running { pid } = runtime.status
+                    && let Err(e) = crate::shutdown::signal_group(pid, signal)
                 {
-                    #[cfg(unix)]
-                    {
-                        use nix::sys::signal::{self, Signal};
-                        use nix::unistd::Pid;
-                        if let Ok(sig) = Signal::try_from(signal) {
-                            // Signal the whole process group so
-                            // backgrounded grandchildren exit too.
-                            let _ = signal::kill(Pid::from_raw(-(pid as i32)), sig);
-                        }
-                    }
+                    return Response::Error {
+                        message: format!("{name}: {e:#}"),
+                    };
                 }
             }
             Response::Ack {
@@ -1763,18 +1800,35 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
 /// `Pending` so the supervisor respawns them.
 async fn handle_restart(state: &SharedState, services: Vec<String>) -> Response {
     let mut guard = state.lock().await;
+    if guard.shutdown_requested {
+        return Response::Error {
+            message: "environment is shutting down".into(),
+        };
+    }
+
     match resolve_services_or_error(&guard, &services) {
         Err(resp) => resp,
         Ok(names) => {
             guard.stop_instances(&names);
+            let versions = guard.stop_versions.clone();
             drop(guard);
             // Spawn a task to wait for stop then reset to Pending
             let state_clone = state.clone();
             let names_clone = names.clone();
             tokio::spawn(async move {
-                wait_for_terminal(&state_clone, &names_clone, Duration::from_millis(50), 200).await;
+                if let Err(e) = wait_for_terminal(&state_clone, &names_clone).await {
+                    eprintln!("restart failed: {e}");
+                    return;
+                }
                 let mut guard = state_clone.lock().await;
+                if guard.shutdown_requested {
+                    return;
+                }
                 for name in &names_clone {
+                    if guard.stop_versions.get(name) != versions.get(name) {
+                        continue;
+                    }
+                    guard.stopping.remove(name);
                     if let Some(runtime) = guard.processes.get_mut(name) {
                         runtime.status = ProcessStatus::Pending;
                         runtime.log_ready = false;
@@ -1811,7 +1865,10 @@ async fn handle_remove_orphans(state: &SharedState, keep: Vec<String>) -> Respon
         let state_clone = state.clone();
         let orphans_clone = orphans.clone();
         tokio::spawn(async move {
-            wait_for_terminal(&state_clone, &orphans_clone, Duration::from_millis(50), 200).await;
+            if let Err(e) = wait_for_terminal(&state_clone, &orphans_clone).await {
+                eprintln!("remove failed: {e}");
+                return;
+            }
             let mut guard = state_clone.lock().await;
             for name in &orphans_clone {
                 guard.processes.remove(name);
@@ -2094,13 +2151,13 @@ async fn handle_reload(
         guard.stop_instances(&to_stop);
     }
 
-    // 5b. Wait for the stopped instances to reach a terminal state so the
-    //     replacement spawn isn't racing a still-shutting-down child. Poll
-    //     briefly; the per-process shutdown timeout applies inside each
-    //     controller's lifecycle task, so the outer wait bound just needs to
-    //     exceed the worst-case shutdown.
-    if !to_stop.is_empty() {
-        wait_for_terminal(&state, &to_stop, Duration::from_millis(50), 1200).await;
+    // Wait for actual cleanup, never replace a generation after an arbitrary timeout.
+    if !to_stop.is_empty()
+        && let Err(e) = wait_for_terminal(&state, &to_stop).await
+    {
+        return Response::Error {
+            message: e.to_string(),
+        };
     }
 
     // 5c. Under the lock: drop old changed + orphaned + scaled-down entries
@@ -2114,6 +2171,15 @@ async fn handle_reload(
     //     picks them up in dep order.
     let (n_added, n_changed, n_removed, n_scaled_services, replica_delta, n_renamed) = {
         let mut guard = state.lock().await;
+        if guard.shutdown_requested {
+            return Response::Error {
+                message: "environment is shutting down".into(),
+            };
+        }
+        for name in &to_stop {
+            guard.stopping.remove(name);
+        }
+
         for name in &changed_instances {
             guard.processes.remove(name);
             guard.controllers.remove(name);

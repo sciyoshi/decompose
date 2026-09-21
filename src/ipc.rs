@@ -14,6 +14,13 @@ use crate::model::{ProcessSnapshot, RuntimePaths};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    ForceDown,
+    ShutdownBudget {
+        timeout_seconds: Option<u64>,
+    },
+    StopStatus {
+        services: Vec<String>,
+    },
     Ps,
     Down {
         timeout_seconds: Option<u64>,
@@ -68,6 +75,13 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    ShutdownBudget {
+        seconds: u64,
+    },
+    StopStatus {
+        complete: bool,
+        errors: Vec<String>,
+    },
     Pong {
         pid: u32,
         instance: String,
