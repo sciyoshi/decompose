@@ -76,8 +76,8 @@ impl Env {
         let child = self
             .command(&["up", "--json"])
             .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(fs::File::create(self.path("client.stdout")).unwrap())
+            .stderr(fs::File::create(self.path("client.stderr")).unwrap())
             .spawn()
             .unwrap();
         wait(|| {
@@ -190,7 +190,12 @@ fn foreground_terminal_interrupt_and_term_stop_owned_environment() {
         // Terminal-style group delivery must not kill the daemon directly.
         kill(Pid::from_raw(-(client.id() as i32)), sig).unwrap();
         wait(|| client.try_wait().unwrap().is_some());
-        assert!(client.wait().unwrap().success());
+        let status = client.wait().unwrap();
+        assert!(
+            status.success(),
+            "foreground {sig:?} exited with {status}: {}",
+            fs::read_to_string(env.path("client.stderr")).unwrap()
+        );
         assert!(!alive(worker));
         wait(|| !alive(env.daemon.unwrap()));
     }
