@@ -40,6 +40,8 @@ pub mod ipc;
 pub mod model;
 pub mod output;
 pub mod paths;
+#[cfg(unix)]
+mod process_table;
 mod shutdown;
 pub mod tui;
 pub mod tuning;

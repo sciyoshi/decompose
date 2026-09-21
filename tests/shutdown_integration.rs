@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+mod support;
+use support::process_alive as alive;
+
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -128,14 +131,6 @@ fn wait(mut predicate: impl FnMut() -> bool) {
         );
         sleep(Duration::from_millis(30));
     }
-}
-fn alive(pid: u32) -> bool {
-    let out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
-    out.status.success() && !text.trim().is_empty() && !text.trim().starts_with('Z')
 }
 fn signal(pid: u32, sig: Signal) {
     kill(Pid::from_raw(pid as i32), sig).unwrap();
@@ -473,4 +468,37 @@ fn tui_stays_responsive_and_accepts_force_during_shutdown() {
     assert!(tui.wait().unwrap().success());
     assert!(!alive(worker));
     assert!(!alive(hook));
+}
+
+#[test]
+fn shutdown_needs_no_process_utilities_on_path() {
+    let mut env = Env::new(&CONFIG.replace("exec sh", "exec /bin/sh"));
+    fs::write(
+        env.path("service.sh"),
+        FORKER
+            .replace("sh -c", "/bin/sh -c")
+            .replace("exec sleep", "exec /bin/sleep"),
+    )
+    .unwrap();
+    fs::create_dir(env.path("empty-bin")).unwrap();
+    let out = env
+        .command(&["up", "-d", "--json"])
+        .env("PATH", env.path("empty-bin"))
+        .env("COMPOSE_SHELL", "/bin/sh")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.daemon = Some(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["pid"]
+            .as_u64()
+            .unwrap() as u32,
+    );
+    let worker = env.pidfile("worker.pid");
+    // The daemon inherited an empty PATH, so any internal ps invocation fails.
+    env.run(&["down"]);
+    assert!(!alive(worker));
 }

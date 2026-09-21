@@ -61,34 +61,12 @@ pub(crate) fn signal_group(pgid: u32, signal: i32) -> Result<()> {
     }
 }
 
-/// Zombie descendants are no longer executing and must be reaped by their
-/// new parent. `kill(-pgid, 0)` alone cannot distinguish them from survivors.
+/// Inspect native process state off the async executor. Zombies are finished
+/// even while their new parent has yet to reap them.
 async fn group_alive(pgid: u32) -> Result<bool> {
     #[cfg(unix)]
     {
-        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-        match kill(Pid::from_raw(-(pgid as i32)), None) {
-            Err(Errno::ESRCH) => return Ok(false),
-            Ok(()) => {}
-            Err(e) => return Err(e).context("failed to inspect process group"),
-        }
-        let output = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::process::Command::new("ps")
-                .args(["-A", "-o", "pgid=,stat="])
-                .env("LC_ALL", "C")
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await??;
-        if !output.status.success() {
-            bail!("ps failed while inspecting process group {pgid}");
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-            let mut columns = line.split_whitespace();
-            columns.next().and_then(|s| s.parse::<u32>().ok()) == Some(pgid)
-                && columns.next().is_some_and(|s| !s.starts_with('Z'))
-        }))
+        Ok(tokio::task::spawn_blocking(move || crate::process_table::group_alive(pgid)).await??)
     }
     #[cfg(not(unix))]
     {

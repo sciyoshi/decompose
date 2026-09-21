@@ -1,5 +1,12 @@
 #![cfg(not(windows))]
 
+mod support;
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+use support::process_alive;
+
 use std::fs;
 use std::io::{self, Write};
 use std::net::TcpListener;
@@ -320,12 +327,7 @@ fn ctrl_c_stops_owned_environment() {
     let mut child = up.spawn().expect("spawn attached up");
     thread::sleep(Duration::from_millis(1500));
 
-    let status = Command::new("kill")
-        .arg("-INT")
-        .arg(child.id().to_string())
-        .status()
-        .expect("send ctrl-c");
-    assert!(status.success(), "failed to send SIGINT");
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).expect("send ctrl-c");
 
     let up_exit = child.wait().expect("wait up");
     assert!(up_exit.success(), "up should stop cleanly");
@@ -4945,15 +4947,9 @@ processes:
         .parse()
         .expect("parse pid");
 
-    // Sanity: the grandchild is alive right now (kill -0 returns 0).
-    let alive_before = Command::new("kill")
-        .arg("-0")
-        .arg(child_pid.to_string())
-        .status()
-        .expect("kill -0");
     assert!(
-        alive_before.success(),
-        "grandchild pid {child_pid} should be alive before down"
+        process_alive(child_pid as u32),
+        "grandchild should be alive before down"
     );
 
     let down = run_cmd(
@@ -4971,12 +4967,7 @@ processes:
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut still_alive = true;
     while std::time::Instant::now() < deadline {
-        let status = Command::new("kill")
-            .arg("-0")
-            .arg(child_pid.to_string())
-            .status()
-            .expect("kill -0 after down");
-        if !status.success() {
+        if !process_alive(child_pid as u32) {
             still_alive = false;
             break;
         }
@@ -4986,10 +4977,7 @@ processes:
     if still_alive {
         // Best effort cleanup so the grandchild doesn't outlive the test
         // binary even when we fail.
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(child_pid.to_string())
-            .status();
+        let _ = kill(Pid::from_raw(child_pid), Signal::SIGKILL);
         panic!("grandchild pid {child_pid} survived `down` — process group was not signalled");
     }
 }
@@ -5591,10 +5579,8 @@ fn is_daemon_live_ipc(
     }
 }
 
-/// Observe daemon liveness without generating IPC traffic. Every IPC
-/// request resets the orphan-watchdog clock, so the auto-exit tests need a
-/// zero-touch probe — we read the PID file the daemon writes at startup
-/// and send `kill(pid, 0)` to check whether the process is still alive.
+/// Observe daemon liveness using its PID file and native process state,
+/// independently of whether the IPC server is responsive.
 /// Returns `true` if the PID file exists and the referenced process is
 /// running.
 fn is_daemon_live_no_ipc(state: &Path) -> bool {
@@ -5616,12 +5602,7 @@ fn is_daemon_live_no_ipc(state: &Path) -> bool {
         let Ok(pid) = contents.trim().parse::<i32>() else {
             continue;
         };
-        // `kill -0` on Unix: exit 0 = alive (or permission denied),
-        // non-zero = ESRCH or similar. We want "alive".
-        let status = Command::new("kill").arg("-0").arg(pid.to_string()).status();
-        if let Ok(s) = status
-            && s.success()
-        {
+        if process_alive(pid as u32) {
             return true;
         }
     }
@@ -5748,15 +5729,9 @@ fn attached_up_killed_triggers_daemon_auto_exit() {
 
     // SIGKILL the attached `up` so it can't call down. The `up` process is
     // the declared parent-pid; once it's gone, no further IPC requests
-    // should arrive, and the watchdog should trip. Note: from here on we
-    // must NOT issue IPC against the daemon, because every request resets
-    // the orphan activity clock and defeats the test.
-    let kill_status = Command::new("kill")
-        .arg("-KILL")
-        .arg(child.id().to_string())
-        .status()
-        .expect("send sigkill");
-    assert!(kill_status.success(), "failed to SIGKILL up");
+    // are needed: the watchdog should stop the environment independently
+    // of client activity.
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL).expect("send sigkill");
     let _ = child.wait();
 
     // Grace is 2s, watchdog tick is 1s. Allow generous slack.
@@ -5806,12 +5781,7 @@ fn client_activity_does_not_extend_owner_lifetime() {
     );
 
     // Kill the launching `up` so the daemon is orphaned.
-    let kill_status = Command::new("kill")
-        .arg("-KILL")
-        .arg(child.id().to_string())
-        .status()
-        .expect("send sigkill");
-    assert!(kill_status.success(), "failed to SIGKILL up");
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL).expect("send sigkill");
     let _ = child.wait();
 
     // Polling a dead owner's environment must not keep it alive.
