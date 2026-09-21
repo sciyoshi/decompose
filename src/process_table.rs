@@ -42,17 +42,25 @@ mod platform {
             if group != pgid {
                 continue;
             }
-            let stat = match std::fs::read(entry.path().join("stat")) {
-                Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+            let Some((group, live)) = read_group_stat(&entry.path().join("stat"))? else {
+                continue;
             };
-            let (group, live) = parse_stat(&stat)?;
             if group == pgid && live {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+}
+
+/// A process may disappear before open (ENOENT) or after open but before
+/// procfs produces the stat record (ESRCH). Both mean this member has exited.
+#[cfg(target_os = "linux")]
+fn read_group_stat(path: &std::path::Path) -> io::Result<Option<(i32, bool)>> {
+    match std::fs::read(path) {
+        Ok(stat) => parse_stat(&stat).map(Some),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -165,6 +173,33 @@ mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_tolerates_exit_before_and_after_open() {
+        use std::os::fd::AsRawFd;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let path = std::path::PathBuf::from(format!("/proc/{}/stat", child.id()));
+        let file = std::fs::File::open(&path).unwrap();
+        // Reopen the held inode to deterministically exercise the same ESRCH
+        // as a process being reaped during std::fs::read's open/read window.
+        let held = std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let live = read_group_stat(&held);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(live.unwrap().unwrap().1);
+        assert_eq!(
+            std::fs::read(&held).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_eq!(read_group_stat(&held).unwrap(), None);
+        assert_eq!(read_group_stat(&path).unwrap(), None);
+    }
 
     #[test]
     fn proc_stat_handles_arbitrary_command_names_and_process_states() {
