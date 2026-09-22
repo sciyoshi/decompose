@@ -87,6 +87,62 @@ fn assert_success(output: &Output, context: &str) {
     }
 }
 
+#[test]
+fn daemon_replies_to_invalid_requests_and_remains_responsive() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+
+    let (root, project, runtime, state, _) = setup_project();
+    let home = root.path().join("home");
+    let run = |args: &[&str]| run_cmd(&project, &runtime, &state, &home, args, &[], &[]);
+    assert_success(&run(&["up", "-d"]), "up");
+
+    // Always shut down the test daemon, including when a socket check fails.
+    let checks = std::panic::catch_unwind(|| {
+        let socket = fs::read_dir(runtime.join("decompose"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "sock"))
+            .expect("daemon socket");
+        let request = |payload: &str| {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            writeln!(stream, "{payload}").unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).expect("JSON response")
+        };
+
+        for (payload, detail) in [
+            (r#"{"type":"future_command"}"#, "unknown variant"),
+            ("not json", "expected"),
+            (r#"{"type":"stop"}"#, "missing field"),
+            (r#"{"type":"down","timeout_seconds":-1}"#, "invalid value"),
+        ] {
+            let response = request(payload);
+            assert_eq!(response["type"], "error");
+            let message = response["message"].as_str().expect("error message");
+            assert!(message.contains("invalid request json"), "{message}");
+            assert!(message.contains(detail), "{message}");
+            assert_eq!(request(r#"{"type":"ping"}"#)["type"], "pong");
+        }
+        // Extra fields from newer clients remain accepted on known commands.
+        assert_eq!(
+            request(r#"{"type":"ping","future_field":true}"#)["type"],
+            "pong"
+        );
+    });
+    assert_success(&run(&["down"]), "down after invalid requests");
+    if let Err(panic) = checks {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn spawn_http_ok_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
     let port = listener

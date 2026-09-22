@@ -1537,7 +1537,22 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
         return Ok(());
     }
 
-    let req: Request = serde_json::from_str(line.trim()).context("invalid request json")?;
+    let req: Request = match serde_json::from_str(line.trim()) {
+        Ok(req) => req,
+        Err(err) => {
+            // A newer client may send a command this daemon does not know.
+            // Reply using the stable error envelope instead of dropping the
+            // connection, which hides the reason from the client.
+            let response = Response::Error {
+                message: format!("invalid request json: {err}"),
+            };
+            write_half
+                .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+                .await?;
+            write_half.flush().await?;
+            return Ok(());
+        }
+    };
 
     if state.lock().await.shutdown_requested
         && matches!(
