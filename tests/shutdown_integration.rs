@@ -520,15 +520,8 @@ fn default_pager_launches_directly_without_shell_on_path() {
     let mut env = Env::new("processes:\n  app:\n    command: echo pager-output; exec sleep 120\n");
     env.up();
     wait(|| {
-        fs::read_dir(env.path("state/decompose"))
-            .unwrap()
-            .flatten()
-            .any(|entry| {
-                entry.path().extension().is_some_and(|ext| ext == "log")
-                    && fs::read_to_string(entry.path())
-                        .unwrap()
-                        .contains("pager-output")
-            })
+        let output = env.command(&["logs", "--no-pager"]).output().unwrap();
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("pager-output")
     });
     fs::create_dir(env.path("pager-bin")).unwrap();
     let pager = env.path("pager-bin/less");

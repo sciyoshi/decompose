@@ -37,6 +37,7 @@ pub mod config;
 pub mod daemon;
 pub mod health_probes;
 pub mod ipc;
+mod logs;
 pub mod model;
 pub mod output;
 pub mod paths;
@@ -54,7 +55,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -658,7 +658,7 @@ async fn maybe_print_up_block(
     });
 }
 
-/// Stream the daemon log until the Ctrl-C task fires, then stop the log
+/// Stream service logs until the Ctrl-C task fires, then stop the log
 /// streamer and emit the "detached" marker. Consumes `ctrl_c_task`.
 async fn stream_logs_until_ctrl_c(
     paths: &crate::model::RuntimePaths,
@@ -852,91 +852,32 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
         _ => bail!("no running environment for this project — start one with `decompose up`"),
     };
 
+    let mut reader = crate::logs::Reader::default();
+    let backlog = reader
+        .poll(&paths.daemon_log, &args.processes, args.tail)
+        .await?;
     if args.follow {
-        // Mirror `docker compose logs -f` / `tail -f`: print the existing
-        // backlog first, then stream new output. Read the file once and
-        // remember its length so the follower resumes at exactly the byte
-        // offset where the backlog ended — no drops, no duplicates.
-        //
-        // `args.tail` controls how much backlog to show:
-        //   * None         — all existing lines
-        //   * Some(0)      — explicit opt-out (start streaming from now)
-        //   * Some(n)      — last n filtered lines
-        let skip_backlog = matches!(args.tail, Some(0));
-        let start_offset = match tokio::fs::read(&paths.daemon_log).await {
-            Ok(bytes) => {
-                let len = bytes.len() as u64;
-                if !skip_backlog {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let lines: Vec<&str> = text.lines().collect();
-                    let filtered = filter_log_lines(&lines, &args.processes);
-                    let backlog = match args.tail {
-                        Some(n) => {
-                            let start = filtered.len().saturating_sub(n);
-                            &filtered[start..]
-                        }
-                        None => &filtered[..],
-                    };
-                    // Print directly to stdout (no pager) so the user sees
-                    // backlog immediately and new lines stream in live.
-                    let stdout = std::io::stdout();
-                    let mut out = stdout.lock();
-                    for line in backlog {
-                        let _ = writeln!(out, "{line}");
-                    }
-                    let _ = out.flush();
-                }
-                len
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to read daemon log at {}",
-                        paths.daemon_log.display()
-                    )
-                });
-            }
-        };
-
+        for line in &backlog {
+            println!("{line}");
+        }
+        let _ = std::io::stdout().flush();
         let (log_stop_tx, log_stop_rx) = watch::channel(false);
-        let proc_filter = args.processes.clone();
-        let log_handle = tokio::spawn(stream_filtered_logs(
-            paths.daemon_log.clone(),
+        let mut log_handle = tokio::spawn(stream_filtered_logs(
             paths.clone(),
             log_stop_rx,
-            proc_filter,
-            Some(start_offset),
+            args.processes,
+            reader,
         ));
-        ctrl_c().await.context("failed to listen for Ctrl-C")?;
-        let _ = log_stop_tx.send(true);
-        let _ = log_handle.await;
+        tokio::select! {
+            result = &mut log_handle => result??,
+            signal = ctrl_c() => {
+                signal.context("failed to listen for Ctrl-C")?;
+                let _ = log_stop_tx.send(true);
+                log_handle.await??;
+            }
+        }
     } else {
-        let content = match tokio::fs::read_to_string(&paths.daemon_log).await {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // No log file yet — treat as empty (daemon just started).
-                String::new()
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to read daemon log at {}",
-                        paths.daemon_log.display()
-                    )
-                });
-            }
-        };
-        let lines: Vec<&str> = content.lines().collect();
-        let filtered = filter_log_lines(&lines, &args.processes);
-        let output: &[&str] = match args.tail {
-            Some(n) => {
-                let start = filtered.len().saturating_sub(n);
-                &filtered[start..]
-            }
-            None => &filtered[..],
-        };
-        if output.is_empty() {
+        if backlog.is_empty() {
             if args.processes.is_empty() {
                 eprintln!("(no log output yet)");
             } else {
@@ -946,7 +887,8 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
                 );
             }
         }
-        write_logs_maybe_paged(output, args.no_pager);
+        let lines: Vec<&str> = backlog.iter().map(String::as_str).collect();
+        write_logs_maybe_paged(&lines, args.no_pager);
     }
 
     Ok(())
@@ -1578,83 +1520,53 @@ fn is_no_daemon_error(err: &anyhow::Error, paths: &crate::model::RuntimePaths) -
     false
 }
 
-/// Read new bytes appended to `log_path` since `offset`, returning the updated
-/// offset.  Returns `None` when the file hasn't grown (or doesn't exist yet).
-async fn read_new_log_bytes(log_path: &std::path::Path, offset: &mut u64) -> Option<Vec<u8>> {
-    let meta = tokio::fs::metadata(log_path).await.ok()?;
-    let len = meta.len();
-    if len < *offset {
-        *offset = 0;
-    }
-    if len <= *offset {
-        return None;
-    }
-    let mut file = tokio::fs::File::open(log_path).await.ok()?;
-    file.seek(std::io::SeekFrom::Start(*offset)).await.ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await.ok()?;
-    *offset += buf.len() as u64;
-    if buf.is_empty() { None } else { Some(buf) }
-}
-
 async fn stream_daemon_logs(
     log_path: std::path::PathBuf,
     mut stop_rx: watch::Receiver<bool>,
     start_at_end: bool,
 ) {
-    let mut offset = match tokio::fs::metadata(&log_path).await {
-        Ok(meta) if start_at_end => meta.len(),
-        Ok(_) => 0,
-        Err(_) => 0,
-    };
-
+    let mut reader = crate::logs::Reader::default();
+    if start_at_end && let Err(error) = reader.poll(&log_path, &[], Some(0)).await {
+        eprintln!("failed to read logs: {error}");
+    }
     loop {
+        match reader.poll(&log_path, &[], None).await {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Err(error) => {
+                eprintln!("failed to read logs: {error}");
+                return;
+            }
+        }
+        let _ = std::io::stdout().flush();
         if *stop_rx.borrow() {
             break;
         }
-
-        if let Some(buf) = read_new_log_bytes(&log_path, &mut offset).await {
-            let text = String::from_utf8_lossy(&buf);
-            print!("{text}");
-            let _ = std::io::stdout().flush();
-        }
-
         tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    break;
-                }
-            }
-            _ = sleep(Duration::from_millis(100)) => {}
+            _ = stop_rx.changed() => {},
+            _ = sleep(Duration::from_millis(100)) => {},
         }
     }
 }
 
 async fn stream_filtered_logs(
-    log_path: std::path::PathBuf,
     paths: crate::model::RuntimePaths,
     mut stop_rx: watch::Receiver<bool>,
     processes: Vec<String>,
-    // `Some(offset)` starts tailing at the given byte offset (used after a
-    // backlog print so we resume exactly where that read ended). `None`
-    // preserves the old behaviour of starting at the current end-of-file.
-    start_offset: Option<u64>,
-) {
-    let mut offset = match start_offset {
-        Some(off) => off,
-        None => match tokio::fs::metadata(&log_path).await {
-            Ok(meta) => meta.len(),
-            Err(_) => 0,
-        },
-    };
-    let mut poll_counter: u32 = 0;
-
+    mut reader: crate::logs::Reader,
+) -> Result<()> {
+    let mut poll_counter = 0u32;
     loop {
+        for line in reader.poll(&paths.daemon_log, &processes, None).await? {
+            println!("{line}");
+        }
+        let _ = std::io::stdout().flush();
         if *stop_rx.borrow() {
             break;
         }
-
-        // Periodically check if filtered processes have all exited
         if !processes.is_empty() {
             poll_counter += 1;
             if poll_counter.is_multiple_of(10)
@@ -1674,26 +1586,12 @@ async fn stream_filtered_logs(
                 }
             }
         }
-
-        if let Some(buf) = read_new_log_bytes(&log_path, &mut offset).await {
-            let text = String::from_utf8_lossy(&buf);
-            let lines: Vec<&str> = text.lines().collect();
-            let filtered = filter_log_lines(&lines, &processes);
-            for line in filtered {
-                println!("{line}");
-            }
-            let _ = std::io::stdout().flush();
-        }
-
         tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    break;
-                }
-            }
-            _ = sleep(Duration::from_millis(100)) => {}
+            _ = stop_rx.changed() => {},
+            _ = sleep(Duration::from_millis(100)) => {},
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

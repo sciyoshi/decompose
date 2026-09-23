@@ -6727,3 +6727,106 @@ processes:
     );
     assert_success(&down2, "down session 2");
 }
+
+#[test]
+fn structured_logs_isolate_replicas_and_drain_long_unterminated_output() {
+    let (root, project, runtime, state, config) = setup_project();
+    let home = root.path().join("home");
+    let payload = format!("{}\nEND_LONG\n", "é".repeat(70_000));
+    fs::write(project.join("payload"), &payload).unwrap();
+    fs::write(
+        &config,
+        r#"
+processes:
+  alpha:
+    replicas: 2
+    command: "echo READY; cat payload; echo ERR >&2; printf FINAL; sleep 30"
+    ready_log_line: READY
+  beta:
+    command: "echo BETA_ONLY; sleep 30"
+"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| run_cmd(&project, &runtime, &state, &home, args, &[], &[]);
+    assert_success(&run(&["up", "-d", "--wait"]), "up");
+    let checks = std::panic::catch_unwind(|| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let logs = run(&["logs", "--no-pager", "alpha[1]"]);
+            assert_success(&logs, "replica logs");
+            let text = String::from_utf8_lossy(&logs.stdout);
+            assert!(!text.contains("BETA_ONLY"));
+            assert!(
+                !text.contains("[alpha"),
+                "single replica strips display prefix"
+            );
+            if text.contains("END_LONG") && text.contains("ERR") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing replica output"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let logs = run(&["logs", "--no-pager", "beta"]);
+        assert_success(&logs, "beta logs");
+        assert_eq!(String::from_utf8_lossy(&logs.stdout), "BETA_ONLY\n");
+    });
+    assert_success(&run(&["down"]), "down drains final output");
+    if let Err(panic) = checks {
+        std::panic::resume_unwind(panic);
+    }
+
+    let state_root = state.join("decompose");
+    let diagnostic = fs::read_dir(&state_root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "log"))
+        .unwrap();
+    let diagnostics = fs::read_to_string(&diagnostic).unwrap();
+    assert!(!diagnostics.contains("END_LONG"));
+    assert!(!diagnostics.contains("BETA_ONLY"));
+    let log_dir = diagnostic.with_extension("").join("logs");
+    let mut files = 0;
+    for entry in fs::read_dir(log_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        files += 1;
+        let contents = fs::read_to_string(&path).unwrap();
+        let records: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(records.iter().all(|r| r.get("seq").is_none()));
+        assert!(
+            records
+                .iter()
+                .all(|r| humantime::parse_rfc3339(r["timestamp"].as_str().unwrap()).is_ok())
+        );
+        let service = records[0]["service"].as_str().unwrap();
+        let replica = records[0]["replica"].as_u64().unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|r| r["service"] == service && r["replica"] == replica)
+        );
+        if service == "alpha" {
+            assert!(records.iter().any(|r| r["partial"] == true));
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r["stream"] == "stderr" && r["message"] == "ERR")
+            );
+            let stdout: String = records
+                .iter()
+                .filter(|r| r["stream"] == "stdout")
+                .map(|r| r["message"].as_str().unwrap())
+                .collect();
+            assert_eq!(stdout, format!("READY{}END_LONGFINAL", "é".repeat(70_000)));
+        }
+    }
+    assert_eq!(files, 3, "one output file per replica");
+}

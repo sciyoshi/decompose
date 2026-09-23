@@ -156,6 +156,7 @@ pub(crate) struct DaemonState {
     stop_versions: BTreeMap<String, u64>,
     stop_errors: BTreeMap<String, String>,
     force_shutdown: Arc<AtomicBool>,
+    logs: Arc<crate::logs::Store>,
 }
 
 impl DaemonState {
@@ -493,6 +494,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         stop_versions: BTreeMap::new(),
         stop_errors: BTreeMap::new(),
         force_shutdown: Arc::new(AtomicBool::new(false)),
+        logs: Arc::new(crate::logs::Store::new(&paths.daemon_log)?),
     }));
 
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -814,12 +816,20 @@ async fn start_process(name: String, state: SharedState) {
     })
     .await;
 
-    attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
+    let output_tasks = attach_output_readers(
+        &mut child,
+        &name_handle,
+        &spec,
+        ready_pattern,
+        state.clone(),
+    )
+    .await;
 
     tokio::spawn(process_lifecycle(
         name_handle,
         spec,
         child,
+        output_tasks,
         kill_rx,
         state.clone(),
     ));
@@ -906,6 +916,7 @@ async fn mark_failed_to_start(
 ) {
     let name = crate::model::read_name(name_handle);
     eprintln!("[{name}] {err:#}");
+    write_process_event(state, name_handle, &format!("{err:#}")).await;
     with_process_mut(state, name_handle, |runtime| {
         runtime.status = ProcessStatus::FailedToStart {
             reason: format!("{err:#}"),
@@ -1066,10 +1077,7 @@ fn exit_reason_from_status(status: &std::process::ExitStatus) -> ExitReason {
     ExitReason::Code(-1)
 }
 
-/// Format the separator line that is written to the daemon log between
-/// consecutive runs of a process. The line is already prefixed with
-/// `[name]` so that `decompose logs <name>` filtering picks it up,
-/// matching the format the stdout/stderr readers emit.
+/// Format the human-readable separator between consecutive process runs.
 fn format_restart_separator(
     name: &str,
     reason: ExitReason,
@@ -1138,12 +1146,19 @@ async fn process_lifecycle(
     name_handle: crate::model::NameHandle,
     mut spec: crate::model::ProcessInstanceSpec,
     mut child: tokio::process::Child,
+    mut output_tasks: Vec<tokio::task::JoinHandle<()>>,
     mut kill_rx: watch::Receiver<bool>,
     state: SharedState,
 ) {
     loop {
         let (final_status, exit_reason) =
             wait_for_child_exit(&name_handle, &spec, &mut child, &mut kill_rx, &state).await;
+
+        // Descendant cleanup has closed the pipes; drain their final output
+        // before restarting or marking the controller complete.
+        for task in output_tasks.drain(..) {
+            let _ = task.await;
+        }
 
         let should_restart = apply_restart_decision(&name_handle, &state, final_status).await;
         if !should_restart {
@@ -1153,11 +1168,8 @@ async fn process_lifecycle(
             break;
         }
 
-        // Emit a separator line into the daemon log so that humans (and
-        // `decompose logs svc`) can visually distinguish the previous run
-        // from the next attempt. The separator flows through the same
-        // stdout stream the child line-readers use, so name-prefix
-        // filtering picks it up unchanged.
+        // Persist the restart separator as a lifecycle event in this
+        // replica's log, after draining the previous run's output.
         if let Some(reason) = exit_reason {
             let (attempt, max) = with_process(&state, &name_handle, |r| {
                 (r.restart_count, r.spec.max_restarts)
@@ -1165,7 +1177,9 @@ async fn process_lifecycle(
             .await
             .unwrap_or((0, None));
             let name = crate::model::read_name(&name_handle);
-            println!("{}", format_restart_separator(&name, reason, attempt, max));
+            let line = format_restart_separator(&name, reason, attempt, max);
+            let message = line.strip_prefix(&format!("[{name}] ")).unwrap_or(&line);
+            write_process_event(&state, &name_handle, message).await;
         }
 
         // Backoff delay. Look up the current spec under the lock, since a
@@ -1224,68 +1238,126 @@ async fn process_lifecycle(
 
         let ready_pattern: Option<Regex> =
             spec.ready_log_line.as_deref().map(compile_ready_pattern);
-        attach_output_readers(&mut child, &name_handle, ready_pattern, state.clone());
+        output_tasks = attach_output_readers(
+            &mut child,
+            &name_handle,
+            &spec,
+            ready_pattern,
+            state.clone(),
+        )
+        .await;
     }
 }
 
-/// Spawn tasks that read lines from the child's stdout and stderr pipes,
-/// printing them with a `[name]` prefix and optionally matching a
-/// `ready_log_line` regex to set the `log_ready` flag on the process runtime.
-fn attach_output_readers(
+/// Persist process events alongside output so service filtering keeps them.
+async fn write_process_event(
+    state: &SharedState,
+    handle: &crate::model::NameHandle,
+    message: &str,
+) {
+    let (logs, identity) = {
+        let guard = state.lock().await;
+        let name = crate::model::read_name(handle);
+        (
+            guard.logs.clone(),
+            guard
+                .processes
+                .get(&name)
+                .map(|r| (r.spec.base_name.clone(), r.spec.replica)),
+        )
+    };
+    if let Some((base, replica)) = identity {
+        let name = crate::model::read_name(handle);
+        let message = message.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            logs.writer(&base, replica)?
+                .lock()
+                .unwrap()
+                .write(&name, "event", &message, false)
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            eprintln!("failed to write service log event: {result:?}");
+        }
+    }
+}
+
+/// Each replica owns a writer shared only by its stdout/stderr readers.
+async fn attach_output_readers(
     child: &mut tokio::process::Child,
     name_handle: &crate::model::NameHandle,
+    spec: &crate::model::ProcessInstanceSpec,
     ready_pattern: Option<Regex>,
     state: SharedState,
-) {
-    let log_ready_flag = Arc::new(AtomicBool::new(false));
-
-    if let Some(stdout) = child.stdout.take() {
-        let handle = name_handle.clone();
-        let pattern = ready_pattern.clone();
-        let flag = log_ready_flag.clone();
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let proc_name = crate::model::read_name(&handle);
-                println!("[{proc_name}] {line}");
-                if let Some(ref re) = pattern
-                    && !flag.load(Ordering::Relaxed)
-                    && re.is_match(&line)
-                {
-                    flag.store(true, Ordering::Relaxed);
-                    with_process_mut(&state_clone, &handle, |runtime| {
-                        runtime.log_ready = true;
-                    })
-                    .await;
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let logs = state.lock().await.logs.clone();
+    let writer = match logs.writer(&spec.base_name, spec.replica) {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            eprintln!("cannot open log for {}: {error}", spec.name);
+            None
+        }
+    };
+    let flag = Arc::new(AtomicBool::new(false));
+    let streams: Vec<(&str, std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>)> = child
+        .stdout
+        .take()
+        .map(|s| {
+            (
+                "stdout",
+                Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            )
+        })
+        .into_iter()
+        .chain(child.stderr.take().map(|s| {
+            (
+                "stderr",
+                Box::pin(s) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+            )
+        }))
+        .collect();
+    streams
+        .into_iter()
+        .map(|(stream, pipe)| {
+            let writer = writer.clone();
+            let handle = name_handle.clone();
+            let pattern = ready_pattern.clone();
+            let flag = flag.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut chunks = crate::logs::Chunks::new(BufReader::new(pipe));
+                let mut reported_error = false;
+                loop {
+                    let (line, partial) = match chunks.next().await {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(error) => {
+                            eprintln!("failed reading {stream}: {error}");
+                            break;
+                        }
+                    };
+                    if let Some(ref re) = pattern
+                        && !flag.load(Ordering::Relaxed)
+                        && re.is_match(&line)
+                    {
+                        flag.store(true, Ordering::Relaxed);
+                        with_process_mut(&state, &handle, |r| r.log_ready = true).await;
+                    }
+                    if let Some(writer) = writer.clone() {
+                        let name = crate::model::read_name(&handle);
+                        let result = tokio::task::spawn_blocking(move || {
+                            writer.lock().unwrap().write(&name, stream, &line, partial)
+                        })
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) && !reported_error {
+                            eprintln!("failed writing service output: {result:?}");
+                            reported_error = true;
+                        }
+                    }
                 }
-            }
-        });
-    }
-
-    if let Some(stderr) = child.stderr.take() {
-        let handle = name_handle.clone();
-        let pattern = ready_pattern;
-        let flag = log_ready_flag;
-        let state_clone = state;
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let proc_name = crate::model::read_name(&handle);
-                eprintln!("[{proc_name}] {line}");
-                if let Some(ref re) = pattern
-                    && !flag.load(Ordering::Relaxed)
-                    && re.is_match(&line)
-                {
-                    flag.store(true, Ordering::Relaxed);
-                    with_process_mut(&state_clone, &handle, |runtime| {
-                        runtime.log_ready = true;
-                    })
-                    .await;
-                }
-            }
-        });
-    }
+            })
+        })
+        .collect()
 }
 
 /// Build a shell command for executing a user-supplied command string.

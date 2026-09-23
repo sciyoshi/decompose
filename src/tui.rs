@@ -1,8 +1,8 @@
 //! Preliminary TUI for `decompose up --tui`.
 //!
 //! Two-pane layout: process list on top, interleaved log stream on bottom.
-//! Polls the daemon for process snapshots via IPC and tails the daemon log
-//! file directly (same file `decompose logs` reads). Mouse capture is
+//! Polls the daemon for process snapshots via IPC and tails service log
+//! files directly (same reader `decompose logs` uses). Mouse capture is
 //! intentionally off so native terminal drag-select still works.
 
 use std::collections::VecDeque;
@@ -25,8 +25,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::time::{Instant, interval};
 
 use crate::ipc::{Request, Response, send_request};
@@ -119,7 +117,7 @@ struct App {
     list_state: ListState,
     focus: Focus,
     logs: VecDeque<LogLine>,
-    log_offset: u64,
+    log_reader: crate::logs::Reader,
     /// When true, the log view snaps to the bottom on each new line. Flipped
     /// off when the user scrolls up, back on when they hit End.
     follow: bool,
@@ -145,7 +143,7 @@ impl App {
             list_state: ListState::default(),
             focus: Focus::List,
             logs: VecDeque::with_capacity(BUFFER_CAP),
-            log_offset: 0,
+            log_reader: crate::logs::Reader::default(),
             follow: true,
             log_scrollback: 0,
             status_message: None,
@@ -368,52 +366,20 @@ async fn run_app(term: &mut Term, paths: RuntimePaths) -> Result<()> {
     Ok(())
 }
 
-/// Max bytes to read from the tail of the log file at startup. 256 KiB is
-/// plenty for ~500 colourful lines — more than enough context without
-/// slowing the first render on a long-lived daemon whose log ran to MB.
-const PRELOAD_TAIL_BYTES: u64 = 256 * 1024;
-
-/// Max lines from the preload window to actually push into the buffer.
-/// Well under BUFFER_CAP so users still have headroom for live tail.
-const PRELOAD_LINES: usize = 500;
-
-/// Load recent lines from the end of the daemon log so the TUI opens with
-/// context instead of an empty pane. Skips a partial first line when the
-/// tail window starts mid-line. Advances `log_offset` to end-of-file so
-/// the regular poll loop picks up from exactly where we stopped.
+/// Open with recent context, retaining reader positions for the live tail.
 async fn preload_log_tail(app: &mut App) {
-    let path = app.paths.daemon_log.clone();
-    let Ok(meta) = tokio::fs::metadata(&path).await else {
-        return;
-    };
-    let len = meta.len();
-    let start = len.saturating_sub(PRELOAD_TAIL_BYTES);
-    let Ok(mut file) = File::open(&path).await else {
-        app.log_offset = len;
-        return;
-    };
-    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        app.log_offset = len;
-        return;
-    }
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    if file.read_to_end(&mut buf).await.is_err() {
-        app.log_offset = len;
-        return;
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<&str> = text.lines().collect();
-    // Drop the leading partial line if we started mid-file.
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0);
-    }
-    let skip = lines.len().saturating_sub(PRELOAD_LINES);
-    for line in lines.iter().skip(skip) {
-        if !line.is_empty() {
-            app.push_log_line(line);
+    match app
+        .log_reader
+        .poll(&app.paths.daemon_log, &[], Some(500))
+        .await
+    {
+        Ok(lines) => {
+            for line in lines {
+                app.push_log_line(&line);
+            }
         }
+        Err(error) => app.set_status(format!("failed to read logs: {error}")),
     }
-    app.log_offset = len;
 }
 
 async fn refresh_processes(app: &mut App) {
@@ -443,42 +409,17 @@ async fn refresh_processes(app: &mut App) {
 }
 
 async fn poll_log(app: &mut App) {
-    let path = &app.paths.daemon_log;
-    let meta = match tokio::fs::metadata(path).await {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    let len = meta.len();
-    if len < app.log_offset {
-        // File was truncated (daemon restart): reset to start.
-        app.log_offset = 0;
-    }
-    if len == app.log_offset {
-        return;
-    }
-    let mut file = match File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    if file
-        .seek(std::io::SeekFrom::Start(app.log_offset))
+    match app
+        .log_reader
+        .poll(&app.paths.daemon_log, &[], Some(BUFFER_CAP))
         .await
-        .is_err()
     {
-        return;
-    }
-    let mut buf = Vec::with_capacity((len - app.log_offset) as usize);
-    if file.read_to_end(&mut buf).await.is_err() {
-        return;
-    }
-    app.log_offset += buf.len() as u64;
-    let text = String::from_utf8_lossy(&buf);
-    for raw in text.split_inclusive('\n') {
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
-        if line.is_empty() {
-            continue;
+        Ok(lines) => {
+            for line in lines {
+                app.push_log_line(&line);
+            }
         }
-        app.push_log_line(line);
+        Err(error) => app.set_status(format!("failed to read logs: {error}")),
     }
     if app.follow {
         app.log_scrollback = 0;

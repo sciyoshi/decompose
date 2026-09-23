@@ -238,6 +238,35 @@ decompose logs -n 100 web
 decompose logs -f api worker
 ```
 
+Service output is stored as JSONL under
+`$XDG_STATE_HOME/decompose/<instance>/logs/` (default:
+`~/.local/state/decompose/<instance>/logs/`). Each replica has its own files,
+with a readable service prefix, a hash of the service name, and a replica
+index. The identity stays the same when scaling changes the display name
+from `api` to `api[1]`. Small `.meta.json` files let readers select services
+without scanning unrelated output.
+
+Records contain a UTC `timestamp` formatted with nanoseconds, `service`, `replica`,
+display `name`, `stream` (`stdout`, `stderr`, or lifecycle `event`), `message`,
+and `partial`. Combined output merges available records by capture timestamp;
+equal timestamps use a stable file-order tie-breaker. There is no global
+sequence counter or guaranteed ordering between independent processes.
+
+Output is split at 64 KiB of input, keeping UTF-8 characters intact. Oversized
+lines appear as multiple display lines; `partial: true` marks size-limited
+chunks. Invalid UTF-8 is replaced for display. Readiness regexes match each
+chunk individually. Readers retain incomplete JSON records between polls.
+Each replica retains at most four 10 MiB files (40 MiB total); older generations
+are deleted. A follower that falls behind retention cannot recover deleted
+output. Logs reset when a new daemon starts, but survive individual service
+restarts and reloads.
+
+Daemon diagnostics remain separate in `<instance>.log`, reset at daemon
+startup. CLI and TUI output remains human-readable. The new CLI can still
+read an older daemon's combined text log. **On-disk compatibility:** older
+CLIs and scripts reading `<instance>.log` cannot read the new service logs;
+upgrade those readers before starting a daemon with this storage format.
+
 ### Multi-file configuration
 
 ```bash
