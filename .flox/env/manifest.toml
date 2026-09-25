@@ -18,7 +18,8 @@ runtime-packages = ["glibc", "gcc-runtime", "libiconv"]
 command = '''
   set -euo pipefail
   cargo build --release --locked
-  install -Dm755 target/release/decompose "$out/bin/decompose"
+  mkdir -p "$out/bin"
+  install -m755 target/release/decompose "$out/bin/decompose"
   mkdir -p "$out/share/bash-completion/completions" \
     "$out/share/zsh/site-functions" "$out/share/fish/vendor_completions.d"
   "$out/bin/decompose" completion bash > "$out/share/bash-completion/completions/decompose"

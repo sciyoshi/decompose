@@ -54,7 +54,7 @@
     },
     "build": {
       "decompose": {
-        "command": "  set -euo pipefail\n  cargo build --release --locked\n  install -Dm755 target/release/decompose \"$out/bin/decompose\"\n  mkdir -p \"$out/share/bash-completion/completions\" \\\n    \"$out/share/zsh/site-functions\" \"$out/share/fish/vendor_completions.d\"\n  \"$out/bin/decompose\" completion bash > \"$out/share/bash-completion/completions/decompose\"\n  \"$out/bin/decompose\" completion zsh > \"$out/share/zsh/site-functions/_decompose\"\n  \"$out/bin/decompose\" completion fish > \"$out/share/fish/vendor_completions.d/decompose.fish\"\n",
+        "command": "  set -euo pipefail\n  cargo build --release --locked\n  mkdir -p \"$out/bin\"\n  install -m755 target/release/decompose \"$out/bin/decompose\"\n  mkdir -p \"$out/share/bash-completion/completions\" \\\n    \"$out/share/zsh/site-functions\" \"$out/share/fish/vendor_completions.d\"\n  \"$out/bin/decompose\" completion bash > \"$out/share/bash-completion/completions/decompose\"\n  \"$out/bin/decompose\" completion zsh > \"$out/share/zsh/site-functions/_decompose\"\n  \"$out/bin/decompose\" completion fish > \"$out/share/fish/vendor_completions.d/decompose.fish\"\n",
         "runtime-packages": [
           "glibc",
           "gcc-runtime",
