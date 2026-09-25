@@ -80,7 +80,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-flox:
-    name: Publish Flox (${{ matrix.system }})
+    name: Publish Flox (${{ matrix.org }}, ${{ matrix.system }})
     needs: create-release
     environment: flox
     permissions:
@@ -88,6 +88,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        org: [sciyoshi, fellowapp]
+        system: [aarch64-darwin, x86_64-darwin, aarch64-linux, x86_64-linux]
         include:
           - system: aarch64-darwin
             os: macos-15
@@ -99,6 +101,7 @@ jobs:
             os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     env:
+      FLOX_ORG: ${{ matrix.org }}
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +123,7 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           test "$RELEASE_TAG" = "v$version"
       - name: Publish to Flox
-        run: flox publish --org sciyoshi decompose
+        run: flox publish --org "$FLOX_ORG" decompose
         env:
           FLOX_FLOXHUB_TOKEN: ${{ secrets.FLOX_FLOXHUB_TOKEN }}
       - name: Verify published package
@@ -134,7 +137,7 @@ jobs:
           # Other platforms may still be publishing in parallel.
           printf 'schema-version = "1.17.0"\n[options]\nsystems = ["%s"]\n' \
             "$TARGET_SYSTEM" > "$verify_dir/.flox/env/manifest.toml"
-          flox install --dir "$verify_dir" "sciyoshi/decompose@${RELEASE_TAG#v}"
+          flox install --dir "$verify_dir" "$FLOX_ORG/decompose@${RELEASE_TAG#v}"
           actual=$(flox activate --dir "$verify_dir" -- decompose --version)
           test "$actual" = "decompose ${RELEASE_TAG#v}"
 

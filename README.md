@@ -60,17 +60,18 @@ inputs.decompose.url = "github:sciyoshi/decompose";
 
 The flake also exposes a `devShell` for contributors — `nix develop` drops you into a shell with `cargo`, `rustc`, `rustfmt`, and `clippy` pinned.
 
-### With Flox (personal catalog)
+### With Flox
 
-When authenticated as `sciyoshi`, install the published package into a Flox
-environment:
+Members of the `fellowapp` FloxHub organization can install the published
+package into a Flox environment:
 
 ```bash
-flox install sciyoshi/decompose
+flox install fellowapp/decompose
 ```
 
-Personal catalog packages are only accessible to their owner. Releases publish
-Flox packages for ARM64 and x64 on both macOS and Linux.
+Releases publish to both `fellowapp/decompose` and `sciyoshi/decompose` for
+ARM64 and x64 on both macOS and Linux. The personal `sciyoshi` catalog is
+only accessible to its owner.
 
 To build and publish a new version from this repository:
 
@@ -78,12 +79,15 @@ To build and publish a new version from this repository:
 flox build decompose
 # Commit and push all build inputs before publishing.
 flox publish --org sciyoshi decompose
+flox publish --org fellowapp decompose
 ```
 
 Flox reads the package version from `Cargo.toml` and publishes for the host
-platform. The release workflow runs on all four platforms when a version tag
-is pushed, then installs each published package to verify it. CI authenticates
-with the `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub `flox` environment.
+platform. The release workflow runs for both catalogs on all four platforms
+when a version tag is pushed, then installs each published package to verify it.
+CI authenticates with the `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub
+`flox` environment.
+The token must have publishing access to both catalogs.
 The workflow can also be dispatched manually with an existing release tag.
 For packaging-only corrections after a release, its optional `flox-source-ref`
 input selects a pushed source revision for Flox; its package version must still
