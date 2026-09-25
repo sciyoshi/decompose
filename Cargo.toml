@@ -1,6 +1,6 @@
 [package]
 name = "decompose"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Samuel Cormier-Iijima <samuel@cormier-iijima.com>"]
@@ -13,6 +13,7 @@ readme = "README.md"
 keywords = ["process", "orchestration", "compose", "daemon", "devtools"]
 categories = ["development-tools", "command-line-utilities"]
 exclude = [
+    "/.flox",
     "/.github",
     "/.claude",
     "/.cursor",

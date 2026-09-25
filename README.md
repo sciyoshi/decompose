@@ -60,6 +60,30 @@ inputs.decompose.url = "github:sciyoshi/decompose";
 
 The flake also exposes a `devShell` for contributors — `nix develop` drops you into a shell with `cargo`, `rustc`, `rustfmt`, and `clippy` pinned.
 
+### With Flox (personal catalog)
+
+When authenticated as `sciyoshi`, install the published package into a Flox
+environment:
+
+```bash
+flox install sciyoshi/decompose
+```
+
+Personal catalog packages are only accessible to their owner. The initial
+Flox publication supports macOS Apple Silicon (`aarch64-darwin`).
+
+To build and publish a new version from this repository:
+
+```bash
+flox build decompose
+# Commit and push all build inputs before publishing.
+flox publish --org sciyoshi decompose
+```
+
+Flox reads the package version from `Cargo.toml` and publishes for the host
+platform. Repeat publishing on each additional platform to make it available
+there.
+
 ### From source
 
 ```bash

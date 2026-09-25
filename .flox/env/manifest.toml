@@ -1,0 +1,27 @@
+schema-version = "1.17.0"
+
+[install]
+cargo.pkg-path = "cargo"
+pkg-config.pkg-path = "pkg-config"
+rustc.pkg-path = "rustc"
+clang.pkg-path = "clang"
+
+[build.decompose]
+description = "A process orchestrator for local development"
+version.command = "sed -n 's/^version = \"\\(.*\\)\"/\\1/p' Cargo.toml"
+# Cargo downloads the dependencies pinned in Cargo.lock.
+sandbox = "off"
+runtime-packages = []
+command = '''
+  set -euo pipefail
+  cargo build --release --locked
+  install -Dm755 target/release/decompose "$out/bin/decompose"
+  mkdir -p "$out/share/bash-completion/completions" \
+    "$out/share/zsh/site-functions" "$out/share/fish/vendor_completions.d"
+  "$out/bin/decompose" completion bash > "$out/share/bash-completion/completions/decompose"
+  "$out/bin/decompose" completion zsh > "$out/share/zsh/site-functions/_decompose"
+  "$out/bin/decompose" completion fish > "$out/share/fish/vendor_completions.d/decompose.fish"
+'''
+
+[options]
+systems = ["aarch64-darwin", "x86_64-darwin", "aarch64-linux", "x86_64-linux"]
