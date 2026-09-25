@@ -127,9 +127,13 @@ jobs:
         shell: bash
         env:
           FLOX_FLOXHUB_TOKEN: ${{ secrets.FLOX_FLOXHUB_TOKEN }}
+          TARGET_SYSTEM: ${{ matrix.system }}
         run: |
           verify_dir=$(mktemp -d)
           flox init --dir "$verify_dir" --bare --no-auto-setup
+          # Other platforms may still be publishing in parallel.
+          printf 'schema-version = "1.17.0"\n[options]\nsystems = ["%s"]\n' \
+            "$TARGET_SYSTEM" > "$verify_dir/.flox/env/manifest.toml"
           flox install --dir "$verify_dir" "sciyoshi/decompose@${RELEASE_TAG#v}"
           actual=$(flox activate --dir "$verify_dir" -- decompose --version)
           test "$actual" = "decompose ${RELEASE_TAG#v}"
