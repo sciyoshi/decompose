@@ -3280,7 +3280,7 @@ fn up_creates_directories_and_files_with_restrictive_perms() {
 }
 
 // ---------------------------------------------------------------------------
-// Config-reload integration tests (bd decompose-rn2)
+// Config-reload integration tests
 //
 // These exercise the Reload IPC + reconcile loop via the `up` CLI entry
 // point: when `up` runs against a live daemon it sends `Reload` before
@@ -6135,7 +6135,7 @@ fn completion_rejects_unknown_shell() {
 }
 
 // ---------------------------------------------------------------------------
-// Disabled-flag integration tests (bd decompose-yxg)
+// Disabled-flag integration tests
 //
 // These pin down the end-to-end behaviour of the `disabled: true` YAML flag:
 //   - `up` must skip disabled services (supervisor filter in daemon.rs).
@@ -6146,7 +6146,7 @@ fn completion_rejects_unknown_shell() {
 //
 // Several of these tests assert *current* behaviour rather than ideal
 // behaviour; see the inline comments for the surprises that motivated
-// follow-up beads.
+// follow-up work.
 // ---------------------------------------------------------------------------
 
 /// Helper: find the named process's entry in a `ps --json` payload and return
