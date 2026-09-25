@@ -10,6 +10,10 @@ on:
         description: Tag to release, for example v0.2.6
         required: true
         type: string
+      flox-source-ref:
+        description: Optional Flox packaging fix ref (must retain the release version)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -99,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.flox-source-ref || env.RELEASE_TAG }}
           # Flox verifies that the source revision exists on the remote.
           fetch-depth: 0
       - uses: flox/install-flox-action@v2

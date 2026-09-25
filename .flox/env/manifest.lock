@@ -9,6 +9,34 @@
       "clang": {
         "pkg-path": "clang"
       },
+      "gcc-runtime": {
+        "pkg-path": "gcc-unwrapped",
+        "systems": [
+          "aarch64-linux",
+          "x86_64-linux"
+        ],
+        "outputs": [
+          "lib",
+          "libgcc"
+        ]
+      },
+      "glibc": {
+        "pkg-path": "glibc",
+        "systems": [
+          "aarch64-linux",
+          "x86_64-linux"
+        ],
+        "outputs": [
+          "out"
+        ]
+      },
+      "libiconv": {
+        "pkg-path": "libiconv",
+        "systems": [
+          "aarch64-darwin",
+          "x86_64-darwin"
+        ]
+      },
       "pkg-config": {
         "pkg-path": "pkg-config"
       },
@@ -27,7 +55,11 @@
     "build": {
       "decompose": {
         "command": "  set -euo pipefail\n  cargo build --release --locked\n  install -Dm755 target/release/decompose \"$out/bin/decompose\"\n  mkdir -p \"$out/share/bash-completion/completions\" \\\n    \"$out/share/zsh/site-functions\" \"$out/share/fish/vendor_completions.d\"\n  \"$out/bin/decompose\" completion bash > \"$out/share/bash-completion/completions/decompose\"\n  \"$out/bin/decompose\" completion zsh > \"$out/share/zsh/site-functions/_decompose\"\n  \"$out/bin/decompose\" completion fish > \"$out/share/fish/vendor_completions.d/decompose.fish\"\n",
-        "runtime-packages": [],
+        "runtime-packages": [
+          "glibc",
+          "gcc-runtime",
+          "libiconv"
+        ],
         "sandbox": "off",
         "version": {
           "command": "sed -n 's/^version = \"\\(.*\\)\"/\\1/p' Cargo.toml"
@@ -285,6 +317,233 @@
         "out": "/nix/store/l6mji5kmnmpz1inr3ri3j5f6f527rfs6-clang-wrapper-21.1.8"
       },
       "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "gcc-unwrapped",
+      "broken": false,
+      "derivation": "/nix/store/bmcdjrmrqkrwfv16d039mnn9974fhch1-gcc-15.2.0.drv",
+      "description": "GNU Compiler Collection, version 15.2.0",
+      "install_id": "gcc-runtime",
+      "license": "GPL-3.0-or-later",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "gcc-15.2.0",
+      "pname": "gcc-unwrapped",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T03:41:23.023389Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "15.2.0",
+      "outputs_to_install": [
+        "man",
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "checksum": "/nix/store/6igpfz2rx7xxsr5kvxwlc57d5iafaabz-gcc-15.2.0-checksum",
+        "info": "/nix/store/khkipdd1fmlcbxnza01582fh7j2mfnf3-gcc-15.2.0-info",
+        "lib": "/nix/store/m3v5jbl1y7hxb1yimlyp0067acslkxf2-gcc-15.2.0-lib",
+        "libgcc": "/nix/store/5scis26lfzmcsbgbs3b1i4wraxg28pbp-gcc-15.2.0-libgcc",
+        "man": "/nix/store/bny95l0diywfwvg1lnwhm1m9fsxdm5pl-gcc-15.2.0-man",
+        "out": "/nix/store/8hwmjrgdixn4612zrlabmych64ix89mx-gcc-15.2.0"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "gcc-unwrapped",
+      "broken": false,
+      "derivation": "/nix/store/qlb1647jp7grq5fgp66fhk5qr9rzr1j6-gcc-15.2.0.drv",
+      "description": "GNU Compiler Collection, version 15.2.0",
+      "install_id": "gcc-runtime",
+      "license": "GPL-3.0-or-later",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "gcc-15.2.0",
+      "pname": "gcc-unwrapped",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:40:25.791144Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "15.2.0",
+      "outputs_to_install": [
+        "man",
+        "man",
+        "man",
+        "out",
+        "out",
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "checksum": "/nix/store/scnas3kx869pfc8mz3fjqmfvl9m9sn6a-gcc-15.2.0-checksum",
+        "info": "/nix/store/2hbjnbfhaq4gq6p55xi9qvj6lx7x4g04-gcc-15.2.0-info",
+        "lib": "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib",
+        "libgcc": "/nix/store/7nww4d4yl7jzf66qllvyn61xb21vp7ry-gcc-15.2.0-libgcc",
+        "man": "/nix/store/5r95b3z75rc980dws0wp5ylawgzfkj6l-gcc-15.2.0-man",
+        "out": "/nix/store/sq0nrnfwhkc5ljvklnrk5ps4358g4nbj-gcc-15.2.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "glibc",
+      "broken": false,
+      "derivation": "/nix/store/fv5hzqsszrbwgq51ykpw6vad9n76frzz-glibc-2.42-67.drv",
+      "description": "GNU C Library",
+      "install_id": "glibc",
+      "license": "LGPL-2.0-or-later",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "glibc-2.42-67",
+      "pname": "glibc",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T03:41:23.267964Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.42-67",
+      "outputs_to_install": [
+        "bin",
+        "bin",
+        "bin"
+      ],
+      "outputs": {
+        "bin": "/nix/store/rpam9gvq8452lxla82mnk2867x68f40a-glibc-2.42-67-bin",
+        "debug": "/nix/store/l4zim22r7ffv7hfkp62xyryw6h9l6f62-glibc-2.42-67-debug",
+        "dev": "/nix/store/g5ss8x9195xalqwzqsmbla1xanh9sjy2-glibc-2.42-67-dev",
+        "getent": "/nix/store/ms8c3hw429m6qzj64s8z867hlhr1nrna-glibc-2.42-67-getent",
+        "out": "/nix/store/jp8avbmpfcdnm0axwrzyk072nmq9cr0d-glibc-2.42-67",
+        "static": "/nix/store/vxfviq9zplf2gj7sb3a0wsdwqvpvcp1g-glibc-2.42-67-static"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "glibc",
+      "broken": false,
+      "derivation": "/nix/store/8ky82wqb2hrwww20kbq2v3vlwvn0bddi-glibc-2.42-67.drv",
+      "description": "GNU C Library",
+      "install_id": "glibc",
+      "license": "LGPL-2.0-or-later",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "glibc-2.42-67",
+      "pname": "glibc",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:40:26.052804Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.42-67",
+      "outputs_to_install": [
+        "bin",
+        "bin",
+        "bin",
+        "bin",
+        "bin"
+      ],
+      "outputs": {
+        "bin": "/nix/store/521dd0054ifhzmjfmpx9mz0hr7wh7sig-glibc-2.42-67-bin",
+        "debug": "/nix/store/ndzhn3ijyjxnil481xv6b2a1m2b1055q-glibc-2.42-67-debug",
+        "dev": "/nix/store/q5wv2ldpcv5w8yb2wmsngsygvlxb73fk-glibc-2.42-67-dev",
+        "getent": "/nix/store/fg4gkw8jr3w0cmikyxhcqr2bp2npm09w-glibc-2.42-67-getent",
+        "out": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67",
+        "static": "/nix/store/q8kp93rv8rw0zd9y4n17mrj8r1ikk8ls-glibc-2.42-67-static"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "libiconv",
+      "broken": false,
+      "derivation": "/nix/store/irkbdz86bxcbd2c206gqx4m1csj09g53-libiconv-113.drv",
+      "description": "Iconv(3) implementation",
+      "install_id": "libiconv",
+      "license": "[ BSD-2-Clause, BSD-3-Clause, APSL-1.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "libiconv-113",
+      "pname": "libiconv",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T03:13:14.028699Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "113",
+      "outputs_to_install": [
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "dev": "/nix/store/x9zqgwph8i92jppic911kwpwld30drwn-libiconv-113-dev",
+        "out": "/nix/store/qla3pimj2nqrklkhar0yv7127fcd1v86-libiconv-113"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "libiconv",
+      "broken": false,
+      "derivation": "/nix/store/b1m5y0h4r411yfvmfacyca5jsjv609r8-libiconv-113.drv",
+      "description": "Iconv(3) implementation",
+      "install_id": "libiconv",
+      "license": "[ BSD-2-Clause, BSD-3-Clause, APSL-1.0 ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "libiconv-113",
+      "pname": "libiconv",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:09:24.042301Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "113",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dev": "/nix/store/zdqs550dy4kdpfigwl7rbyyljnikrajs-libiconv-113-dev",
+        "out": "/nix/store/slbk44rhj2im5spq903ik7xpv1phz9rc-libiconv-113"
+      },
+      "system": "x86_64-darwin",
       "group": "toplevel",
       "priority": 5
     },

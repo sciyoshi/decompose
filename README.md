@@ -85,6 +85,9 @@ platform. The release workflow runs on all four platforms when a version tag
 is pushed, then installs each published package to verify it. CI authenticates
 with the `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub `flox` environment.
 The workflow can also be dispatched manually with an existing release tag.
+For packaging-only corrections after a release, its optional `flox-source-ref`
+input selects a pushed source revision for Flox; its package version must still
+match the release tag. Binary assets continue to use the original release tag.
 
 ### From source
 

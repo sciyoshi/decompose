@@ -5,13 +5,16 @@ cargo.pkg-path = "cargo"
 pkg-config.pkg-path = "pkg-config"
 rustc.pkg-path = "rustc"
 clang.pkg-path = "clang"
+glibc = { pkg-path = "glibc", outputs = ["out"], systems = ["aarch64-linux", "x86_64-linux"] }
+gcc-runtime = { pkg-path = "gcc-unwrapped", outputs = ["lib", "libgcc"], systems = ["aarch64-linux", "x86_64-linux"] }
+libiconv = { pkg-path = "libiconv", systems = ["aarch64-darwin", "x86_64-darwin"] }
 
 [build.decompose]
 description = "A process orchestrator for local development"
 version.command = "sed -n 's/^version = \"\\(.*\\)\"/\\1/p' Cargo.toml"
 # Cargo downloads the dependencies pinned in Cargo.lock.
 sandbox = "off"
-runtime-packages = []
+runtime-packages = ["glibc", "gcc-runtime", "libiconv"]
 command = '''
   set -euo pipefail
   cargo build --release --locked
