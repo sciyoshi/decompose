@@ -105,6 +105,11 @@ jobs:
       - uses: flox/install-flox-action@v2
         with:
           version: '1.17.0'
+      - name: Configure publishing branch
+        # Keep the tagged source, but give Flox an upstream for remote checks.
+        run: |
+          git switch -c flox-publish
+          git branch --set-upstream-to=origin/main
       - name: Check release version
         shell: bash
         run: |
