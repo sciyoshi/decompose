@@ -168,3 +168,11 @@ Use the existing `setup_project()` and `run_cmd()` helpers when adding tests.
 **Conventional Commits required.** See `AGENTS.md` for the full spec.
 Quick reference: `feat(cli):`, `fix(daemon):`, `refactor(config):`,
 `test:`, `docs:`, `chore:`.
+
+## Flox releases
+
+The release workflow publishes `sciyoshi/decompose` for ARM64 and x64 on
+macOS and Linux, then verifies installation on each platform. It uses the
+`FLOX_FLOXHUB_TOKEN` environment secret in the GitHub `flox` environment.
+The package version comes from `Cargo.toml`; commit and push all build inputs
+before publishing. See `AGENTS.md` for the full release process.

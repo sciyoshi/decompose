@@ -107,6 +107,7 @@ chore(deps): bump tokio to 1.44
    - Create a GitHub Release
    - Build and attach binaries for `{x86_64,aarch64}-{linux-gnu,apple-darwin}`
    - Publish to crates.io
+   - Publish `sciyoshi/decompose` to Flox for ARM64 and x64 on macOS and Linux
 
 ## Secrets required
 
@@ -114,6 +115,8 @@ chore(deps): bump tokio to 1.44
   configured, so this can be a short-lived OIDC-exchanged token or a
   manual API token set in GitHub repository secrets.
 - `GITHUB_TOKEN` — provided automatically by GitHub Actions.
+- `FLOX_FLOXHUB_TOKEN` — Flox publishing token, stored as an environment
+  secret in the GitHub `flox` environment.
 
 ## When using Claude / AI assistants
 

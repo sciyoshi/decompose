@@ -69,8 +69,8 @@ environment:
 flox install sciyoshi/decompose
 ```
 
-Personal catalog packages are only accessible to their owner. The initial
-Flox publication supports macOS Apple Silicon (`aarch64-darwin`).
+Personal catalog packages are only accessible to their owner. Releases publish
+Flox packages for ARM64 and x64 on both macOS and Linux.
 
 To build and publish a new version from this repository:
 
@@ -81,8 +81,10 @@ flox publish --org sciyoshi decompose
 ```
 
 Flox reads the package version from `Cargo.toml` and publishes for the host
-platform. Repeat publishing on each additional platform to make it available
-there.
+platform. The release workflow runs on all four platforms when a version tag
+is pushed, then installs each published package to verify it. CI authenticates
+with the `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub `flox` environment.
+The workflow can also be dispatched manually with an existing release tag.
 
 ### From source
 

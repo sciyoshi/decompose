@@ -75,6 +75,56 @@ jobs:
           ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  publish-flox:
+    name: Publish Flox (${{ matrix.system }})
+    needs: create-release
+    environment: flox
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: aarch64-darwin
+            os: macos-15
+          - system: x86_64-darwin
+            os: macos-15-intel
+          - system: aarch64-linux
+            os: ubuntu-24.04-arm
+          - system: x86_64-linux
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          # Flox verifies that the source revision exists on the remote.
+          fetch-depth: 0
+      - uses: flox/install-flox-action@v2
+        with:
+          version: '1.17.0'
+      - name: Check release version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          test "$RELEASE_TAG" = "v$version"
+      - name: Publish to Flox
+        run: flox publish --org sciyoshi decompose
+        env:
+          FLOX_FLOXHUB_TOKEN: ${{ secrets.FLOX_FLOXHUB_TOKEN }}
+      - name: Verify published package
+        shell: bash
+        env:
+          FLOX_FLOXHUB_TOKEN: ${{ secrets.FLOX_FLOXHUB_TOKEN }}
+        run: |
+          verify_dir=$(mktemp -d)
+          flox init --dir "$verify_dir" --bare --no-auto-setup
+          flox install --dir "$verify_dir" "sciyoshi/decompose@${RELEASE_TAG#v}"
+          actual=$(flox activate --dir "$verify_dir" -- decompose --version)
+          test "$actual" = "decompose ${RELEASE_TAG#v}"
+
   publish-crate:
     name: Publish to crates.io
     if: github.event_name == 'push'
