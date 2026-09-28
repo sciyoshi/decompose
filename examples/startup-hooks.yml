@@ -1,0 +1,26 @@
+# Self-contained initialization demo. Copy this file to a disposable directory:
+# decompose --file startup-hooks.yml up -d --wait
+# Files are created beside this config. Stop before removing ./data.
+processes:
+  database:
+    command: 'test -s ./data/format && touch ./data/admin-ready; exec sleep 3600'
+    pre_start:
+      - name: data-directory
+        creates: ./data/format
+        command: 'mkdir -p ./data && echo version-1 > ./data/format'
+    post_start:
+      - name: app-user
+        wait_for:
+          exec:
+            command: test -f ./data/admin-ready
+        unless: test -f ./data/app-user
+        command: echo app > ./data/app-user
+    readiness_probe:
+      exec:
+        command: test -f ./data/app-user
+      period_seconds: 2
+  application:
+    command: sleep 3600
+    depends_on:
+      database:
+        condition: process_initialized

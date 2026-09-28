@@ -233,12 +233,40 @@ fn validate_hooks(service: &str, phase: &str, hooks: &[HookConfig]) -> Result<()
                 bail!("{service} {phase}:{}: empty wait command", h.name);
             }
             if w.http_get.as_ref().is_some_and(|h| {
-                h.scheme != "http" || h.port == 0 || h.host.is_empty() || !h.path.starts_with('/')
+                (h.scheme != "http" && !h.scheme.contains('$'))
+                    || h.port == 0
+                    || h.host.is_empty()
+                    || (!h.path.starts_with('/') && !h.path.contains('$'))
             }) {
                 bail!(
                     "{service} {phase}:{}: wait_for requires an http URL with a host, port and absolute path",
                     h.name
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_resolved_hooks(processes: &BTreeMap<String, ProcessRuntime>) -> Result<()> {
+    for r in processes.values() {
+        for (phase, hooks) in [
+            ("pre_start", &r.spec.pre_start),
+            ("post_start", &r.spec.post_start),
+        ] {
+            validate_hooks(&r.spec.name, phase, hooks)?;
+            for hook in hooks {
+                if let Some(http) = hook.wait_for.as_ref().and_then(|w| w.http_get.as_ref())
+                    && (http.scheme != "http"
+                        || http.host.is_empty()
+                        || !http.path.starts_with('/'))
+                {
+                    bail!(
+                        "{} {phase}:{}: invalid resolved HTTP wait",
+                        r.spec.name,
+                        hook.name
+                    );
+                }
             }
         }
     }
@@ -1196,7 +1224,17 @@ pub fn build_process_instances(
         let resolved_env = resolve_process_env(proc_cfg, cfg, cwd, dotenv);
         // Hash covers the resolved environment so that .env edits (and any
         // other env-layer change) naturally trigger a recreate on reload.
-        let config_hash = compute_config_hash(proc_cfg, &resolved_env);
+        let working_dir = cwd.join(proc_cfg.working_dir.as_deref().unwrap_or(Path::new("")));
+        let mut hash_config = proc_cfg.clone();
+        hash_config.pre_start = proc_cfg
+            .pre_start
+            .as_ref()
+            .map(|h| resolve_hooks(h, &working_dir, &resolved_env, !cfg.disable_env_expansion));
+        hash_config.post_start = proc_cfg
+            .post_start
+            .as_ref()
+            .map(|h| resolve_hooks(h, &working_dir, &resolved_env, !cfg.disable_env_expansion));
+        let config_hash = compute_config_hash(&hash_config, &resolved_env);
         for idx in 0..proc_cfg.replicas {
             let replica = idx + 1;
             let instance_name = if proc_cfg.replicas > 1 {
@@ -1222,18 +1260,8 @@ pub fn build_process_instances(
             let disabled = proc_cfg.disabled;
 
             let spec = ProcessInstanceSpec {
-                pre_start: resolve_hooks(
-                    proc_cfg.pre_start.as_deref().unwrap_or_default(),
-                    &working_dir,
-                    &env,
-                    !cfg.disable_env_expansion,
-                ),
-                post_start: resolve_hooks(
-                    proc_cfg.post_start.as_deref().unwrap_or_default(),
-                    &working_dir,
-                    &env,
-                    !cfg.disable_env_expansion,
-                ),
+                pre_start: hash_config.pre_start.clone().unwrap_or_default(),
+                post_start: hash_config.post_start.clone().unwrap_or_default(),
                 name: instance_name.clone(),
                 base_name: base_name.clone(),
                 replica,
@@ -1263,6 +1291,7 @@ pub fn build_process_instances(
             out.insert(
                 instance_name,
                 ProcessRuntime {
+                    hook_cancel: None,
                     initialization: Default::default(),
                     spec,
                     status: if disabled {
@@ -1295,6 +1324,38 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn hook_http_fields_interpolate_and_resolved_validation_rejects_invalid_urls() {
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(
+            r#"
+processes:
+  svc:
+    command: echo
+    environment: {SCHEME: http, HOST: localhost, URL_PATH: /admin}
+    post_start:
+      - name: ready
+        command: echo
+        wait_for:
+          http_get: {scheme: '${SCHEME}', host: '${HOST}', path: '${URL_PATH}', port: 80}
+"#,
+        )
+        .unwrap();
+        validate_config(&cfg).unwrap();
+        let mut instances = build_process_instances(&cfg, Path::new("/tmp"), &BTreeMap::new());
+        validate_resolved_hooks(&instances).unwrap();
+        let http = instances.get_mut("svc").unwrap().spec.post_start[0]
+            .wait_for
+            .as_mut()
+            .unwrap()
+            .http_get
+            .as_mut()
+            .unwrap();
+        assert_eq!(http.host, "localhost");
+        assert_eq!(http.path, "/admin");
+        http.scheme = "ftp".into();
+        assert!(validate_resolved_hooks(&instances).is_err());
+    }
 
     #[test]
     fn hook_schema_rejects_ambiguous_or_unsupported_config() {

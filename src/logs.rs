@@ -83,16 +83,18 @@ pub(crate) struct Record {
 
 impl Record {
     fn render(&self, strip: bool) -> String {
+        let hook = self
+            .hook_phase
+            .as_ref()
+            .zip(self.hook_name.as_ref())
+            .map(|(p, n)| format!("[{p}:{n}] "))
+            .unwrap_or_default();
         if strip {
-            self.message.clone()
+            format!("{hook}{}", self.message)
+        } else if hook.is_empty() {
+            format!("[{}] {}", self.name, self.message)
         } else {
-            let hook = self
-                .hook_phase
-                .as_ref()
-                .zip(self.hook_name.as_ref())
-                .map(|(p, n)| format!("[{p}:{n}] "))
-                .unwrap_or_default();
-            format!("[{}] {hook}{}", self.name, self.message)
+            format!("[{}]{hook}{}", self.name, self.message)
         }
     }
 }
@@ -535,6 +537,49 @@ mod tests {
         let path = tmp.path().join("instance.log");
         let store = Store::new(&path).unwrap();
         (tmp, path, store)
+    }
+
+    #[test]
+    fn hook_records_keep_metadata_under_retention_and_filtered_rendering() {
+        let (_tmp, path, store) = setup();
+        let writer = store.writer("db", 1).unwrap();
+        writer.lock().unwrap().limit = 400;
+        for i in 0..20 {
+            writer
+                .lock()
+                .unwrap()
+                .write_hook(
+                    "db",
+                    "stderr",
+                    &format!("line {i}"),
+                    false,
+                    ("post_start", "setup", "executing"),
+                )
+                .unwrap();
+        }
+        let files = fs::read_dir(directory(&path))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), FILE_COUNT as usize);
+        for file in files {
+            for line in fs::read_to_string(file).unwrap().lines() {
+                let r: Record = serde_json::from_str(line).unwrap();
+                assert_eq!(r.hook_phase.as_deref(), Some("post_start"));
+                assert_eq!(r.hook_name.as_deref(), Some("setup"));
+                assert_eq!(r.hook_stage.as_deref(), Some("executing"));
+                assert_eq!(r.stream, "stderr");
+                assert!(r.render(true).starts_with("[post_start:setup]"));
+            }
+        }
+        assert!(
+            Reader::default()
+                .read(&path, &["db".into()], None)
+                .unwrap()
+                .iter()
+                .any(|s| s.ends_with("line 19"))
+        );
     }
 
     #[test]

@@ -262,6 +262,8 @@ impl ProcessStatus {
 
 #[derive(Debug, Clone)]
 pub struct ProcessRuntime {
+    /// Cancels post-start work independently of signals sent to the service.
+    pub hook_cancel: Option<tokio::sync::watch::Sender<bool>>,
     pub initialization: Initialization,
     pub spec: ProcessInstanceSpec,
     pub status: ProcessStatus,
@@ -427,7 +429,12 @@ impl Initialization {
             return format!("initialization failed ({error})");
         }
         match (&self.phase, &self.hook) {
-            (Some(phase), Some(hook)) => format!("initializing {phase}:{hook}"),
+            (Some(phase), Some(hook)) if self.state == InitializationState::Cancelled => {
+                format!("initialization cancelled ({phase}:{hook})")
+            }
+            (Some(phase), Some(hook)) if self.state == InitializationState::Running => {
+                format!("initializing {phase}:{hook}")
+            }
             _ => String::new(),
         }
     }

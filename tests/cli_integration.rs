@@ -7039,3 +7039,701 @@ processes:
     assert!(!env.project.join("never").exists());
     env.down_json();
 }
+
+#[test]
+fn startup_hooks_cancel_every_stage_in_both_phases() {
+    for phase in ["pre_start", "post_start"] {
+        for (stage, operation) in [
+            ("waiting", "stop"),
+            ("checking", "down"),
+            ("executing", "kill"),
+            ("verifying", "restart"),
+        ] {
+            let mut env = TestEnv::new();
+            let fields = match stage {
+                "waiting" => {
+                    "wait_for: {exec: {command: 'echo $$ > hook.pid; exec sleep 100'}, timeout_seconds: 30}\n        command: 'touch mutation'"
+                }
+                "checking" => {
+                    "unless: 'echo $$ > hook.pid; exec sleep 100'\n        command: 'touch mutation'"
+                }
+                "executing" => "command: 'echo $$ > hook.pid; exec sleep 100'",
+                _ => {
+                    "unless: 'if test -f marker; then echo $$ > hook.pid; exec sleep 100; else exit 1; fi'\n        command: 'touch marker'"
+                }
+            };
+            env.with_config(&format!("disable_env_expansion: true\nprocesses:\n  svc:\n    command: 'touch spawned; exec sleep 100'\n    {phase}:\n      - name: active\n        {fields}\n      - name: later\n        command: 'touch later'\n"));
+            env.up_detach_json();
+            wait_hook_snapshot(&env, |ps| {
+                env.project.join("hook.pid").exists()
+                    && hook_service(ps, "svc")["initialization"]["hooks"][0]["stage"] == stage
+            });
+            let pid: u32 = fs::read_to_string(env.project.join("hook.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_success(
+                &env.run(&[operation, "--json"]),
+                &format!("{operation} {phase} {stage}"),
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while process_alive(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "leaked {phase} {stage} subprocess {pid}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!env.project.join("later").exists());
+            if phase == "pre_start" {
+                assert!(!env.project.join("spawned").exists());
+            }
+            if operation != "down" {
+                env.down_json();
+            } else {
+                env.up_started = false;
+            }
+        }
+    }
+}
+
+#[test]
+fn startup_hooks_guard_contracts_and_artifact_errors() {
+    for (guard, command, succeeds, reason) in [
+        (
+            "unless: 'exit 0'",
+            "touch mutation",
+            true,
+            "already_satisfied",
+        ),
+        ("unless: 'exit 1'", "touch mutation", false, ""),
+        ("unless: 'kill -TERM $$$$'", "touch mutation", false, ""),
+        ("creates: artifact", "exit 4", false, ""),
+        ("creates: dangling", "touch target", true, ""),
+        (
+            "creates: present",
+            "touch mutation",
+            true,
+            "already_satisfied",
+        ),
+        (
+            "creates: inaccessible/artifact",
+            "touch mutation",
+            false,
+            "",
+        ),
+    ] {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let mut env = TestEnv::new();
+        symlink("target", env.project.join("dangling")).unwrap();
+        fs::create_dir(env.project.join("present")).unwrap();
+        fs::create_dir(env.project.join("inaccessible")).unwrap();
+        fs::set_permissions(
+            env.project.join("inaccessible"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        env.with_config(&format!("processes:\n  svc:\n    command: 'sleep 100'\n    pre_start:\n      - name: guarded\n        {guard}\n        command: '{command}'\n"));
+        env.up_detach_json();
+        let ps = wait_hook_snapshot(&env, |ps| {
+            matches!(
+                hook_service(ps, "svc")["initialization"]["state"].as_str(),
+                Some("succeeded" | "failed")
+            )
+        });
+        fs::set_permissions(
+            env.project.join("inaccessible"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let init = &hook_service(&ps, "svc")["initialization"];
+        assert_eq!(init["state"] == "succeeded", succeeds, "{guard}: {init}");
+        if !reason.is_empty() {
+            assert_eq!(init["hooks"][0]["reason"], reason);
+            assert!(!env.project.join("mutation").exists());
+        }
+        if guard.contains("artifact") {
+            assert!(!env.project.join("artifact").exists());
+        }
+    }
+}
+
+#[test]
+fn startup_hooks_wait_retries_cleanup_and_overall_timeout() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+disable_env_expansion: true
+processes:
+  svc:
+    command: 'touch spawned; sleep 100'
+    pre_start:
+      - name: bounded
+        timeout_seconds: 3
+        wait_for:
+          exec: {command: 'echo $$ >> probes; sleep 100 & echo $! >> grandchildren; wait'}
+          timeout_seconds: 1
+        command: 'touch mutation'
+"#,
+    );
+    env.up_detach_json();
+    let started = std::time::Instant::now();
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "svc")["state"] == "failed");
+    assert!(started.elapsed() < Duration::from_secs(9));
+    assert_eq!(
+        hook_service(&ps, "svc")["initialization"]["hooks"][0]["stage"],
+        "waiting"
+    );
+    let probes = fs::read_to_string(env.project.join("probes")).unwrap();
+    assert!(probes.lines().count() >= 2);
+    for path in ["probes", "grandchildren"] {
+        for pid in fs::read_to_string(env.project.join(path)).unwrap().lines() {
+            assert!(!process_alive(pid.parse().unwrap()), "leaked probe {pid}");
+        }
+    }
+    assert!(!env.project.join("mutation").exists());
+    assert!(!env.project.join("spawned").exists());
+}
+
+#[test]
+fn startup_hooks_deadline_covers_check_command_and_verification() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: 'sleep 100'
+    pre_start:
+      - name: shared-deadline
+        timeout_seconds: 1
+        unless: 'if test -f mutation; then sleep 100; else exit 1; fi'
+        command: 'touch mutation'
+"#,
+    );
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "svc")["state"] == "failed");
+    assert_eq!(
+        hook_service(&ps, "svc")["initialization"]["hooks"][0]["stage"],
+        "verifying"
+    );
+    assert!(fs::read_to_string(env.project.join("mutation")).is_ok());
+}
+
+#[test]
+fn startup_hooks_dependency_order_and_readiness_are_independent() {
+    let mut env = TestEnv::new();
+    env.with_config(r#"
+processes:
+  dependency:
+    command: 'touch dependency; exec sleep 100'
+    ready_log_line: MAIN_READY
+    post_start:
+      - name: independent
+        command: 'echo MAIN_READY; echo hook-error >&2; touch hook-output; while ! test -f release; do sleep 0.02; done'
+  started:
+    command: 'sleep 100'
+    depends_on: {dependency: {condition: process_started}}
+    pre_start: [{name: check-dep, command: 'test -f dependency; touch started-pre'}]
+  initialized:
+    command: 'sleep 100'
+    depends_on: {dependency: {condition: process_initialized}}
+    pre_start: [{name: check-init, command: 'test -f release; touch initialized-pre'}]
+"#);
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |_| {
+        env.project.join("hook-output").exists() && env.project.join("started-pre").exists()
+    });
+    assert_eq!(hook_service(&ps, "dependency")["log_ready"], false);
+    assert_eq!(hook_service(&ps, "initialized")["state"], "pending");
+    assert!(!env.project.join("initialized-pre").exists());
+    fs::write(env.project.join("release"), "").unwrap();
+    wait_hook_snapshot(&env, |_| env.project.join("initialized-pre").exists());
+    let logs = env.run(&["logs", "--no-pager", "dependency"]);
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs.contains("[post_start:independent] MAIN_READY"),
+        "{logs}"
+    );
+    assert!(logs.contains("hook-error"));
+    let mut records = Vec::new();
+    fn collect_logs(dir: &Path, records: &mut Vec<Value>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_logs(&path, records);
+            } else if path.extension().is_some_and(|s| s == "jsonl") {
+                for line in fs::read_to_string(path).unwrap().lines() {
+                    records.push(serde_json::from_str(line).unwrap());
+                }
+            }
+        }
+    }
+    collect_logs(&env.state, &mut records);
+    assert!(records.iter().any(|r| r["hook_name"] == "independent"
+        && r["hook_stage"] == "executing"
+        && r["stream"] == "stderr"
+        && r["message"] == "hook-error"));
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_replicas_live_rename_scale_down_and_reload() {
+    let mut env = TestEnv::new();
+    let config = |replicas, command: &str| {
+        format!(
+            r#"
+processes:
+  worker:
+    replicas: {replicas}
+    command: 'sleep 100'
+    post_start:
+      - name: work
+        command: '{command}'
+  client:
+    command: 'sleep 100'
+    depends_on: {{worker: {{condition: process_initialized}}}}
+"#
+        )
+    };
+    env.with_config(&config(
+        1,
+        "echo start >> starts; while ! test -f release; do sleep 0.02; done; echo done",
+    ));
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |_| env.project.join("starts").exists());
+    let original = hook_service(&ps, "worker")["pid"].clone();
+    env.with_config(&config(
+        2,
+        "echo start >> starts; while ! test -f release; do sleep 0.02; done; echo done",
+    ));
+    assert_success(&env.run(&["up", "-d"]), "scale up");
+    let ps = wait_hook_snapshot(&env, |_| {
+        fs::read_to_string(env.project.join("starts"))
+            .unwrap()
+            .lines()
+            .count()
+            == 2
+    });
+    assert_eq!(hook_service(&ps, "worker[1]")["pid"], original);
+    assert_eq!(hook_service(&ps, "client")["state"], "pending");
+    env.with_config(&config(
+        1,
+        "echo start >> starts; while ! test -f release; do sleep 0.02; done; echo done",
+    ));
+    assert_success(&env.run(&["up", "-d"]), "scale down active hook");
+    fs::write(env.project.join("release"), "").unwrap();
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "client")["state"] == "running");
+    assert_eq!(hook_service(&ps, "worker")["pid"], original);
+    let logs = env.run(&["logs", "--no-pager", "worker"]);
+    assert!(String::from_utf8_lossy(&logs.stdout).contains("[post_start:work] done"));
+    assert_success(&env.run(&["up", "-d", "--wait"]), "unchanged up");
+    assert_eq!(
+        fs::read_to_string(env.project.join("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    env.with_config(&config(1, "touch reloaded"));
+    assert_success(&env.run(&["up", "-d", "--wait"]), "reload changed hook");
+    assert!(env.project.join("reloaded").exists());
+    let ps = env.ps_json_value();
+    assert_ne!(hook_service(&ps, "worker")["pid"], original);
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_automatic_restart_reevaluates_both_phases() {
+    let mut env = TestEnv::new();
+    env.with_config(r#"
+processes:
+  svc:
+    command: 'if test -f second; then exec sleep 100; fi; while ! test -f post; do sleep 0.02; done; touch second; exit 1'
+    restart_policy: on_failure
+    backoff_seconds: 0
+    pre_start: [{name: every, command: 'echo pre >> attempts'}]
+    post_start: [{name: guarded, creates: post, command: 'echo post >> attempts; touch post'}]
+"#);
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| {
+        let p = hook_service(ps, "svc");
+        p["restart_count"] == 1 && p["initialization"]["initialized"] == true
+    });
+    assert_eq!(
+        hook_service(&ps, "svc")["initialization"]["hooks"][1]["reason"],
+        "already_satisfied"
+    );
+    assert_eq!(
+        fs::read_to_string(env.project.join("attempts")).unwrap(),
+        "pre\npost\npre\n"
+    );
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_one_off_commands_are_excluded_and_no_deps_still_runs_hooks() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  dep:
+    command: 'sleep 100'
+    pre_start: [{name: dep, command: 'touch dependency'}]
+  svc:
+    command: 'sleep 100'
+    pre_start: [{name: once, command: 'echo hook >> attempts'}]
+"#,
+    );
+    assert_success(&env.run(&["run", "svc", "true"]), "one off run");
+    assert!(!env.project.join("attempts").exists());
+    env.up_started = true;
+    assert_success(&env.run(&["up", "-d", "--no-deps", "svc"]), "no deps");
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["initialized"] == true
+    });
+    assert!(!env.project.join("dependency").exists());
+    assert_success(&env.run(&["exec", "svc", "true"]), "one off exec");
+    assert_eq!(
+        fs::read_to_string(env.project.join("attempts")).unwrap(),
+        "hook\n"
+    );
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_exit_modes_retain_failure_and_ignore_hook_success() {
+    for phase in ["pre_start", "post_start"] {
+        let mut env = TestEnv::new();
+        env.with_config(&format!("exit_mode: exit_on_failure\nprocesses:\n  svc:\n    command: 'sleep 100'\n    {phase}: [{{name: broken, command: 'exit 9'}}]\n"));
+        env.up_started = true;
+        let out = env.run(&["up", "--json"]);
+        assert!(!out.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains("broken"), "{text}");
+    }
+    let mut env = TestEnv::new();
+    env.with_config("exit_mode: exit_on_end\nprocesses:\n  svc:\n    command: 'sleep 100'\n    pre_start: [{name: done, command: 'exit 0'}]\n");
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["initialized"] == true
+    });
+    assert_eq!(hook_service(&ps, "svc")["state"], "running");
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_http_wait_is_independent_of_readiness() {
+    // Hold the response until the service asks for an admin check. A 302
+    // exercises the existing HTTP probe success rule (200..400).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let mut env = TestEnv::new();
+    env.with_config(&format!(
+        r#"
+processes:
+  svc:
+    command: 'touch main-started; exec sleep 100'
+    readiness_probe: {{exec: {{command: 'test -f initialized'}}, period_seconds: 1}}
+    post_start:
+      - name: admin
+        wait_for: {{http_get: {{port: {port}}}}}
+        command: 'touch initialized'
+"#
+    ));
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["hooks"][0]["stage"] == "waiting"
+    });
+    assert_eq!(hook_service(&ps, "svc")["ready"], false);
+    assert!(!env.project.join("initialized").exists());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n");
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_success(
+        &env.run(&["up", "-d", "--wait"]),
+        "HTTP initialization and readiness",
+    );
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_cli_timeout_reports_stage_without_cancelling_daemon() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: 'sleep 100'
+    pre_start:
+      - name: slow
+        command: 'while ! test -f release; do sleep 0.02; done'
+"#,
+    );
+    env.up_detach_json();
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["hooks"][0]["stage"] == "executing"
+    });
+    let out = run_cmd(
+        &env.project,
+        &env.runtime,
+        &env.state,
+        &env.home,
+        &["up", "-d", "--wait"],
+        &[("DECOMPOSE_DAEMON_READY_TIMEOUT_MS", "200")],
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pre_start:slow"));
+    assert_eq!(
+        hook_service(&env.ps_json_value(), "svc")["state"],
+        "initializing"
+    );
+    fs::write(env.project.join("release"), "").unwrap();
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["initialized"] == true
+    });
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_exited_one_shot_uses_historical_success() {
+    let mut env = TestEnv::new();
+    env.with_config("processes:\n  job:\n    command: 'exit 0'\n    pre_start: [{name: prepare, command: 'touch prepared'}]\n");
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "job")["state"] == "exited");
+    assert_eq!(
+        hook_service(&ps, "job")["initialization"]["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        hook_service(&ps, "job")["initialization"]["initialized"],
+        false
+    );
+    assert_success(&env.run(&["up", "-d", "--wait"]), "one-shot initialization");
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_artifact_shortcuts_and_hook_environment_are_isolated() {
+    let mut env = TestEnv::new();
+    fs::create_dir(env.project.join("subdir")).unwrap();
+    fs::write(env.project.join("subdir/existing"), "").unwrap();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: 'test "$$VALUE" = service; exec sleep 100'
+    environment: {VALUE: service}
+    pre_start:
+      - name: local-shortcut
+        working_dir: subdir
+        creates: existing
+        wait_for: {exec: {command: 'exit 1'}}
+        timeout_seconds: 1
+        command: 'touch never'
+      - name: recheck
+        working_dir: subdir
+        creates: created-during-wait
+        wait_for: {exec: {command: 'touch created-during-wait'}}
+        command: 'touch never'
+      - name: env
+        working_dir: subdir
+        environment: ['VALUE=hook']
+        command: 'test "$$VALUE" = hook && pwd > location && echo "$$VALUE" > value'
+      - name: isolated
+        command: 'test "$$VALUE" = service && touch isolated'
+"#,
+    );
+    env.up_detach_json();
+    assert_success(
+        &env.run(&["up", "-d", "--wait"]),
+        "artifact shortcuts and env",
+    );
+    assert_eq!(
+        fs::read_to_string(env.project.join("subdir/value")).unwrap(),
+        "hook\n"
+    );
+    assert!(env.project.join("isolated").exists());
+    assert!(!env.project.join("subdir/never").exists());
+    let ps = env.ps_json_value();
+    for idx in [0, 1] {
+        assert_eq!(
+            hook_service(&ps, "svc")["initialization"]["hooks"][idx]["reason"],
+            "already_satisfied"
+        );
+    }
+    let effective = env.run(&["config", "--json"]);
+    assert_success(&effective, "config");
+    let cfg: Value = serde_json::from_slice(&effective.stdout).unwrap();
+    assert!(
+        cfg["processes"]["svc"]["pre_start"][0]["creates"]
+            .as_str()
+            .unwrap()
+            .ends_with("subdir/existing")
+    );
+    assert_eq!(cfg["processes"]["svc"]["post_start"], serde_json::json!([]));
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_liveness_restart_cancels_previous_incarnation() {
+    let mut env = TestEnv::new();
+    env.with_config(r#"
+disable_env_expansion: true
+processes:
+  svc:
+    command: 'sleep 100'
+    restart_policy: always
+    max_restarts: 1
+    backoff_seconds: 0
+    liveness_probe:
+      exec: {command: 'test -f second'}
+      period_seconds: 1
+      initial_delay_seconds: 1
+      failure_threshold: 1
+    post_start:
+      - name: blocked-first-time
+        command: 'if test -f hook.pid; then touch second; else echo $$ > hook.pid; exec sleep 100; fi'
+"#);
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| {
+        let p = hook_service(ps, "svc");
+        p["restart_count"] == 1 && p["initialization"]["initialized"] == true
+    });
+    assert_eq!(
+        hook_service(&ps, "svc")["initialization"]["hooks"][0]["status"],
+        "succeeded"
+    );
+    let pid = fs::read_to_string(env.project.join("hook.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!process_alive(pid));
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_documented_example_runs_and_skips_on_restart() {
+    let mut env = TestEnv::new();
+    env.with_config(include_str!("../examples/startup-hooks.yml"));
+    env.up_detach_json();
+    assert_success(&env.run(&["up", "-d", "--wait"]), "documented example");
+    assert_success(&env.run(&["restart", "database"]), "example restart");
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "database")["initialization"]["initialized"] == true
+    });
+    for h in hook_service(&ps, "database")["initialization"]["hooks"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(h["reason"], "already_satisfied");
+    }
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_kill_cancels_work_even_if_main_ignores_signal() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+disable_env_expansion: true
+processes:
+  svc:
+    command: "trap '' TERM; touch main-ready; while :; do sleep 1; done"
+    shutdown: {timeout_seconds: 1}
+    post_start:
+      - name: active
+        wait_for: {exec: {command: 'test -f main-ready'}}
+        command: 'echo $$ > hook.pid; exec sleep 100'
+"#,
+    );
+    env.up_detach_json();
+    wait_hook_snapshot(&env, |_| env.project.join("hook.pid").exists());
+    let pid = fs::read_to_string(env.project.join("hook.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_success(
+        &env.run(&["kill", "--signal", "TERM", "svc"]),
+        "signal service",
+    );
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["state"] == "cancelled"
+    });
+    assert_eq!(hook_service(&ps, "svc")["state"], "running");
+    assert!(!process_alive(pid));
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_reap_background_descendants_after_shell_success() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+disable_env_expansion: true
+processes:
+  svc:
+    command: sleep 100
+    pre_start:
+      - name: descendants
+        command: 'sleep 100 & echo $! > child.pid; exit 0'
+"#,
+    );
+    env.up_detach_json();
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["initialization"]["initialized"] == true
+    });
+    let pid = fs::read_to_string(env.project.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!process_alive(pid));
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_explicit_retry_discards_previous_failure_for_waiting() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: sleep 100
+    pre_start:
+      - name: recoverable
+        command: 'test -f fixed'
+"#,
+    );
+    env.up_detach_json();
+    wait_hook_snapshot(&env, |ps| hook_service(ps, "svc")["state"] == "failed");
+    fs::write(env.project.join("fixed"), "").unwrap();
+    assert_success(
+        &env.run(&["up", "-d", "--wait"]),
+        "explicit retry of failed hook",
+    );
+    assert_eq!(
+        hook_service(&env.ps_json_value(), "svc")["initialization"]["state"],
+        "succeeded"
+    );
+    env.down_json();
+}

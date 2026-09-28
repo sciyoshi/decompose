@@ -456,6 +456,7 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
 
     let exit_mode = config.exit_mode;
     let mut process_map = build_process_instances(&config, &args.cwd, &dotenv);
+    crate::config::validate_resolved_hooks(&process_map)?;
 
     // Mark non-selected services as NotStarted instead of Pending so the
     // supervisor won't auto-launch them.
@@ -841,22 +842,45 @@ async fn start_process(name: String, state: SharedState) {
             return;
         };
         let pid = child.id().unwrap_or(0);
-        with_process_mut(&state, &name_handle, |r| {
-            r.status = ProcessStatus::Running { pid };
-            r.started_once = true;
-            if spec.post_start.is_empty() {
-                r.initialization.state = crate::model::InitializationState::Succeeded;
-                r.initialization.initialized = true;
-                r.initialization.phase = None;
-                r.initialization.hook = None;
-            }
-        })
-        .await;
+        publish_running(&state, &name_handle, &spec, pid).await;
         let pattern = spec.ready_log_line.as_deref().map(compile_ready_pattern);
         let output_tasks =
             attach_output_readers(&mut child, &name_handle, &spec, pattern, state.clone()).await;
         process_lifecycle(name_handle, spec, child, output_tasks, kill_rx, state).await;
     });
+}
+
+async fn publish_running(
+    state: &SharedState,
+    handle: &crate::model::NameHandle,
+    spec: &crate::model::ProcessInstanceSpec,
+    pid: u32,
+) {
+    let mut guard = state.lock().await;
+    let name = crate::model::read_name(handle);
+    let stopping = guard.shutdown_requested
+        || guard.stopping.contains(&name)
+        || guard.controllers.get(&name).is_some_and(|c| *c.borrow());
+    if let Some(r) = guard.processes.get_mut(&name) {
+        r.status = ProcessStatus::Running { pid };
+        r.started_once = true;
+        r.log_ready = false;
+        r.ready = false;
+        r.alive = true;
+        if spec.post_start.is_empty() && !stopping {
+            r.initialization.state = crate::model::InitializationState::Succeeded;
+            r.initialization.initialized = true;
+            r.initialization.phase = None;
+            r.initialization.hook = None;
+        }
+    }
+}
+
+pub(crate) async fn initialization_failed(state: &SharedState) {
+    let mut guard = state.lock().await;
+    if guard.exit_mode == ExitMode::ExitOnFailure {
+        guard.request_shutdown();
+    }
 }
 
 pub(crate) async fn record_hook_cleanup_error(
@@ -959,7 +983,10 @@ async fn spawn_process_child(
     // lock is held, so a cancelled pre-start cannot acquire a main PID later.
     let mut guard = state.lock().await;
     let current = crate::model::read_name(name_handle);
-    if guard.shutdown_requested || guard.stopping.contains(&current) {
+    if guard.shutdown_requested
+        || guard.stopping.contains(&current)
+        || guard.controllers.get(&current).is_some_and(|c| *c.borrow())
+    {
         if let Some(r) = guard.processes.get_mut(&current) {
             r.status = ProcessStatus::Stopped;
         }
@@ -1080,6 +1107,10 @@ async fn wait_for_child_exit(
     let probes = spawn_health_probes(name_handle, spec, state, &probe_rx);
     let pgid = child.id().expect("live child has pid");
     let (hook_stop, hook_rx) = watch::channel(false);
+    with_process_mut(state, name_handle, |r| {
+        r.hook_cancel = Some(hook_stop.clone())
+    })
+    .await;
     let hooks = crate::hooks::run_phase(state, name_handle, spec, "post_start", hook_rx);
     tokio::pin!(hooks);
     let mut hooks_done = false;
@@ -1342,22 +1373,7 @@ async fn process_lifecycle(
         };
         child = new_child;
         let pid = child.id().unwrap_or(0);
-        with_process_mut(&state, &name_handle, |runtime| {
-            runtime.status = ProcessStatus::Running { pid };
-            if spec.post_start.is_empty() {
-                runtime.initialization.state = crate::model::InitializationState::Succeeded;
-                runtime.initialization.initialized = true;
-                runtime.initialization.phase = None;
-                runtime.initialization.hook = None;
-            }
-            runtime.log_ready = false;
-            runtime.ready = false;
-            // A freshly spawned process is assumed alive until its
-            // liveness probe (if any) proves otherwise — matches the
-            // `ProcessRuntime::alive` default documented in model.rs.
-            runtime.alive = true;
-        })
-        .await;
+        publish_running(&state, &name_handle, &spec, pid).await;
 
         let ready_pattern: Option<Regex> =
             spec.ready_log_line.as_deref().map(compile_ready_pattern);
@@ -2002,7 +2018,7 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
 /// services error out; services that aren't currently running are silently
 /// skipped (the signal only has a target for actively-Running PIDs).
 async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) -> Response {
-    let guard = state.lock().await;
+    let mut guard = state.lock().await;
     match resolve_services_or_error(&guard, &services) {
         Err(resp) => resp,
         Ok(names) => {
@@ -2014,6 +2030,12 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
                     && let Some(tx) = guard.controllers.get(name)
                 {
                     tx.send_replace(true);
+                }
+                if let Some(runtime) = guard.processes.get_mut(name) {
+                    runtime.initialization.initialized = false;
+                    if let Some(cancel) = &runtime.hook_cancel {
+                        cancel.send_replace(true);
+                    }
                 }
                 if let Some(runtime) = guard.processes.get(name)
                     && let ProcessStatus::Running { pid } = runtime.status
@@ -2206,6 +2228,11 @@ async fn handle_reload(
     }
 
     let new_process_map = build_process_instances(&new_config, &cwd, &dotenv);
+    if let Err(e) = crate::config::validate_resolved_hooks(&new_process_map) {
+        return Response::Error {
+            message: e.to_string(),
+        };
+    }
 
     // 2. Build fingerprints keyed by base-name. Replicas share a config_hash,
     //    so collapsing to base-name is sufficient — and replica-count changes
@@ -2585,6 +2612,7 @@ mod tests {
 
     fn runtime_with(base: &str, status: ProcessStatus, started_once: bool) -> ProcessRuntime {
         ProcessRuntime {
+            hook_cancel: None,
             initialization: Default::default(),
             spec: ProcessInstanceSpec {
                 pre_start: Vec::new(),
@@ -2617,6 +2645,45 @@ mod tests {
             alive: true,
             name_handle: crate::model::make_name_handle(base.to_string()),
         }
+    }
+
+    #[test]
+    fn initialized_gate_requires_every_live_replica_but_started_is_historical() {
+        let mut candidate = runtime_with("api", ProcessStatus::Pending, false);
+        candidate
+            .spec
+            .depends_on
+            .insert("db".into(), DependencyCondition::ProcessInitialized);
+        let mut a = runtime_with("db", ProcessStatus::Running { pid: 1 }, true);
+        a.initialization.state = crate::model::InitializationState::Succeeded;
+        a.initialization.initialized = true;
+        let mut b = a.clone();
+        b.initialization.initialized = false;
+        let mut all = BTreeMap::from([("db[1]".into(), a), ("db[2]".into(), b)]);
+        assert!(!dependencies_met(&candidate, &all));
+        all.get_mut("db[2]").unwrap().initialization.initialized = true;
+        assert!(dependencies_met(&candidate, &all));
+        all.get_mut("db[2]").unwrap().status = ProcessStatus::Exited { code: 0 };
+        assert!(!dependencies_met(&candidate, &all));
+        candidate
+            .spec
+            .depends_on
+            .insert("db".into(), DependencyCondition::ProcessStarted);
+        assert!(dependencies_met(&candidate, &all));
+    }
+
+    #[test]
+    fn snapshots_deserialize_without_initialization_additions() {
+        let runtime = runtime_with("db", ProcessStatus::Running { pid: 1 }, true);
+        let mut json = serde_json::to_value(ProcessSnapshot::from(&runtime)).unwrap();
+        json.as_object_mut().unwrap().remove("initialization");
+        json.as_object_mut()
+            .unwrap()
+            .remove("initialization_blockers");
+        let snapshot: ProcessSnapshot = serde_json::from_value(json).unwrap();
+        assert!(!snapshot.initialization.initialized);
+        assert!(snapshot.initialization.hooks.is_empty());
+        assert!(snapshot.initialization_blockers.is_empty());
     }
 
     #[test]

@@ -133,6 +133,7 @@ fn resolve_service_context(
         );
     }
     let instances = build_process_instances(&cfg, &config_dir, &dotenv);
+    crate::config::validate_resolved_hooks(&instances)?;
     // Pick the first replica (or the bare service name when replicas == 1).
     let (_, runtime) = instances
         .iter()
@@ -1052,6 +1053,7 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
 
     let dotenv = load_dotenv_files(&config_dir, &global.env_files, global.disable_dotenv)?;
     let instances = build_process_instances(&cfg, &config_dir, &dotenv);
+    crate::config::validate_resolved_hooks(&instances)?;
     for (name, service) in &mut cfg.processes {
         if let Some(r) = instances.values().find(|r| &r.spec.base_name == name) {
             service.pre_start = Some(r.spec.pre_start.clone());
@@ -1442,7 +1444,9 @@ async fn wait_for_services_ready(
                     .collect();
 
                 for p in &active {
-                    if let Some(error) = p.initialization.failure() {
+                    if p.state != "pending"
+                        && let Some(error) = p.initialization.failure()
+                    {
                         emit_message(output_mode, "error", &format!("{}: {error}", p.name));
                         bail!("{}: {error}", p.name);
                     }

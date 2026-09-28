@@ -18,6 +18,7 @@ fn now() -> String {
 
 pub(crate) async fn begin(state: &SharedState, handle: &NameHandle, spec: &ProcessInstanceSpec) {
     with_process_mut(state, handle, |r| {
+        r.hook_cancel = None;
         r.status = ProcessStatus::Initializing;
         r.initialization = Initialization {
             state: InitializationState::Running,
@@ -48,6 +49,7 @@ pub(crate) async fn begin(state: &SharedState, handle: &NameHandle, spec: &Proce
 
 pub(crate) async fn end_incarnation(state: &SharedState, handle: &NameHandle, exited: bool) {
     with_process_mut(state, handle, |r| {
+        r.hook_cancel = None;
         r.initialization.initialized = false;
         if r.initialization.state == InitializationState::Running {
             r.initialization.state = InitializationState::Cancelled;
@@ -458,10 +460,18 @@ pub(crate) async fn run_phase(
         .await
         .flatten()
         .unwrap_or_else(|| "checking".into());
+        if result.as_ref().is_err_and(|e| !e.cancelled) {
+            crate::daemon::initialization_failed(state).await;
+        }
         step.log(&stage, &message).await;
         if result.is_err() {
             return false;
         }
     }
-    !*cancel.borrow()
+    if *cancel.borrow() {
+        end_incarnation(state, handle, false).await;
+        false
+    } else {
+        true
+    }
 }
