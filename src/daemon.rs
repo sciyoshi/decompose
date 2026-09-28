@@ -24,10 +24,7 @@ use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
 
 use crate::cli::DaemonArgs;
-use crate::config::{
-    apply_interpolation, build_process_instances, collect_process_subset, load_and_merge_configs,
-    load_dotenv_files,
-};
+use crate::config::{build_process_instances, collect_process_subset, load_project};
 use crate::ipc::{Request, Response, to_socket_name};
 use crate::model::{
     DependencyCondition, ExitMode, ProcessRuntime, ProcessSnapshot, ProcessStatus, RestartPolicy,
@@ -422,11 +419,9 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         let _ = fs::remove_file(&paths.socket);
     }
 
-    let dotenv = load_dotenv_files(&args.cwd, &args.env_files, args.disable_dotenv)?;
-
-    let mut config = load_and_merge_configs(&args.config_files)?;
-    apply_interpolation(&mut config);
-    crate::config::validate_project_paths(&config, &args.cwd)?;
+    let loaded = load_project(&args.config_files, &args.env_files, args.disable_dotenv)?;
+    let config = loaded.config;
+    let dotenv = loaded.dotenv;
 
     // Determine which services were selected for launch. Non-selected ones
     // stay in the daemon state as NotStarted so they can be addressed later
@@ -2032,29 +2027,16 @@ async fn handle_reload(
 
     // 1. Load and interpolate the new config. Any failure here aborts the
     //    reload without touching any running processes.
-    let dotenv = match load_dotenv_files(&cwd, &env_files, disable_dotenv) {
-        Ok(d) => d,
-        Err(e) => {
-            return Response::Error {
-                message: format!("reload: failed to load env files: {e:#}"),
-            };
-        }
-    };
-
-    let mut new_config = match load_and_merge_configs(&config_files) {
-        Ok(c) => c,
+    let loaded = match load_project(&config_files, &env_files, disable_dotenv) {
+        Ok(loaded) => loaded,
         Err(e) => {
             return Response::Error {
                 message: format!("reload: invalid config: {e:#}"),
             };
         }
     };
-    apply_interpolation(&mut new_config);
-    if let Err(e) = crate::config::validate_project_paths(&new_config, &cwd) {
-        return Response::Error {
-            message: format!("reload: invalid config: {e:#}"),
-        };
-    }
+    let new_config = loaded.config;
+    let dotenv = loaded.dotenv;
 
     let new_process_map = build_process_instances(&new_config, &cwd, &dotenv);
 

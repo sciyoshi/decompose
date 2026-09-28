@@ -10,36 +10,78 @@ pub(super) struct RawProject {
     pub processes: BTreeMap<String, RawProcess>,
     pub disable_env_expansion: Option<bool>,
     pub exit_mode: Option<ExitMode>,
+    #[serde(default)]
+    pub include: Vec<Include>,
+    #[serde(skip)]
+    pub environment_sources: BTreeMap<String, PathBuf>,
 }
 
 /// Keeping supplied fields avoids confusing `false`, `1`, or `[]` with
 /// omission. The resolved schema remains the authority for field types.
 #[derive(Debug, Default, Deserialize, Clone)]
-#[serde(transparent)]
-pub(super) struct RawProcess(pub BTreeMap<String, Value>);
+pub(super) struct RawProcess {
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub sources: BTreeMap<String, PathBuf>,
+    #[serde(skip)]
+    pub environment_sources: BTreeMap<String, PathBuf>,
+    #[serde(skip)]
+    pub files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub(super) enum Include {
+    Path(String),
+    Detail(IncludeDetail),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IncludeDetail {
+    pub path: String,
+    pub processes: Option<Vec<String>>,
+}
+
+impl Include {
+    pub fn parts(&self) -> (&str, Option<&[String]>) {
+        match self {
+            Self::Path(path) => (path, None),
+            Self::Detail(detail) => (&detail.path, detail.processes.as_deref()),
+        }
+    }
+}
 
 impl RawProcess {
     fn merge(&mut self, overlay: Self) -> Result<()> {
-        for (key, value) in overlay.0 {
+        self.sources.extend(overlay.sources);
+        self.environment_sources.extend(overlay.environment_sources);
+        for file in overlay.files {
+            if !self.files.contains(&file) {
+                self.files.push(file);
+            }
+        }
+        for (key, value) in overlay.fields {
             if key == "environment" {
                 let mut env = self.environment()?;
                 env.0.extend(serde_yaml_ng::from_value::<EnvVars>(value)?.0);
-                self.0.insert(key, serde_yaml_ng::to_value(env)?);
+                self.fields.insert(key, serde_yaml_ng::to_value(env)?);
             } else if key == "depends_on" {
                 let mut deps = self.dependencies()?;
                 deps.extend(serde_yaml_ng::from_value::<
                     BTreeMap<String, ProcessDependency>,
                 >(value)?);
-                self.0.insert(key, serde_yaml_ng::to_value(deps)?);
+                self.fields.insert(key, serde_yaml_ng::to_value(deps)?);
             } else {
-                self.0.insert(key, value);
+                self.fields.insert(key, value);
             }
         }
         Ok(())
     }
 
     pub fn environment(&self) -> Result<EnvVars> {
-        self.0
+        self.fields
             .get("environment")
             .cloned()
             .map(serde_yaml_ng::from_value)
@@ -49,7 +91,7 @@ impl RawProcess {
     }
 
     pub fn dependencies(&self) -> Result<BTreeMap<String, ProcessDependency>> {
-        self.0
+        self.fields
             .get("depends_on")
             .cloned()
             .map(serde_yaml_ng::from_value)
@@ -59,7 +101,9 @@ impl RawProcess {
     }
 
     pub fn resolve(self) -> Result<ProcessConfig> {
-        Ok(serde_yaml_ng::from_value(serde_yaml_ng::to_value(self.0)?)?)
+        Ok(serde_yaml_ng::from_value(serde_yaml_ng::to_value(
+            self.fields,
+        )?)?)
     }
 }
 
@@ -67,14 +111,32 @@ impl RawProject {
     pub fn read(path: &Path) -> Result<Self> {
         let data = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let raw: Self = serde_yaml_ng::from_str(&data)
+        let mut raw: Self = serde_yaml_ng::from_str(&data)
             .with_context(|| format!("config error: {}", path.display()))?;
         // Check supplied field types now, but defer completeness and graph
         // validation until every overlay has been applied.
-        for (name, process) in &raw.processes {
+        raw.environment_sources = raw
+            .environment
+            .0
+            .keys()
+            .map(|key| (key.clone(), path.to_path_buf()))
+            .collect();
+        for (name, process) in &mut raw.processes {
+            process.sources = process
+                .fields
+                .keys()
+                .map(|key| (key.clone(), path.to_path_buf()))
+                .collect();
+            process.environment_sources = process
+                .environment()?
+                .0
+                .keys()
+                .map(|key| (key.clone(), path.to_path_buf()))
+                .collect();
+            process.files.push(path.to_path_buf());
             let mut check = process.clone();
             check
-                .0
+                .fields
                 .entry("command".into())
                 .or_insert(Value::String(String::new()));
             check
@@ -86,6 +148,7 @@ impl RawProject {
 
     pub fn merge(mut self, overlay: Self) -> Result<Self> {
         self.environment.0.extend(overlay.environment.0);
+        self.environment_sources.extend(overlay.environment_sources);
         for (name, process) in overlay.processes {
             self.processes.entry(name).or_default().merge(process)?;
         }
@@ -103,7 +166,15 @@ impl RawProject {
             .processes
             .into_iter()
             .map(|(name, raw)| {
-                let process = raw.resolve().with_context(|| format!("process `{name}`"))?;
+                let files = raw
+                    .files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let process = raw
+                    .resolve()
+                    .with_context(|| format!("process `{name}` from {files}"))?;
                 Ok((name, process))
             })
             .collect::<Result<_>>()?;

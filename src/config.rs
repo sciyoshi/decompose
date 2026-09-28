@@ -8,7 +8,9 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod compose;
 mod raw;
+pub use compose::{LoadedProject, MAX_INCLUDE_DEPTH, ProcessProvenance, Provenance, load_project};
 
 use crate::model::{
     DependencyCondition, ExecCheck, ExitMode, HealthProbe, HttpCheck, ProcessInstanceSpec,
@@ -153,15 +155,10 @@ pub fn load_config(path: &Path) -> Result<ProjectConfig> {
         .map_err(|e| anyhow::anyhow!("config error: {}: {e:#}", path.display()))
 }
 
+/// Load a fully resolved project using its automatic root `.env`.
+/// Use [`load_project`] to supply explicit env files or inspect provenance.
 pub fn load_and_merge_configs(paths: &[PathBuf]) -> Result<ProjectConfig> {
-    assert!(!paths.is_empty(), "at least one config path is required");
-    let mut raw = raw::RawProject::default();
-    for path in paths {
-        raw = raw.merge(raw::RawProject::read(path)?)?;
-    }
-    let cfg = raw.resolve()?;
-    validate_config(&cfg)?;
-    Ok(cfg)
+    Ok(load_project(paths, &[], false)?.config)
 }
 
 /// Upper bound on `replicas` per process. Much higher than any sane local-dev
@@ -182,36 +179,43 @@ static PROCESS_NAME_RE: LazyLock<Regex> =
 /// Resolve each service's `env_file` entries against `project_root` and
 /// reject any that escape that directory. Reads `.env` from outside the
 /// project (e.g. `../../etc/secrets`) is a surprise in a compose-shaped
-/// tool; callers who genuinely want a shared env file can symlink it in.
+/// tool. The project loader additionally allows the directory of the file
+/// that supplied each entry. Symlinks are checked against their targets.
 ///
-/// Missing files are tolerated (they would produce a dotenv-parse warning
-/// later but not a load failure); we only canonicalize what exists.
+/// Missing files are tolerated; we only canonicalize what exists.
 pub fn validate_project_paths(cfg: &ProjectConfig, project_root: &Path) -> Result<()> {
+    for (name, process) in &cfg.processes {
+        validate_env_paths(name, &process.env_file, project_root, None)?;
+    }
+    Ok(())
+}
+
+fn validate_env_paths(
+    name: &str,
+    entries: &[String],
+    project_root: &Path,
+    source_dir: Option<&Path>,
+) -> Result<()> {
     let root = fs::canonicalize(project_root).with_context(|| {
         format!(
             "failed to canonicalize project root `{}`",
             project_root.display()
         )
     })?;
-    for (name, proc_cfg) in &cfg.processes {
-        for entry in &proc_cfg.env_file {
-            let abs = if Path::new(entry).is_absolute() {
-                PathBuf::from(entry)
-            } else {
-                project_root.join(entry)
-            };
-            let canonical = match fs::canonicalize(&abs) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if !canonical.starts_with(&root) {
-                bail!(
-                    "process `{name}` env_file `{entry}` resolves outside the \
-                     project directory (`{}` is not under `{}`)",
-                    canonical.display(),
-                    root.display()
-                );
-            }
+    for entry in entries {
+        let abs = project_root.join(entry);
+        let canonical = match fs::canonicalize(&abs) {
+            Ok(p) => p,
+            // Preserve the existing policy for missing env files.
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&root)
+            && !source_dir.is_some_and(|dir| canonical.starts_with(dir))
+        {
+            bail!(
+                "process `{name}` env_file `{entry}` resolves outside the project directory and its defining file directory (`{}`)",
+                canonical.display()
+            );
         }
     }
     Ok(())
@@ -414,31 +418,37 @@ pub fn collect_process_subset(
     names: &[String],
     include_deps: bool,
 ) -> Result<HashSet<String>> {
+    let graph = cfg
+        .processes
+        .iter()
+        .map(|(name, process)| (name.clone(), process.depends_on.keys().cloned().collect()))
+        .collect();
+    collect_subset(&graph, names, include_deps)
+}
+
+/// Missing dependency nodes can be supplied by a later overlay. Final
+/// validation still rejects unresolved references in the completed graph.
+fn collect_subset(
+    graph: &BTreeMap<String, Vec<String>>,
+    names: &[String],
+    include_deps: bool,
+) -> Result<HashSet<String>> {
     for name in names {
-        if !cfg.processes.contains_key(name) {
+        if !graph.contains_key(name) {
             bail!("unknown process `{name}`");
         }
     }
-
-    let keep: HashSet<String> = if include_deps {
-        let mut visited = HashSet::new();
-        let mut queue: VecDeque<String> = names.iter().cloned().collect();
-        while let Some(current) = queue.pop_front() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            if let Some(proc_cfg) = cfg.processes.get(&current) {
-                for dep_name in proc_cfg.depends_on.keys() {
-                    queue.push_back(dep_name.clone());
-                }
-            }
+    let mut visited = HashSet::new();
+    let mut queue: VecDeque<String> = names.iter().cloned().collect();
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
         }
-        visited
-    } else {
-        names.iter().cloned().collect()
-    };
-
-    Ok(keep)
+        if include_deps && let Some(deps) = graph.get(&current) {
+            queue.extend(deps.iter().cloned());
+        }
+    }
+    Ok(visited)
 }
 
 pub fn filter_process_subset(
