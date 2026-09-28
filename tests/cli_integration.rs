@@ -7785,3 +7785,210 @@ processes:
     );
     env.down_json();
 }
+
+#[test]
+fn included_fragment_config_run_and_reload_share_resolution_and_identity() {
+    let mut env = TestEnv::new();
+    let fragments = env._root.path().join("fragments");
+    fs::create_dir_all(&fragments).unwrap();
+    fs::create_dir_all(env.project.join("work")).unwrap();
+    fs::write(fragments.join(".env"), "FRAGMENT_ONLY=must-not-load\n").unwrap();
+    fs::write(fragments.join("service.env"), "FROM_FRAGMENT=asset\n").unwrap();
+    fs::write(
+        env.project.join(".env"),
+        "DECOMPOSE_FRAGMENT_PATH=../fragments/service.yaml\nROOT_ONLY=root\n",
+    )
+    .unwrap();
+    let fragment = fragments.join("service.yaml");
+    let definition = |version: &str| {
+        format!(
+            r#"
+processes:
+  api:
+    command: 'exec /bin/sleep 30'
+    working_dir: work
+    env_file: ['${{DECOMPOSE_FILE_DIR}}/service.env']
+    environment:
+      VERSION: '{version}'
+      PORT: '3000'
+      ASSET_DIR: '${{DECOMPOSE_FILE_DIR}}'
+  excluded:
+    command: /bin/false
+"#
+        )
+    };
+    fs::write(&fragment, definition("first")).unwrap();
+    env.with_config(
+        r#"
+include:
+  - path: '${DECOMPOSE_FRAGMENT_PATH}'
+    processes: [api]
+processes:
+  api:
+    environment: {PORT: '9000'}
+"#,
+    );
+    let output = env.run(&["config", "--json"]);
+    assert_success(&output, "config includes");
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(config["processes"].as_object().unwrap().len(), 1);
+    assert_eq!(config["processes"]["api"]["environment"]["PORT"], "9000");
+    assert_eq!(
+        config["provenance"]["processes"]["api"]["command_source"],
+        fragment.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        config["provenance"]["processes"]["api"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let output = env.run(&["run", "api", "/bin/sh", "-c", "printf '%s|%s|%s|%s|%s' \"$PORT\" \"$ROOT_ONLY\" \"$FROM_FRAGMENT\" \"${FRAGMENT_ONLY:-absent}\" \"$PWD\""]);
+    assert_success(&output, "run included api");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "9000|root|asset|absent|{}",
+            env.project.join("work").canonicalize().unwrap().display()
+        )
+    );
+
+    let first: Value = serde_json::from_slice(&env.up_detach_json().stdout).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let first_pid = loop {
+        if let Some(pid) = pid_of(&env.ps_json_value(), "api") {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "api never started");
+        thread::sleep(Duration::from_millis(30));
+    };
+    // Moving the source changes provenance but not the effective process.
+    fs::rename(&fragment, fragments.join("moved.yaml")).unwrap();
+    // Keep dotenv stable: discovery variables also enter the child env.
+    env.with_config("include: [{path: ../fragments/moved.yaml, processes: [api]}]\nprocesses: {api: {environment: {PORT: '9000'}}}");
+    assert_success(&env.run(&["up", "-d", "--json"]), "reload moved fragment");
+    assert_eq!(pid_of(&env.ps_json_value(), "api"), Some(first_pid));
+
+    fs::write(fragments.join("moved.yaml"), definition("second")).unwrap();
+    let output = env.run(&["up", "-d", "--json"]);
+    assert_success(&output, "reload changed fragment");
+    let second = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter::<Value>()
+        .map(Result::unwrap)
+        .find(|record| record.get("pid").is_some())
+        .expect("up status record");
+    assert!(first["pid"].is_u64());
+    assert_eq!(
+        first["pid"], second["pid"],
+        "same daemon handles include edits"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = pid_of(&env.ps_json_value(), "api")
+            && pid != first_pid
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fragment edit did not restart api"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+    let output = env.run(&["exec", "api", "/bin/sh", "-c", "printf '%s' \"$VERSION\""]);
+    assert_success(&output, "exec included api after reload");
+    assert_eq!(output.stdout, b"second");
+}
+
+#[test]
+fn include_preflight_reports_conflicts_without_starting_daemon() {
+    let mut env = TestEnv::new();
+    fs::write(
+        env.project.join("a.yaml"),
+        "processes: {api: {command: /bin/sleep 30}}",
+    )
+    .unwrap();
+    fs::write(
+        env.project.join("b.yaml"),
+        "processes: {api: {command: /bin/sleep 60}}",
+    )
+    .unwrap();
+    env.with_config("include: [a.yaml, b.yaml]");
+    let output = env.run(&["up", "-d", "--json"]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("conflicts") && error.contains("a.yaml") && error.contains("b.yaml"));
+    assert!(!error.contains("daemon did not become ready"));
+}
+
+#[test]
+fn included_hooks_keep_source_anchors_and_resolve_environment_once() {
+    let mut env = TestEnv::new();
+    let fragments = env._root.path().join("hook-fragments");
+    fs::create_dir_all(&fragments).unwrap();
+    fs::create_dir_all(env.project.join("work")).unwrap();
+    fs::write(fragments.join("service.env"), "HOOK_VALUE=from-file\n").unwrap();
+    fs::write(
+        fragments.join("prepare.sh"),
+        "test \"$HOOK_VALUE\" = from-file && printf '%s' \"$HOOK_ASSET\" > prepared\n",
+    )
+    .unwrap();
+    fs::write(
+        fragments.join("service.yaml"),
+        r#"
+processes:
+  svc:
+    command: sleep 100
+    working_dir: work
+    env_file: ['${DECOMPOSE_FILE_DIR}/service.env']
+    pre_start:
+      - name: prepare
+        creates: prepared
+        environment: {HOOK_ASSET: '${DECOMPOSE_FILE_DIR}'}
+        command: 'sh "${DECOMPOSE_FILE_DIR}/prepare.sh"'
+    post_start:
+      - name: replaced
+        command: 'exit 1'
+"#,
+    )
+    .unwrap();
+    env.with_config(
+        r#"
+include: [../hook-fragments/service.yaml]
+processes:
+  svc:
+    post_start:
+      - name: local
+        command: |
+          set -eu
+          value=inline
+          test "$$value" = inline
+          test '${HOOK_VALUE}' = from-file
+          test '${DECOMPOSE_PROJECT_DIR}' = '${DECOMPOSE_FILE_DIR}'
+          touch '${DECOMPOSE_FILE_DIR}/local-marker'
+"#,
+    );
+    let output = env.run(&["config", "--json"]);
+    assert_success(&output, "resolve included hooks");
+    let config: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pre = &config["processes"]["svc"]["pre_start"][0];
+    assert_eq!(
+        pre["creates"],
+        env.project
+            .canonicalize()
+            .unwrap()
+            .join("work/prepared")
+            .to_str()
+            .unwrap()
+    );
+    assert!(pre.get("interpolation_anchors").is_none());
+    env.up_started = true;
+    assert_success(&env.run(&["up", "-d", "--wait"]), "run included hooks");
+    assert_eq!(
+        fs::read_to_string(env.project.join("work/prepared")).unwrap(),
+        fragments.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(env.project.join("local-marker").exists());
+    env.down_json();
+}

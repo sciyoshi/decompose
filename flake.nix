@@ -18,6 +18,38 @@
           f (import nixpkgs { inherit system; }));
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
     in {
+      # Substitute store paths while leaving runtime ${...} and $$ escapes
+      # untouched. References in the YAML retain their runtime closures.
+      lib.mkFragment = { pkgs, name, src, substitutions ? {} }:
+        assert builtins.match "[A-Za-z0-9_-]+" name != null;
+        pkgs.runCommand "${name}-decompose-fragment" {} ''
+          install -Dm444 ${pkgs.replaceVars src substitutions} \
+            "$out/share/decompose/${name}.yaml"
+        '';
+
+      checks = forAllSystems (pkgs:
+        let
+          runner = pkgs.writeShellScriptBin "fragment-check" ''
+            echo packaged-fragment-ok
+          '';
+          fragment = self.lib.mkFragment {
+            inherit pkgs;
+            name = "check";
+            src = ./examples/fragments/check.yaml;
+            substitutions = { inherit runner; };
+          };
+        in {
+          fragment = pkgs.runCommand "decompose-fragment-check" {} ''
+            file=${fragment}/share/decompose/check.yaml
+            grep -F '${runner}/bin/fragment-check' "$file"
+            grep -F '${"$"}{DECOMPOSE_PROJECT_DIR}' "$file"
+            grep -F '$$RUNTIME_VALUE' "$file"
+            test "$(${runner}/bin/fragment-check)" = packaged-fragment-ok
+            mkdir -p "$out"
+            cp "$file" "$out/check.yaml"
+          '';
+        });
+
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = cargoToml.package.name;

@@ -310,6 +310,28 @@ decompose --file base.yml --file dev.yml up -d
 decompose --file base.yml --file dev.yml ps
 ```
 
+### Including reusable services
+
+```yaml
+include:
+  - ${FLOX_ENV}/share/decompose/nats.yaml
+  - path: ${FLOX_ENV}/share/decompose/temporal.yaml
+    processes: [temporal] # includes transitive dependencies
+processes:
+  nats:
+    environment: {NATS_PORT: '4223'} # inherits the fragment's command
+```
+
+Includes merge in order, then local definitions override them. Duplicate imported
+processes require an explicit local definition. Included files use the root
+project's `.env` and relative service paths. Use `${DECOMPOSE_PROJECT_DIR}` for
+writable data and `${DECOMPOSE_FILE_DIR}` for assets next to a fragment.
+`decompose config --json` reports process provenance.
+
+The flake exposes `lib.mkFragment { pkgs, name, src, substitutions }` to package
+YAML with absolute binary store paths. See the [include and packaging guide](docs/src/configuration.md#includes-and-packaged-fragments)
+for merge rules, path handling, and a complete Nix example.
+
 ### Output modes
 
 ```bash
@@ -424,10 +446,11 @@ disable_env_expansion: false  # Disable ${VAR} interpolation globally
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `include` | list | `[]` | Paths or `{path, processes?}` entries importing reusable processes and global environment. |
 | `environment` | map or list | `{}` | Environment variables applied to all processes. Accepts a YAML map (`KEY: value`) or a list of `KEY=VALUE` strings. |
 | `exit_mode` | string | `wait_all` | Controls daemon behavior when processes exit. One of: `wait_all` (keep running until all processes finish or `down` is called), `exit_on_failure` (stop everything if any process exits non-zero), `exit_on_end` (stop everything when any process exits). |
-| `disable_env_expansion` | bool | `false` | When `true`, disables `${VAR}` interpolation in all string fields. |
-| `processes` | map | *required* | Map of process name to process configuration. At least one process must be defined. |
+| `disable_env_expansion` | bool | `false` | When `true`, disables content interpolation. Include paths still expand. |
+| `processes` | map | `{}` | Process definitions and partial overrides. At least one process must exist after includes and overlays are merged. |
 
 ### Process settings
 
@@ -453,11 +476,11 @@ processes:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `command` | string | *required* | Shell command to run. Executed via the system shell. |
+| `command` | string | *required after merging* | Shell command to run. Executed via the system shell. |
 | `description` | string | `null` | Optional human-readable description. |
-| `working_dir` | string | config file directory | Working directory for the process. Relative paths resolve from the config file location. |
+| `working_dir` | string | project directory | Working directory for the process. Relative paths resolve from the first root config directory, including in fragments. |
 | `environment` | map or list | `{}` | Per-process environment variables. Same format as the global `environment` (map or list of `KEY=VALUE`). Merged on top of global vars. |
-| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Paths are relative to the config file directory. |
+| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Relative paths use the project directory; `${DECOMPOSE_FILE_DIR}` addresses fragment assets. |
 | `disabled` | bool | `false` | When `true`, the process is visible in `ps` output but not auto-started by `up`. Can be started explicitly with `start`. |
 | `replicas` | integer | `1` | Number of instances to run. When greater than 1, instances are named `service[1]`, `service[2]`, etc. Must be at least 1. |
 | `ready_log_line` | string (regex) | `null` | A regex pattern matched against process stdout/stderr. When a line matches, the process is marked as "log ready". Required if any other process depends on this one with `process_log_ready` condition. |
@@ -635,7 +658,10 @@ earlier ones:
 
 #### Variable interpolation
 
-String fields support `${VAR}` substitution from the merged environment.
+String fields support `${VAR}` substitution after merging. Interpolation uses
+root dotenv, then shell values, global environment, and process environment, in
+increasing precedence. Reserved path anchors take precedence over declarations.
+Per-process `env_file` values are loaded into children, not used for interpolation.
 
 | Syntax | Description |
 |---|---|
@@ -645,8 +671,8 @@ String fields support `${VAR}` substitution from the merged environment.
 | `$$` | Literal `$` character (escape). |
 
 Interpolation is applied to these fields: `command`, `description`,
-`working_dir`, `ready_log_line`, `shutdown.command`, and all environment
-variable values.
+`working_dir`, `env_file`, `ready_log_line`, `shutdown.command`, probe exec
+commands and HTTP strings, and all environment variable values.
 
 Disable interpolation globally by setting `disable_env_expansion: true` at
 the top level.

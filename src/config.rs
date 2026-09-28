@@ -8,6 +8,10 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod compose;
+mod raw;
+pub use compose::{LoadedProject, MAX_INCLUDE_DEPTH, ProcessProvenance, Provenance, load_project};
+
 use crate::model::{
     DependencyCondition, ExecCheck, ExitMode, HealthProbe, HttpCheck, ProcessInstanceSpec,
     ProcessRuntime, ProcessStatus, RestartPolicy,
@@ -123,6 +127,9 @@ pub struct ProcessConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
+    /// Source anchors are applied during the single, deferred hook expansion.
+    #[serde(skip)]
+    pub(crate) interpolation_anchors: BTreeMap<String, String>,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -285,6 +292,7 @@ pub(crate) fn resolve_hooks(
         .map(|mut h| {
             let mut vars = env.clone();
             vars.extend(h.environment.0.clone());
+            vars.extend(h.interpolation_anchors.clone());
             let overrides = h
                 .environment
                 .0
@@ -303,18 +311,20 @@ pub(crate) fn resolve_hooks(
             vars = env.clone();
             vars.extend(overrides);
             if expand {
-                h.command.interpolate(&vars);
-                h.unless.interpolate(&vars);
-                h.working_dir.interpolate(&vars);
-                h.creates.interpolate(&vars);
+                let mut interpolation_vars = vars.clone();
+                interpolation_vars.extend(h.interpolation_anchors.clone());
+                h.command.interpolate(&interpolation_vars);
+                h.unless.interpolate(&interpolation_vars);
+                h.working_dir.interpolate(&interpolation_vars);
+                h.creates.interpolate(&interpolation_vars);
                 if let Some(w) = &mut h.wait_for {
                     if let Some(e) = &mut w.exec {
-                        e.command.interpolate(&vars);
+                        e.command.interpolate(&interpolation_vars);
                     }
                     if let Some(http) = &mut w.http_get {
-                        http.host.interpolate(&vars);
-                        http.scheme.interpolate(&vars);
-                        http.path.interpolate(&vars);
+                        http.host.interpolate(&interpolation_vars);
+                        http.scheme.interpolate(&interpolation_vars);
+                        http.path.interpolate(&interpolation_vars);
                     }
                 }
             }
@@ -360,31 +370,14 @@ pub struct ProcessDependency {
 // ---------------------------------------------------------------------------
 
 pub fn load_config(path: &Path) -> Result<ProjectConfig> {
-    let data = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file {}", path.display()))?;
-    let cfg: ProjectConfig = serde_yaml_ng::from_str(&data).map_err(|e| {
-        // serde_yaml_ng exposes a line/column location on parse errors;
-        // surface it alongside the file path so users see the offending
-        // spot instead of a bare "mapping: invalid value" message.
-        let location = e
-            .location()
-            .map(|loc| format!(":{}:{}", loc.line(), loc.column()))
-            .unwrap_or_default();
-        anyhow::anyhow!("config error: {}{location}: {e}", path.display())
-    })?;
-    validate_config(&cfg).map_err(|e| anyhow::anyhow!("config error: {}: {e}", path.display()))?;
-    Ok(cfg)
+    load_and_merge_configs(&[path.to_path_buf()])
+        .map_err(|e| anyhow::anyhow!("config error: {}: {e:#}", path.display()))
 }
 
+/// Load a fully resolved project using its automatic root `.env`.
+/// Use [`load_project`] to supply explicit env files or inspect provenance.
 pub fn load_and_merge_configs(paths: &[PathBuf]) -> Result<ProjectConfig> {
-    assert!(!paths.is_empty(), "at least one config path is required");
-    let mut cfg = load_config(&paths[0])?;
-    for path in &paths[1..] {
-        let overlay = load_config(path)?;
-        cfg = merge_configs(cfg, overlay);
-    }
-    validate_config(&cfg)?;
-    Ok(cfg)
+    Ok(load_project(paths, &[], false)?.config)
 }
 
 /// Upper bound on `replicas` per process. Much higher than any sane local-dev
@@ -405,36 +398,43 @@ static PROCESS_NAME_RE: LazyLock<Regex> =
 /// Resolve each service's `env_file` entries against `project_root` and
 /// reject any that escape that directory. Reads `.env` from outside the
 /// project (e.g. `../../etc/secrets`) is a surprise in a compose-shaped
-/// tool; callers who genuinely want a shared env file can symlink it in.
+/// tool. The project loader additionally allows the directory of the file
+/// that supplied each entry. Symlinks are checked against their targets.
 ///
-/// Missing files are tolerated (they would produce a dotenv-parse warning
-/// later but not a load failure); we only canonicalize what exists.
+/// Missing files are tolerated; we only canonicalize what exists.
 pub fn validate_project_paths(cfg: &ProjectConfig, project_root: &Path) -> Result<()> {
+    for (name, process) in &cfg.processes {
+        validate_env_paths(name, &process.env_file, project_root, None)?;
+    }
+    Ok(())
+}
+
+fn validate_env_paths(
+    name: &str,
+    entries: &[String],
+    project_root: &Path,
+    source_dir: Option<&Path>,
+) -> Result<()> {
     let root = fs::canonicalize(project_root).with_context(|| {
         format!(
             "failed to canonicalize project root `{}`",
             project_root.display()
         )
     })?;
-    for (name, proc_cfg) in &cfg.processes {
-        for entry in &proc_cfg.env_file {
-            let abs = if Path::new(entry).is_absolute() {
-                PathBuf::from(entry)
-            } else {
-                project_root.join(entry)
-            };
-            let canonical = match fs::canonicalize(&abs) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if !canonical.starts_with(&root) {
-                bail!(
-                    "process `{name}` env_file `{entry}` resolves outside the \
-                     project directory (`{}` is not under `{}`)",
-                    canonical.display(),
-                    root.display()
-                );
-            }
+    for entry in entries {
+        let abs = project_root.join(entry);
+        let canonical = match fs::canonicalize(&abs) {
+            Ok(p) => p,
+            // Preserve the existing policy for missing env files.
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&root)
+            && !source_dir.is_some_and(|dir| canonical.starts_with(dir))
+        {
+            bail!(
+                "process `{name}` env_file `{entry}` resolves outside the project directory and its defining file directory (`{}`)",
+                canonical.display()
+            );
         }
     }
     Ok(())
@@ -634,75 +634,6 @@ fn detect_dependency_cycles(cfg: &ProjectConfig) -> Result<()> {
 // Config merging
 // ---------------------------------------------------------------------------
 
-pub fn merge_configs(base: ProjectConfig, overlay: ProjectConfig) -> ProjectConfig {
-    let mut env = base.environment.0;
-    env.extend(overlay.environment.0);
-
-    let mut processes = base.processes;
-    for (name, overlay_proc) in overlay.processes {
-        if let Some(base_proc) = processes.get_mut(&name) {
-            if overlay_proc.pre_start.is_some() {
-                base_proc.pre_start = overlay_proc.pre_start;
-            }
-            if overlay_proc.post_start.is_some() {
-                base_proc.post_start = overlay_proc.post_start;
-            }
-            base_proc.command = overlay_proc.command;
-            if overlay_proc.description.is_some() {
-                base_proc.description = overlay_proc.description;
-            }
-            if overlay_proc.working_dir.is_some() {
-                base_proc.working_dir = overlay_proc.working_dir;
-            }
-            base_proc.environment.0.extend(overlay_proc.environment.0);
-            base_proc.depends_on.extend(overlay_proc.depends_on);
-            if !overlay_proc.env_file.is_empty() {
-                base_proc.env_file = overlay_proc.env_file;
-            }
-            if overlay_proc.replicas != 1 {
-                base_proc.replicas = overlay_proc.replicas;
-            }
-            if overlay_proc.ready_log_line.is_some() {
-                base_proc.ready_log_line = overlay_proc.ready_log_line;
-            }
-            if overlay_proc.restart_policy.is_some() {
-                base_proc.restart_policy = overlay_proc.restart_policy;
-            }
-            if overlay_proc.backoff_seconds.is_some() {
-                base_proc.backoff_seconds = overlay_proc.backoff_seconds;
-            }
-            if overlay_proc.max_restarts.is_some() {
-                base_proc.max_restarts = overlay_proc.max_restarts;
-            }
-            if overlay_proc.shutdown.is_some() {
-                base_proc.shutdown = overlay_proc.shutdown;
-            }
-            if overlay_proc.readiness_probe.is_some() {
-                base_proc.readiness_probe = overlay_proc.readiness_probe;
-            }
-            if overlay_proc.liveness_probe.is_some() {
-                base_proc.liveness_probe = overlay_proc.liveness_probe;
-            }
-            if overlay_proc.disabled {
-                base_proc.disabled = true;
-            }
-        } else {
-            processes.insert(name, overlay_proc);
-        }
-    }
-
-    ProjectConfig {
-        environment: EnvVars(env),
-        processes,
-        disable_env_expansion: overlay.disable_env_expansion || base.disable_env_expansion,
-        exit_mode: if overlay.exit_mode != ExitMode::WaitAll {
-            overlay.exit_mode
-        } else {
-            base.exit_mode
-        },
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Process subset filtering (Phase A3)
 // ---------------------------------------------------------------------------
@@ -716,31 +647,37 @@ pub fn collect_process_subset(
     names: &[String],
     include_deps: bool,
 ) -> Result<HashSet<String>> {
+    let graph = cfg
+        .processes
+        .iter()
+        .map(|(name, process)| (name.clone(), process.depends_on.keys().cloned().collect()))
+        .collect();
+    collect_subset(&graph, names, include_deps)
+}
+
+/// Missing dependency nodes can be supplied by a later overlay. Final
+/// validation still rejects unresolved references in the completed graph.
+fn collect_subset(
+    graph: &BTreeMap<String, Vec<String>>,
+    names: &[String],
+    include_deps: bool,
+) -> Result<HashSet<String>> {
     for name in names {
-        if !cfg.processes.contains_key(name) {
+        if !graph.contains_key(name) {
             bail!("unknown process `{name}`");
         }
     }
-
-    let keep: HashSet<String> = if include_deps {
-        let mut visited = HashSet::new();
-        let mut queue: VecDeque<String> = names.iter().cloned().collect();
-        while let Some(current) = queue.pop_front() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-            if let Some(proc_cfg) = cfg.processes.get(&current) {
-                for dep_name in proc_cfg.depends_on.keys() {
-                    queue.push_back(dep_name.clone());
-                }
-            }
+    let mut visited = HashSet::new();
+    let mut queue: VecDeque<String> = names.iter().cloned().collect();
+    while let Some(current) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
         }
-        visited
-    } else {
-        names.iter().cloned().collect()
-    };
-
-    Ok(keep)
+        if include_deps && let Some(deps) = graph.get(&current) {
+            queue.extend(deps.iter().cloned());
+        }
+    }
+    Ok(visited)
 }
 
 pub fn filter_process_subset(
@@ -1394,20 +1331,20 @@ processes:
 
     #[test]
     fn hooks_replace_inherit_clear_and_affect_hash() {
-        let base: ProjectConfig = serde_yaml_ng::from_str("processes: {svc: {command: echo, pre_start: [{name: x, command: echo}], post_start: [{name: x, command: echo}]}}").unwrap();
-        validate_config(&base).unwrap(); // Names may repeat across phases.
-        let inherited = merge_configs(
-            base.clone(),
-            serde_yaml_ng::from_str("processes: {svc: {command: echo}}").unwrap(),
-        );
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.yaml");
+        let overlay = dir.path().join("overlay.yaml");
+        fs::write(&base, "processes: {svc: {command: echo, pre_start: [{name: x, command: echo}], post_start: [{name: x, command: echo}]}}").unwrap();
+        let load = |yaml: &str| {
+            fs::write(&overlay, yaml).unwrap();
+            load_and_merge_configs(&[base.clone(), overlay.clone()]).unwrap()
+        };
+        let inherited = load("processes: {svc: {description: inherited}}");
         assert_eq!(
             inherited.processes["svc"].pre_start.as_ref().unwrap().len(),
             1
         );
-        let cleared = merge_configs(
-            base.clone(),
-            serde_yaml_ng::from_str("processes: {svc: {command: echo, pre_start: []}}").unwrap(),
-        );
+        let cleared = load("processes: {svc: {pre_start: []}}");
         assert!(
             cleared.processes["svc"]
                 .pre_start
@@ -1420,16 +1357,10 @@ processes:
             1
         );
         assert_ne!(
-            compute_config_hash(&base.processes["svc"], &BTreeMap::new()),
+            compute_config_hash(&inherited.processes["svc"], &BTreeMap::new()),
             compute_config_hash(&cleared.processes["svc"], &BTreeMap::new())
         );
-        let replaced = merge_configs(
-            base,
-            serde_yaml_ng::from_str(
-                "processes: {svc: {command: echo, post_start: [{name: y, command: changed}]}}",
-            )
-            .unwrap(),
-        );
+        let replaced = load("processes: {svc: {post_start: [{name: y, command: changed}]}}");
         assert_eq!(
             replaced.processes["svc"].post_start.as_ref().unwrap()[0].name,
             "y"
@@ -2066,9 +1997,9 @@ processes:
     environment:
       B: "2"
 "#;
-        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
-        let merged = merge_configs(base, overlay);
+        let base: raw::RawProject = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: raw::RawProject = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = base.merge(overlay).unwrap().resolve().unwrap();
 
         let api = merged.processes.get("api").unwrap();
         assert_eq!(api.command, "echo overlay");
@@ -2090,9 +2021,9 @@ processes:
   worker:
     command: "echo worker"
 "#;
-        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
-        let merged = merge_configs(base, overlay);
+        let base: raw::RawProject = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: raw::RawProject = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = base.merge(overlay).unwrap().resolve().unwrap();
 
         assert!(merged.processes.contains_key("api"));
         assert!(merged.processes.contains_key("worker"));
@@ -2116,9 +2047,9 @@ processes:
   x:
     command: "echo"
 "#;
-        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
-        let merged = merge_configs(base, overlay);
+        let base: raw::RawProject = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: raw::RawProject = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = base.merge(overlay).unwrap().resolve().unwrap();
 
         assert_eq!(merged.environment.0.get("A"), Some(&"1".to_string()));
         assert_eq!(merged.environment.0.get("B"), Some(&"overlay".to_string()));
@@ -2214,11 +2145,17 @@ processes:
       period_seconds: 2
 "#;
 
-        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
-        let staging: ProjectConfig = serde_yaml_ng::from_str(staging_yaml).unwrap();
-        let local: ProjectConfig = serde_yaml_ng::from_str(local_yaml).unwrap();
+        let base: raw::RawProject = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let staging: raw::RawProject = serde_yaml_ng::from_str(staging_yaml).unwrap();
+        let local: raw::RawProject = serde_yaml_ng::from_str(local_yaml).unwrap();
 
-        let merged = merge_configs(merge_configs(base, staging), local);
+        let merged = base
+            .merge(staging)
+            .unwrap()
+            .merge(local)
+            .unwrap()
+            .resolve()
+            .unwrap();
 
         // Global env: last-wins on conflicts, additive on distinct keys.
         assert_eq!(merged.environment.0.get("TIER"), Some(&"local".to_string()));
@@ -2275,9 +2212,9 @@ environment:
   EXTRA: "1"
 processes: {}
 "#;
-        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
-        let merged = merge_configs(base, overlay);
+        let base: raw::RawProject = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: raw::RawProject = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = base.merge(overlay).unwrap().resolve().unwrap();
 
         assert_eq!(merged.processes.len(), 2);
         assert!(merged.processes.contains_key("api"));
@@ -2311,9 +2248,9 @@ processes:
   api:
     command: "echo overlay"
 "#;
-        let base: ProjectConfig = serde_yaml_ng::from_str(base_yaml).unwrap();
-        let overlay: ProjectConfig = serde_yaml_ng::from_str(overlay_yaml).unwrap();
-        let merged = merge_configs(base, overlay);
+        let base: raw::RawProject = serde_yaml_ng::from_str(base_yaml).unwrap();
+        let overlay: raw::RawProject = serde_yaml_ng::from_str(overlay_yaml).unwrap();
+        let merged = base.merge(overlay).unwrap().resolve().unwrap();
 
         let api = merged.processes.get("api").unwrap();
         assert_eq!(api.command, "echo overlay");

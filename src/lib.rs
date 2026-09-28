@@ -61,10 +61,7 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::cli::{Cli, Commands, ExecArgs, KillArgs, LogsArgs, RunArgs, ServiceArgs, UpArgs};
-use crate::config::{
-    apply_interpolation, build_process_instances, load_and_merge_configs, load_dotenv_files,
-    resolve_config_paths,
-};
+use crate::config::{build_process_instances, load_project, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
 use crate::output::{
@@ -121,10 +118,9 @@ fn resolve_service_context(
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config_files = resolve_config_paths(&global.config_files, &cwd)?;
     let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
-    let dotenv = load_dotenv_files(&config_dir, &global.env_files, global.disable_dotenv)?;
-    let mut cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
-    apply_interpolation(&mut cfg);
-    crate::config::validate_project_paths(&cfg, &config_dir)?;
+    let loaded = load_project(&config_files, &global.env_files, global.disable_dotenv)?;
+    let cfg = loaded.config;
+    let dotenv = loaded.dotenv;
     if !cfg.processes.contains_key(service) {
         let known: Vec<&str> = cfg.processes.keys().map(|k| k.as_str()).collect();
         bail!(
@@ -425,7 +421,7 @@ async fn ensure_daemon_running(
         // Clean up stale socket/pid from a previously killed daemon so the
         // new daemon can bind the socket without interference.
         cleanup_stale_files(paths);
-        preflight_validate_config(config_files, &args.processes)?;
+        preflight_validate_config(global, config_files, &args.processes)?;
         // Attached `up` stays tethered to its daemon: if the user Ctrl-C's
         // out or the terminal is closed, the daemon should auto-exit rather
         // than leak. Detached `up -d` explicitly opts into a daemon that
@@ -575,9 +571,14 @@ async fn reload_and_start_existing_daemon(
 /// spawning the daemon, so users see structured errors (dependency cycles,
 /// unknown services) instead of a generic "daemon did not become ready"
 /// timeout.
-fn preflight_validate_config(config_files: &[PathBuf], processes: &[String]) -> Result<()> {
-    let preflight = load_and_merge_configs(config_files)
-        .context("config validation failed before starting daemon")?;
+fn preflight_validate_config(
+    global: &GlobalConfig,
+    config_files: &[PathBuf],
+    processes: &[String],
+) -> Result<()> {
+    let preflight = load_project(config_files, &global.env_files, global.disable_dotenv)
+        .context("config validation failed before starting daemon")?
+        .config;
     if processes.is_empty() {
         return Ok(());
     }
@@ -1047,12 +1048,10 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
     let cwd = env::current_dir().context("failed to read current directory")?;
     let config_files = resolve_config_paths(&global.config_files, &cwd)?;
     let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
-    let mut cfg = load_and_merge_configs(&config_files).context("invalid configuration")?;
-    apply_interpolation(&mut cfg);
-    crate::config::validate_project_paths(&cfg, &config_dir)?;
+    let loaded = load_project(&config_files, &global.env_files, global.disable_dotenv)?;
+    let mut cfg = loaded.config;
 
-    let dotenv = load_dotenv_files(&config_dir, &global.env_files, global.disable_dotenv)?;
-    let instances = build_process_instances(&cfg, &config_dir, &dotenv);
+    let instances = build_process_instances(&cfg, &config_dir, &loaded.dotenv);
     crate::config::validate_resolved_hooks(&instances)?;
     for (name, service) in &mut cfg.processes {
         if let Some(r) = instances.values().find(|r| &r.spec.base_name == name) {
@@ -1062,7 +1061,10 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
     }
     match output_mode {
         OutputMode::Json => {
-            let json = serde_json::to_string_pretty(&cfg).context("failed to serialize config")?;
+            let mut value = serde_json::to_value(&cfg)?;
+            value["provenance"] = serde_json::to_value(&loaded.provenance)?;
+            let json =
+                serde_json::to_string_pretty(&value).context("failed to serialize config")?;
             println!("{json}");
         }
         OutputMode::Table => {
