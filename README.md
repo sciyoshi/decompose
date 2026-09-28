@@ -497,6 +497,7 @@ processes:
 | `process_started` | The dependency has been started (default if omitted). |
 | `process_completed` | The dependency has exited (any exit code). |
 | `process_completed_successfully` | The dependency has exited with code 0. |
+| `process_initialized` | Every current replica is running and its startup hooks have succeeded or skipped as already satisfied. |
 | `process_healthy` | The dependency's readiness probe is passing. Requires `readiness_probe` to be configured on the dependency. |
 | `process_log_ready` | The dependency's `ready_log_line` regex has matched. Requires `ready_log_line` to be configured on the dependency. |
 
@@ -829,3 +830,23 @@ processes:
         command: "pg_isready"
       period_seconds: 5
 ```
+
+### Startup initialization
+
+Attach ordered `pre_start` and `post_start` hooks to each replica to prepare data
+before spawn and create resources after its administrative endpoint is available.
+Hooks support `creates` artifact guards, `unless` resource checks, independent
+`wait_for` probes, deadlines, and environment/directory overrides. An `unless`
+check returns 0 to skip, 1 to perform the work, and another code to fail; guarded
+work is verified afterward. Guards are reevaluated on every restart without a
+persistent success cache.
+
+Depend on `process_initialized` to wait for every running replica's hooks.
+`up -d --wait` includes initialization, and `ps`, the TUI, and service logs expose
+hook progress and failures. Pre-start failure prevents spawn; post-start failure
+leaves a running service available for inspection under `wait_all`. Hook failures
+do not invoke restart policy. `run`/`exec` do not execute lifecycle hooks.
+
+See the [configuration guide](docs/src/configuration.md#startup-hooks) and the
+[self-contained example](examples/startup-hooks.yml). Hooks execute natively;
+shared resources still require idempotent operations or application-side locking.

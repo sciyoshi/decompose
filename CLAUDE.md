@@ -177,3 +177,32 @@ catalog on each platform. It uses the
 `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub `flox` environment.
 The package version comes from `Cargo.toml`; commit and push all build inputs
 before publishing. See `AGENTS.md` for the full release process.
+
+## Startup hooks
+
+Each process accepts ordered `pre_start` and `post_start` lists. Required fields
+are literal `name` and shell `command`; optional fields are `unless`, `creates`
+(mutually exclusive), `wait_for`, `timeout_seconds` (60), `working_dir`, and
+`environment`. Unknown fields and null phase lists are rejected. Overlay omission
+inherits a phase; `[]` clears it. Hook fields are interpolated once after service
+environment resolution, and resolved hook definitions participate in hashing.
+
+`src/hooks.rs` owns bounded wait/check/execute/verify stages and attributed log
+output. Controllers are registered before pre-start and own cleanup through child
+exit. Never detach or abort hook execution without reaping its group and output
+readers. Resolve `NameHandle` under the state lock; reload can rename live replicas.
+Controllers are joined before replacement, preventing stale attempt updates.
+
+`unless` uses 0=exists, 1=absent, other=error; verify once after mutation. `creates`
+follows symlinks and only treats not-found as absence. Hooks reevaluate on every
+spawn, including automatic restarts. Hook failure itself does not restart a service.
+Pre-start failure prevents spawn; post-start failure leaves the child running in
+`wait_all`. Preserve initialization failure through shutdown for foreground errors.
+
+`process_initialized` requires all current replicas running with successful hooks;
+readiness and historical `process_started` remain independent. The new
+`initializing` process state has no main PID. Snapshots retain historical hook
+records with backward-safe defaults. `up --wait` includes initialization; one-shot
+commands (`run`/`exec`) exclude lifecycle hooks. Hook output must never feed
+`ready_log_line`. Tests use isolated scripts and synchronization files; see
+`startup_hooks_*` in `tests/cli_integration.rs`.

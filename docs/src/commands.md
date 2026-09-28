@@ -25,7 +25,7 @@ Start services and (by default) attach to streaming logs until Ctrl-C.
 | Flag | Description |
 |------|-------------|
 | `-d`, `--detach` | Start the daemon and return immediately. |
-| `--wait` | With `-d`, wait until every selected service is started/healthy before returning. Requires `-d`/`--detach`. |
+| `--wait` | With `-d`, wait until every selected service is initialized and started/healthy before returning. Requires `-d`/`--detach`. |
 | `--no-deps` | Don't auto-start dependencies of the named services. |
 | `--remove-orphans` | Stop and drop services that exist in the daemon but not in the current config. |
 | `--force-recreate` | Recreate every service regardless of whether its config hash changed. Conflicts with `--no-recreate`. |
@@ -143,3 +143,24 @@ command to see the same env mutations the supervisor applied.
 Emit a shell completion script for the given shell to stdout. Supported
 shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`. See
 [Shell completion](completion.md) for installation snippets.
+
+### Startup initialization and waiting
+
+`up` and `start` run pre-start and post-start hooks for new/stopped replicas;
+`restart` reevaluates both phases. Repeated `up`/`start` on an unchanged running
+replica does not rerun hooks. Scale-up runs them only for new replicas; scale-down
+and recreation cancel and clean up affected hook processes.
+
+`up -d` acknowledges launch asynchronously. `up -d --wait` also requires hook
+success before applying its usual started/healthy criterion. Hook failures fail
+waiting promptly with the service, phase, hook, and cause. Successfully exited
+one-shot jobs use the latest attempt's historical initialization result. A job
+that exits before post-start completes has not initialized successfully.
+
+The overall CLI wait deadline is controlled by
+`DECOMPOSE_DAEMON_READY_TIMEOUT_MS` (default five minutes). On expiry it reports
+the active hook or readiness condition; it does not cancel detached work.
+Individual hook deadlines remain independent. `run` and `exec` never execute
+startup hooks for their one-off commands. There is no skip-hooks or cache-reset
+command: restart to retry, and intentionally change a guard or its owned data
+when guarded work should run again.
