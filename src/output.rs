@@ -91,7 +91,7 @@ pub fn style_for_status(status: &str, color: bool) -> Style {
         "running" => GREEN,
         "exited" => GREEN,
         "healthy" => GREEN,
-        "pending" | "starting" | "restarting" => YELLOW,
+        "pending" | "initializing" | "starting" | "restarting" => YELLOW,
         "failed" | "failed_to_start" => RED,
         "disabled" | "not_started" | "stopped" => DIM,
         _ => Style::new(),
@@ -116,9 +116,10 @@ pub fn unified_state(
     let (g, label, s) = match state {
         "running" if !has_readiness_probe || healthy => ("\u{25cf}", "healthy", GREEN), // ●
         "running" => ("\u{25cb}", "running", YELLOW),                                   // ○
-        "pending" => ("\u{25cc}", "pending", YELLOW),                                   // ◌
-        "restarting" => ("\u{25cc}", "restarting", YELLOW),                             // ◌
-        "failed" | "failed_to_start" => ("\u{2715}", "failed", RED),                    // ✕
+        "initializing" => ("\u{25cc}", "initializing", YELLOW),
+        "pending" => ("\u{25cc}", "pending", YELLOW), // ◌
+        "restarting" => ("\u{25cc}", "restarting", YELLOW), // ◌
+        "failed" | "failed_to_start" => ("\u{2715}", "failed", RED), // ✕
         "exited" => ("-", "exited", DIM),
         "stopped" => ("-", "stopped", DIM),
         "disabled" => ("-", "disabled", DIM),
@@ -237,6 +238,30 @@ pub fn print_up_status(info: &UpStatusInfo<'_>) {
         format!("  {}", parts.join(" · "))
     };
     println!("{}", styled(&hint, dim));
+}
+
+/// Display initialization separately from child state and readiness.
+pub(crate) fn initialization_detail(p: &crate::model::ProcessSnapshot) -> String {
+    let detail = p.initialization.detail();
+    if !detail.is_empty() {
+        return detail;
+    }
+    p.initialization_blockers
+        .iter()
+        .map(|b| {
+            let detail = b.initialization.detail();
+            format!(
+                "waiting for {} initialization{}",
+                b.service,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]

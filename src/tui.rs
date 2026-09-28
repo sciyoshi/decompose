@@ -717,7 +717,11 @@ fn draw_process_list(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .map(|p| {
             let (glyph, label, _astyle) =
                 crate::output::unified_state(&p.state, p.has_readiness_probe, p.ready, false);
-            let state_color = state_color(&p.state, p.has_readiness_probe, p.ready);
+            let state_color = if p.initialization.failure().is_some() {
+                Color::Red
+            } else {
+                state_color(&p.state, p.has_readiness_probe, p.ready)
+            };
             let pid = p
                 .pid
                 .map(|x| x.to_string())
@@ -742,6 +746,10 @@ fn draw_process_list(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 Span::raw(format!("{:<22}", truncate(&p.name, 22))),
                 Span::raw(format!("{:>8}", pid)),
                 Span::raw(format!("{:>8}", restarts)),
+                Span::styled(
+                    format!("  {}", crate::output::initialization_detail(p)),
+                    Style::default().fg(state_color),
+                ),
             ]);
             ListItem::new(row)
         })
@@ -906,7 +914,7 @@ fn truncate(s: &str, max: usize) -> String {
 fn state_color(state: &str, has_readiness_probe: bool, healthy: bool) -> Color {
     match state {
         "running" if !has_readiness_probe || healthy => Color::Green,
-        "running" | "pending" | "restarting" => Color::Yellow,
+        "running" | "pending" | "initializing" | "restarting" => Color::Yellow,
         "failed" | "failed_to_start" => Color::Red,
         "exited" | "stopped" | "disabled" | "not_started" => Color::DarkGray,
         _ => Color::White,
@@ -1182,6 +1190,8 @@ mod tests {
 
     fn sample_snapshot(name: &str) -> ProcessSnapshot {
         ProcessSnapshot {
+            initialization: Default::default(),
+            initialization_blockers: Vec::new(),
             name: name.to_string(),
             base: name.to_string(),
             replica: 0,

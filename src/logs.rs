@@ -65,6 +65,12 @@ impl Identity {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_stage: Option<String>,
     pub timestamp: String,
     pub service: String,
     pub replica: u16,
@@ -80,7 +86,13 @@ impl Record {
         if strip {
             self.message.clone()
         } else {
-            format!("[{}] {}", self.name, self.message)
+            let hook = self
+                .hook_phase
+                .as_ref()
+                .zip(self.hook_name.as_ref())
+                .map(|(p, n)| format!("[{p}:{n}] "))
+                .unwrap_or_default();
+            format!("[{}] {hook}{}", self.name, self.message)
         }
     }
 }
@@ -180,6 +192,18 @@ impl Writer {
         self.write_record(name, stream, remaining, partial)
     }
 
+    pub fn write_hook(
+        &mut self,
+        name: &str,
+        stream: &str,
+        message: &str,
+        partial: bool,
+        metadata: (&str, &str, &str),
+    ) -> io::Result<()> {
+        // Readers already use bounded chunks, like service output.
+        self.write_record_with_hook(name, stream, message, partial, Some(metadata))
+    }
+
     fn write_record(
         &mut self,
         name: &str,
@@ -187,10 +211,23 @@ impl Writer {
         message: &str,
         partial: bool,
     ) -> io::Result<()> {
+        self.write_record_with_hook(name, stream, message, partial, None)
+    }
+    fn write_record_with_hook(
+        &mut self,
+        name: &str,
+        stream: &str,
+        message: &str,
+        partial: bool,
+        metadata: Option<(&str, &str, &str)>,
+    ) -> io::Result<()> {
         // Clamp clock corrections per replica to preserve its observed order.
         let time = SystemTime::now().max(self.last_time);
         self.last_time = time;
         let record = Record {
+            hook_phase: metadata.map(|m| m.0.into()),
+            hook_name: metadata.map(|m| m.1.into()),
+            hook_stage: metadata.map(|m| m.2.into()),
             timestamp: humantime::format_rfc3339_nanos(time).to_string(),
             service: self.identity.service.clone(),
             replica: self.identity.replica,

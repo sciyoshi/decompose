@@ -6830,3 +6830,212 @@ processes:
     }
     assert_eq!(files, 3, "one output file per replica");
 }
+
+// Startup hooks use synchronization files for lifecycle races. Polling only
+// observes a condition; it never stands in for completion of an operation.
+fn wait_hook_snapshot(env: &TestEnv, condition: impl Fn(&Value) -> bool) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let ps = env.ps_json_value();
+        if condition(&ps) {
+            return ps;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out: {ps}");
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+fn hook_service<'a>(ps: &'a Value, name: &str) -> &'a Value {
+    ps["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap()
+}
+
+#[test]
+fn startup_hooks_acceptance_guards_restart_and_reinitialize() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  db:
+    command: 'test -f data/prepared && touch endpoint; exec sleep 100'
+    pre_start:
+      - name: prepare
+        creates: data/prepared
+        command: 'mkdir -p data; echo pre >> mutations; touch data/prepared'
+    post_start:
+      - name: user
+        wait_for: {exec: {command: 'test -f endpoint'}}
+        unless: 'test -f data/user'
+        command: 'echo post >> mutations; touch data/user'
+  api:
+    command: 'test -f data/user; exec sleep 100'
+    depends_on: {db: {condition: process_initialized}}
+"#,
+    );
+    env.up_detach_json();
+    assert_success(&env.run(&["up", "-d", "--wait"]), "wait initialization");
+    assert_eq!(
+        fs::read_to_string(env.project.join("mutations")).unwrap(),
+        "pre\npost\n"
+    );
+    assert_success(&env.run(&["restart", "db"]), "restart");
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "db")["initialization"]["initialized"] == true
+    });
+    let ps = env.ps_json_value();
+    for h in hook_service(&ps, "db")["initialization"]["hooks"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(h["reason"], "already_satisfied");
+    }
+    assert_eq!(
+        fs::read_to_string(env.project.join("mutations")).unwrap(),
+        "pre\npost\n"
+    );
+    assert_success(&env.run(&["stop", "db"]), "stop");
+    wait_hook_snapshot(&env, |ps| hook_service(ps, "db")["state"] == "stopped");
+    fs::remove_dir_all(env.project.join("data")).unwrap();
+    assert_success(&env.run(&["start", "db"]), "start");
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "db")["initialization"]["initialized"] == true
+    });
+    assert_eq!(
+        fs::read_to_string(env.project.join("mutations")).unwrap(),
+        "pre\npost\npre\npost\n"
+    );
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_pre_failure_prevents_spawn_and_wait_fails_promptly() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  db:
+    command: 'touch spawned; sleep 100'
+    restart_policy: always
+    pre_start:
+      - {name: broken, unless: 'exit 2', command: 'touch mutation'}
+      - {name: later, command: 'touch later'}
+    post_start: [{name: post, command: 'touch post'}]
+  api:
+    command: 'sleep 100'
+    depends_on: {db: {condition: process_initialized}}
+"#,
+    );
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "db")["state"] == "failed");
+    let db = hook_service(&ps, "db");
+    assert!(db["pid"].is_null());
+    assert_eq!(db["restart_count"], 0);
+    assert_eq!(db["initialization"]["hooks"][0]["exit_code"], 2);
+    assert_eq!(db["initialization"]["hooks"][1]["reason"], "prior_failure");
+    assert_eq!(hook_service(&ps, "api")["state"], "pending");
+    assert_eq!(
+        hook_service(&ps, "api")["initialization_blockers"][0]["service"],
+        "db"
+    );
+    for path in ["spawned", "mutation", "later", "post"] {
+        assert!(!env.project.join(path).exists());
+    }
+    let out = env.run(&["up", "-d", "--wait"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pre_start:broken"));
+}
+
+#[test]
+fn startup_hooks_post_failure_keeps_healthy_child_and_is_visible() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  db:
+    command: 'sleep 100'
+    readiness_probe: {exec: {command: 'exit 0'}, period_seconds: 1}
+    post_start:
+      - {name: missing, creates: promised, command: 'exit 0'}
+      - {name: later, command: 'touch later'}
+"#,
+    );
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| {
+        let p = hook_service(ps, "db");
+        p["ready"] == true && p["initialization"]["state"] == "failed"
+    });
+    let db = hook_service(&ps, "db");
+    assert_eq!(db["state"], "running");
+    assert_eq!(db["initialization"]["initialized"], false);
+    assert_eq!(db["initialization"]["hooks"][0]["stage"], "verifying");
+    assert!(!env.project.join("promised").exists());
+    let table = env.run(&["ps", "--table"]);
+    assert!(
+        String::from_utf8_lossy(&table.stdout)
+            .contains("initialization failed (post_start:missing")
+    );
+}
+
+#[test]
+fn startup_hooks_slow_pre_is_concurrent_and_cancelled_before_spawn() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  a_slow:
+    command: 'touch spawned; sleep 100'
+    pre_start:
+      - name: waiting
+        command: 'echo $$$$ > hook.pid; sleep 100 & echo $! > grandchild.pid; wait'
+  z_fast:
+    command: 'sleep 100'
+"#,
+    );
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| {
+        env.project.join("grandchild.pid").exists()
+            && hook_service(ps, "z_fast")["state"] == "running"
+    });
+    assert_eq!(hook_service(&ps, "a_slow")["state"], "initializing");
+    assert!(hook_service(&ps, "a_slow")["pid"].is_null());
+    let pid: u32 = fs::read_to_string(env.project.join("grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_success(&env.run(&["stop", "a_slow"]), "stop pre hook");
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "a_slow")["state"] == "stopped");
+    assert_eq!(
+        hook_service(&ps, "a_slow")["initialization"]["state"],
+        "cancelled"
+    );
+    assert!(!process_alive(pid));
+    assert!(!env.project.join("spawned").exists());
+    env.down_json();
+}
+
+#[test]
+fn startup_hooks_child_exit_cancels_post_without_losing_exit_status() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  job:
+    command: 'while ! test -f hook.pid; do sleep 0.02; done; exit 7'
+    post_start:
+      - {name: long, command: 'echo $$$$ > hook.pid; exec sleep 100'}
+      - {name: never, command: 'touch never'}
+"#,
+    );
+    env.up_detach_json();
+    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "job")["state"] == "failed");
+    let p = hook_service(&ps, "job");
+    assert_eq!(p["exit_code"], 7);
+    assert_eq!(p["initialization"]["state"], "cancelled");
+    assert_eq!(p["initialization"]["hooks"][1]["reason"], "service_exited");
+    assert!(!env.project.join("never").exists());
+    env.down_json();
+}

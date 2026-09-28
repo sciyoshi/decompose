@@ -155,8 +155,8 @@ pub(crate) struct DaemonState {
     stopping: BTreeSet<String>,
     stop_versions: BTreeMap<String, u64>,
     stop_errors: BTreeMap<String, String>,
-    force_shutdown: Arc<AtomicBool>,
-    logs: Arc<crate::logs::Store>,
+    pub(crate) force_shutdown: Arc<AtomicBool>,
+    pub(crate) logs: Arc<crate::logs::Store>,
 }
 
 impl DaemonState {
@@ -176,6 +176,11 @@ impl DaemonState {
     fn stop_instances(&mut self, names: &[String]) {
         for name in names {
             *self.stop_versions.entry(name.clone()).or_default() += 1;
+        }
+        for name in names {
+            if let Some(r) = self.processes.get_mut(name) {
+                r.initialization.initialized = false;
+            }
         }
         self.stopping.extend(names.iter().cloned());
         self.advance_stops();
@@ -251,9 +256,13 @@ pub(crate) async fn with_process_mut<F, R>(
 where
     F: FnOnce(&mut ProcessRuntime) -> R,
 {
-    let name = crate::model::read_name(handle);
     let mut guard = state.lock().await;
-    guard.processes.get_mut(&name).map(f)
+    let name = crate::model::read_name(handle);
+    guard
+        .processes
+        .get_mut(&name)
+        .filter(|r| Arc::ptr_eq(&r.name_handle, handle))
+        .map(f)
 }
 
 /// Read-only counterpart to [`with_process_mut`]: resolves the name, takes the
@@ -267,9 +276,13 @@ pub(crate) async fn with_process<F, R>(
 where
     F: FnOnce(&ProcessRuntime) -> R,
 {
-    let name = crate::model::read_name(handle);
     let guard = state.lock().await;
-    guard.processes.get(&name).map(f)
+    let name = crate::model::read_name(handle);
+    guard
+        .processes
+        .get(&name)
+        .filter(|r| Arc::ptr_eq(&r.name_handle, handle))
+        .map(f)
 }
 
 /// Acquire an exclusive, non-blocking advisory lock for this daemon instance.
@@ -563,13 +576,16 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     }
 
-    let errors = state
-        .lock()
-        .await
-        .stop_errors
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
+    let errors = {
+        let guard = state.lock().await;
+        let mut errors = guard.stop_errors.values().cloned().collect::<Vec<_>>();
+        errors.extend(guard.processes.values().filter_map(|r| {
+            r.initialization
+                .failure()
+                .map(|e| format!("{}: {e}", r.spec.name))
+        }));
+        errors
+    };
     let receipt = crate::shutdown::Receipt {
         pid: std::process::id(),
         errors,
@@ -602,6 +618,7 @@ async fn supervisor_loop(state: SharedState, stop_tx: watch::Sender<bool>) {
                     ExitMode::ExitOnFailure => guard.processes.values().any(|p| {
                         matches!(p.status, ProcessStatus::Exited { code } if code != 0)
                             || matches!(p.status, ProcessStatus::FailedToStart { .. })
+                            || p.initialization.state == crate::model::InitializationState::Failed
                     }),
                     ExitMode::ExitOnEnd => guard
                         .processes
@@ -749,6 +766,9 @@ pub(crate) fn dependencies_met_with_index(
             // when that's the desired semantics. See model.rs for the
             // `ready`/`alive` split.
             DependencyCondition::ProcessHealthy => dep_instances.iter().all(|p| p.ready),
+            DependencyCondition::ProcessInitialized => dep_instances.iter().all(|p| {
+                matches!(p.status, ProcessStatus::Running { .. }) && p.initialization.initialized
+            }),
             DependencyCondition::ProcessLogReady => dep_instances.iter().all(|p| p.log_ready),
             DependencyCondition::ProcessCompleted => dep_instances.iter().all(|p| {
                 matches!(
@@ -794,45 +814,90 @@ async fn start_process(name: String, state: SharedState) {
         if !matches!(runtime.status, ProcessStatus::Pending) {
             return;
         }
-        runtime.status = ProcessStatus::Restarting;
+        runtime.status = ProcessStatus::Initializing;
         let pair = (runtime.spec.clone(), runtime.name_handle.clone());
         guard.controllers.insert(name.clone(), kill_tx);
         pair
     };
 
-    let ready_pattern: Option<Regex> = spec.ready_log_line.as_deref().map(compile_ready_pattern);
+    tokio::spawn(async move {
+        let mut kill_rx = kill_rx;
+        if !prepare_attempt(&name_handle, &spec, &state, &mut kill_rx).await {
+            state
+                .lock()
+                .await
+                .controllers
+                .remove(&crate::model::read_name(&name_handle));
+            return;
+        }
+        let Some(mut child) =
+            spawn_process_child(&name_handle, &spec, &state, SpawnContext::Initial).await
+        else {
+            state
+                .lock()
+                .await
+                .controllers
+                .remove(&crate::model::read_name(&name_handle));
+            return;
+        };
+        let pid = child.id().unwrap_or(0);
+        with_process_mut(&state, &name_handle, |r| {
+            r.status = ProcessStatus::Running { pid };
+            r.started_once = true;
+            if spec.post_start.is_empty() {
+                r.initialization.state = crate::model::InitializationState::Succeeded;
+                r.initialization.initialized = true;
+                r.initialization.phase = None;
+                r.initialization.hook = None;
+            }
+        })
+        .await;
+        let pattern = spec.ready_log_line.as_deref().map(compile_ready_pattern);
+        let output_tasks =
+            attach_output_readers(&mut child, &name_handle, &spec, pattern, state.clone()).await;
+        process_lifecycle(name_handle, spec, child, output_tasks, kill_rx, state).await;
+    });
+}
 
-    let Some(mut child) =
-        spawn_process_child(&name_handle, &spec, &state, SpawnContext::Initial).await
-    else {
-        state.lock().await.controllers.remove(&name);
-        return;
-    };
+pub(crate) async fn record_hook_cleanup_error(
+    state: &SharedState,
+    handle: &crate::model::NameHandle,
+    error: String,
+) {
+    let mut guard = state.lock().await;
+    guard
+        .stop_errors
+        .insert(crate::model::read_name(handle), error);
+}
 
-    let pid = child.id().unwrap_or(0);
-    with_process_mut(&state, &name_handle, |runtime| {
-        runtime.status = ProcessStatus::Running { pid };
-        runtime.started_once = true;
-    })
-    .await;
-
-    let output_tasks = attach_output_readers(
-        &mut child,
-        &name_handle,
-        &spec,
-        ready_pattern,
-        state.clone(),
-    )
-    .await;
-
-    tokio::spawn(process_lifecycle(
-        name_handle,
-        spec,
-        child,
-        output_tasks,
-        kill_rx,
-        state.clone(),
-    ));
+async fn prepare_attempt(
+    handle: &crate::model::NameHandle,
+    spec: &crate::model::ProcessInstanceSpec,
+    state: &SharedState,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    crate::hooks::begin(state, handle, spec).await;
+    let ok = crate::hooks::run_phase(state, handle, spec, "pre_start", cancel.clone()).await;
+    let mut guard = state.lock().await;
+    let name = crate::model::read_name(handle);
+    let stopped = *cancel.borrow() || guard.shutdown_requested || guard.stopping.contains(&name);
+    if let Some(r) = guard.processes.get_mut(&name) {
+        if stopped {
+            r.status = ProcessStatus::Stopped;
+            r.initialization.initialized = false;
+            if r.initialization.state == crate::model::InitializationState::Running {
+                r.initialization.state = crate::model::InitializationState::Cancelled;
+            }
+        } else if !ok {
+            r.status = ProcessStatus::FailedToStart {
+                reason: r
+                    .initialization
+                    .failure()
+                    .unwrap_or_else(|| "initialization cancelled".into()),
+            };
+        }
+    }
+    ok && !stopped
 }
 
 /// Identifies whether we're doing the initial spawn or a restart attempt,
@@ -890,7 +955,19 @@ async fn spawn_process_child(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    match cmd.spawn().with_context(|| {
+    // Serialize the spawn with stop intent. No await occurs while the state
+    // lock is held, so a cancelled pre-start cannot acquire a main PID later.
+    let mut guard = state.lock().await;
+    let current = crate::model::read_name(name_handle);
+    if guard.shutdown_requested || guard.stopping.contains(&current) {
+        if let Some(r) = guard.processes.get_mut(&current) {
+            r.status = ProcessStatus::Stopped;
+        }
+        return None;
+    }
+    let spawned = cmd.spawn();
+    drop(guard);
+    match spawned.with_context(|| {
         format!(
             "[{name}] {} (command={:?}, cwd={})",
             ctx.spawn_label(),
@@ -1002,11 +1079,43 @@ async fn wait_for_child_exit(
     let (probe_stop, probe_rx) = watch::channel(false);
     let probes = spawn_health_probes(name_handle, spec, state, &probe_rx);
     let pgid = child.id().expect("live child has pid");
-    let outcome = tokio::select! {
-        biased;
-        _ = async { if !*kill_rx.borrow() { let _ = kill_rx.changed().await; } } => None,
-        result = child.wait() => Some(result),
+    let (hook_stop, hook_rx) = watch::channel(false);
+    let hooks = crate::hooks::run_phase(state, name_handle, spec, "post_start", hook_rx);
+    tokio::pin!(hooks);
+    let mut hooks_done = false;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            _ = async { if !*kill_rx.borrow() { let _ = kill_rx.changed().await; } } => break None,
+            result = child.wait() => break Some(result),
+            ok = &mut hooks, if !hooks_done => {
+                hooks_done = true;
+                if ok {
+                    // Child-exit wins over completion, including short one-shot jobs.
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Some(Ok(status)),
+                        Err(e) => break Some(Err(e)),
+                        Ok(None) => {}
+                    }
+                    let mut guard = state.lock().await;
+                    let name = crate::model::read_name(name_handle);
+                    let stopping = *kill_rx.borrow() || guard.stopping.contains(&name) || guard.shutdown_requested;
+                    if !stopping && let Some(r) = guard.processes.get_mut(&name) {
+                        r.initialization.state = crate::model::InitializationState::Succeeded;
+                        r.initialization.initialized = true;
+                        r.initialization.phase = None;
+                        r.initialization.hook = None;
+                    }
+                }
+            }
+        }
     };
+    with_process_mut(state, name_handle, |r| r.initialization.initialized = false).await;
+    hook_stop.send_replace(true);
+    if !hooks_done {
+        hooks.await;
+    }
+    crate::hooks::end_incarnation(state, name_handle, outcome.is_some()).await;
     probe_stop.send_replace(true);
     let mut probe_error = None;
     for task in probes {
@@ -1103,8 +1212,8 @@ async fn apply_restart_decision(
     state: &SharedState,
     final_status: ProcessStatus,
 ) -> bool {
-    let name = crate::model::read_name(name_handle);
     let mut guard = state.lock().await;
+    let name = crate::model::read_name(name_handle);
     let stopping = guard.shutdown_requested || guard.stopping.contains(&name);
     let failed_cleanup = guard.stop_errors.contains_key(&name);
     let Some(runtime) = guard.processes.get_mut(&name) else {
@@ -1162,8 +1271,8 @@ async fn process_lifecycle(
 
         let should_restart = apply_restart_decision(&name_handle, &state, final_status).await;
         if !should_restart {
-            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
+            let name = crate::model::read_name(&name_handle);
             guard.controllers.remove(&name);
             break;
         }
@@ -1190,8 +1299,8 @@ async fn process_lifecycle(
         tokio::select! {
             biased;
             _ = async { if !*kill_rx.borrow() { let _ = kill_rx.changed().await; } } => {
-                let name = crate::model::read_name(&name_handle);
                 let mut guard = state.lock().await;
+                let name = crate::model::read_name(&name_handle);
                 if let Some(runtime) = guard.processes.get_mut(&name) { runtime.status = ProcessStatus::Stopped; }
                 guard.controllers.remove(&name);
                 break;
@@ -1199,8 +1308,8 @@ async fn process_lifecycle(
             _ = sleep(Duration::from_secs(backoff)) => {}
         }
         {
-            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
+            let name = crate::model::read_name(&name_handle);
             if guard.shutdown_requested || guard.stopping.contains(&name) {
                 if let Some(runtime) = guard.processes.get_mut(&name) {
                     runtime.status = ProcessStatus::Stopped;
@@ -1214,12 +1323,20 @@ async fn process_lifecycle(
         let next_spec = with_process(&state, &name_handle, |r| r.spec.clone()).await;
         let Some(next_spec) = next_spec else { break };
         spec = next_spec;
+        if !prepare_attempt(&name_handle, &spec, &state, &mut kill_rx).await {
+            state
+                .lock()
+                .await
+                .controllers
+                .remove(&crate::model::read_name(&name_handle));
+            break;
+        }
 
         let Some(new_child) =
             spawn_process_child(&name_handle, &spec, &state, SpawnContext::Restart).await
         else {
-            let name = crate::model::read_name(&name_handle);
             let mut guard = state.lock().await;
+            let name = crate::model::read_name(&name_handle);
             guard.controllers.remove(&name);
             break;
         };
@@ -1227,6 +1344,12 @@ async fn process_lifecycle(
         let pid = child.id().unwrap_or(0);
         with_process_mut(&state, &name_handle, |runtime| {
             runtime.status = ProcessStatus::Running { pid };
+            if spec.post_start.is_empty() {
+                runtime.initialization.state = crate::model::InitializationState::Succeeded;
+                runtime.initialization.initialized = true;
+                runtime.initialization.phase = None;
+                runtime.initialization.hook = None;
+            }
             runtime.log_ready = false;
             runtime.ready = false;
             // A freshly spawned process is assumed alive until its
@@ -1736,7 +1859,25 @@ async fn handle_ps(state: &SharedState) -> Response {
     let processes = guard
         .processes
         .values()
-        .map(ProcessSnapshot::from)
+        .map(|r| {
+            let mut snapshot = ProcessSnapshot::from(r);
+            if matches!(r.status, ProcessStatus::Pending) {
+                snapshot.initialization_blockers = guard
+                    .processes
+                    .values()
+                    .filter(|dep| {
+                        r.spec.depends_on.get(&dep.spec.base_name)
+                            == Some(&DependencyCondition::ProcessInitialized)
+                            && !dep.initialization.initialized
+                    })
+                    .map(|dep| crate::model::InitializationBlocker {
+                        service: dep.spec.name.clone(),
+                        initialization: dep.initialization.clone(),
+                    })
+                    .collect();
+            }
+            snapshot
+        })
         .collect::<Vec<_>>();
 
     Response::Ps {
@@ -1866,6 +2007,14 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
         Err(resp) => resp,
         Ok(names) => {
             for name in &names {
+                if guard
+                    .processes
+                    .get(name)
+                    .is_some_and(|r| matches!(r.status, ProcessStatus::Initializing))
+                    && let Some(tx) = guard.controllers.get(name)
+                {
+                    tx.send_replace(true);
+                }
                 if let Some(runtime) = guard.processes.get(name)
                     && let ProcessStatus::Running { pid } = runtime.status
                     && let Err(e) = crate::shutdown::signal_group(pid, signal)
@@ -2436,7 +2585,10 @@ mod tests {
 
     fn runtime_with(base: &str, status: ProcessStatus, started_once: bool) -> ProcessRuntime {
         ProcessRuntime {
+            initialization: Default::default(),
             spec: ProcessInstanceSpec {
+                pre_start: Vec::new(),
+                post_start: Vec::new(),
                 name: base.to_string(),
                 base_name: base.to_string(),
                 replica: 1,

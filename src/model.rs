@@ -37,6 +37,7 @@ pub enum DependencyCondition {
     ProcessCompletedSuccessfully,
     ProcessHealthy,
     ProcessLogReady,
+    ProcessInitialized,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -62,6 +63,8 @@ pub struct ProcessInstanceSpec {
     pub name: String,
     pub base_name: String,
     pub replica: u16,
+    pub pre_start: Vec<crate::config::HookConfig>,
+    pub post_start: Vec<crate::config::HookConfig>,
     pub command: String,
     pub description: Option<String>,
     pub working_dir: PathBuf,
@@ -192,6 +195,8 @@ pub enum ProcessStatus {
     /// Selected to run but waiting on `depends_on` conditions or for the
     /// supervisor's next tick to spawn the child.
     Pending,
+    /// Pre-start hooks are running; there is no service PID yet.
+    Initializing,
     /// Live child process; `pid` is the OS PID of the immediate child (the
     /// shell, since commands are executed via `sh -c`).
     Running { pid: u32 },
@@ -217,6 +222,7 @@ impl ProcessStatus {
     pub fn to_human(&self) -> String {
         match self {
             ProcessStatus::NotStarted => "not_started".to_string(),
+            ProcessStatus::Initializing => "initializing".to_string(),
             ProcessStatus::Pending => "pending".to_string(),
             ProcessStatus::Running { pid } => format!("running(pid={pid})"),
             ProcessStatus::Exited { code } => format!("exited(code={code})"),
@@ -230,6 +236,7 @@ impl ProcessStatus {
     pub fn to_json_status(&self) -> &'static str {
         match self {
             ProcessStatus::NotStarted => "not_started",
+            ProcessStatus::Initializing => "initializing",
             ProcessStatus::Pending => "pending",
             ProcessStatus::Running { .. } => "running",
             ProcessStatus::Exited { code: 0 } => "exited",
@@ -255,6 +262,7 @@ impl ProcessStatus {
 
 #[derive(Debug, Clone)]
 pub struct ProcessRuntime {
+    pub initialization: Initialization,
     pub spec: ProcessInstanceSpec,
     pub status: ProcessStatus,
     pub started_once: bool,
@@ -296,6 +304,10 @@ pub struct RuntimePaths {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessSnapshot {
+    #[serde(default)]
+    pub initialization: Initialization,
+    #[serde(default)]
+    pub initialization_blockers: Vec<InitializationBlocker>,
     pub name: String,
     pub base: String,
     pub replica: u16,
@@ -339,6 +351,8 @@ impl From<&ProcessRuntime> for ProcessSnapshot {
             _ => None,
         };
         ProcessSnapshot {
+            initialization: runtime.initialization.clone(),
+            initialization_blockers: Vec::new(),
             name: runtime.spec.name.clone(),
             base: runtime.spec.base_name.clone(),
             replica: runtime.spec.replica,
@@ -353,6 +367,68 @@ impl From<&ProcessRuntime> for ProcessSnapshot {
             has_liveness_probe: runtime.spec.liveness_probe.is_some(),
             pid,
             exit_code,
+        }
+    }
+}
+
+/// Latest startup attempt; historical success is retained after child exit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Initialization {
+    pub state: InitializationState,
+    pub initialized: bool,
+    pub phase: Option<String>,
+    pub hook: Option<String>,
+    pub hooks: Vec<HookRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitializationState {
+    #[default]
+    NotStarted,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookRecord {
+    pub phase: String,
+    pub name: String,
+    pub stage: Option<String>,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitializationBlocker {
+    pub service: String,
+    pub initialization: Initialization,
+}
+
+impl Initialization {
+    pub fn failure(&self) -> Option<String> {
+        self.hooks.iter().find(|h| h.status == "failed").map(|h| {
+            format!(
+                "{}:{}: {}",
+                h.phase,
+                h.name,
+                h.error.as_deref().unwrap_or("hook failed")
+            )
+        })
+    }
+    pub fn detail(&self) -> String {
+        if let Some(error) = self.failure() {
+            return format!("initialization failed ({error})");
+        }
+        match (&self.phase, &self.hook) {
+            (Some(phase), Some(hook)) => format!("initializing {phase}:{hook}"),
+            _ => String::new(),
         }
     }
 }

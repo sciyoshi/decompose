@@ -76,6 +76,10 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProcessConfig {
+    #[serde(default, deserialize_with = "hook_list")]
+    pub pre_start: Option<Vec<HookConfig>>,
+    #[serde(default, deserialize_with = "hook_list")]
+    pub post_start: Option<Vec<HookConfig>>,
     pub command: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -112,6 +116,187 @@ pub struct ProcessConfig {
     /// reach the child — even if they share a key name with `.env`.
     #[serde(default)]
     pub is_dotenv_disabled: bool,
+}
+
+/// An ordered native lifecycle step. Resolved copies contain absolute paths
+/// and the complete hook environment; names remain literal identifiers.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub unless: Option<String>,
+    #[serde(default)]
+    pub creates: Option<PathBuf>,
+    #[serde(default)]
+    pub wait_for: Option<HookWait>,
+    #[serde(default = "hook_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub environment: EnvVars,
+}
+fn hook_timeout() -> u64 {
+    60
+}
+fn hook_period() -> u64 {
+    1
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HookWait {
+    #[serde(default)]
+    pub exec: Option<HookExec>,
+    #[serde(default)]
+    pub http_get: Option<HookHttp>,
+    #[serde(default = "hook_period")]
+    pub period_seconds: u64,
+    #[serde(default = "hook_period")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub initial_delay_seconds: u64,
+}
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HookExec {
+    pub command: String,
+}
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HookHttp {
+    #[serde(default = "hook_host")]
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "hook_scheme")]
+    pub scheme: String,
+    #[serde(default = "hook_path")]
+    pub path: String,
+}
+fn hook_host() -> String {
+    "127.0.0.1".into()
+}
+fn hook_scheme() -> String {
+    "http".into()
+}
+fn hook_path() -> String {
+    "/".into()
+}
+
+// Option distinguishes an omitted overlay from an explicit empty list.
+// Deserializing the Vec directly deliberately rejects null.
+fn hook_list<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<Vec<HookConfig>>, D::Error> {
+    Vec::deserialize(d).map(Some)
+}
+
+fn validate_hooks(service: &str, phase: &str, hooks: &[HookConfig]) -> Result<()> {
+    let mut names = HashSet::new();
+    for h in hooks {
+        let valid = h
+            .name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+            && h.name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c));
+        if !valid || !names.insert(&h.name) {
+            bail!(
+                "{service} {phase}: invalid or duplicate hook name {:?}",
+                h.name
+            );
+        }
+        if h.command.trim().is_empty() || h.unless.as_ref().is_some_and(|c| c.trim().is_empty()) {
+            bail!("{service} {phase}:{}: empty command or check", h.name);
+        }
+        if h.timeout_seconds == 0 || (h.unless.is_some() && h.creates.is_some()) {
+            bail!(
+                "{service} {phase}:{}: require positive timeout and at most one guard",
+                h.name
+            );
+        }
+        if let Some(w) = &h.wait_for {
+            if w.exec.is_some() == w.http_get.is_some()
+                || w.period_seconds == 0
+                || w.timeout_seconds == 0
+            {
+                bail!(
+                    "{service} {phase}:{}: wait_for requires exactly one probe and positive timing",
+                    h.name
+                );
+            }
+            if w.exec.as_ref().is_some_and(|e| e.command.trim().is_empty()) {
+                bail!("{service} {phase}:{}: empty wait command", h.name);
+            }
+            if w.http_get.as_ref().is_some_and(|h| {
+                h.scheme != "http" || h.port == 0 || h.host.is_empty() || !h.path.starts_with('/')
+            }) {
+                bail!(
+                    "{service} {phase}:{}: wait_for requires an http URL with a host, port and absolute path",
+                    h.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_hooks(
+    hooks: &[HookConfig],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    expand: bool,
+) -> Vec<HookConfig> {
+    hooks
+        .iter()
+        .cloned()
+        .map(|mut h| {
+            let mut vars = env.clone();
+            vars.extend(h.environment.0.clone());
+            let overrides = h
+                .environment
+                .0
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        if expand {
+                            interpolate_vars(v, &vars)
+                        } else {
+                            v.clone()
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            vars = env.clone();
+            vars.extend(overrides);
+            if expand {
+                h.command.interpolate(&vars);
+                h.unless.interpolate(&vars);
+                h.working_dir.interpolate(&vars);
+                h.creates.interpolate(&vars);
+                if let Some(w) = &mut h.wait_for {
+                    if let Some(e) = &mut w.exec {
+                        e.command.interpolate(&vars);
+                    }
+                    if let Some(http) = &mut w.http_get {
+                        http.host.interpolate(&vars);
+                        http.scheme.interpolate(&vars);
+                        http.path.interpolate(&vars);
+                    }
+                }
+            }
+            let dir = cwd.join(h.working_dir.as_deref().unwrap_or(Path::new("")));
+            h.creates = h.creates.map(|p| dir.join(p));
+            h.working_dir = Some(dir);
+            h.environment = EnvVars(vars);
+            h
+        })
+        .collect()
 }
 
 fn default_replicas() -> u16 {
@@ -242,6 +427,16 @@ pub fn validate_config(cfg: &ProjectConfig) -> Result<()> {
         if proc_cfg.command.trim().is_empty() {
             bail!("process `{name}` has an empty command");
         }
+        validate_hooks(
+            name,
+            "pre_start",
+            proc_cfg.pre_start.as_deref().unwrap_or_default(),
+        )?;
+        validate_hooks(
+            name,
+            "post_start",
+            proc_cfg.post_start.as_deref().unwrap_or_default(),
+        )?;
         if proc_cfg.replicas == 0 {
             bail!("process `{name}` has replicas=0");
         }
@@ -418,6 +613,12 @@ pub fn merge_configs(base: ProjectConfig, overlay: ProjectConfig) -> ProjectConf
     let mut processes = base.processes;
     for (name, overlay_proc) in overlay.processes {
         if let Some(base_proc) = processes.get_mut(&name) {
+            if overlay_proc.pre_start.is_some() {
+                base_proc.pre_start = overlay_proc.pre_start;
+            }
+            if overlay_proc.post_start.is_some() {
+                base_proc.post_start = overlay_proc.post_start;
+            }
             base_proc.command = overlay_proc.command;
             if overlay_proc.description.is_some() {
                 base_proc.description = overlay_proc.description;
@@ -868,6 +1069,10 @@ pub fn apply_interpolation(cfg: &mut ProjectConfig) {
 /// stable across runs.
 #[derive(Serialize)]
 struct ProcessConfigHashView<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_start: &'a Option<Vec<HookConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post_start: &'a Option<Vec<HookConfig>>,
     command: &'a str,
     description: &'a Option<String>,
     working_dir: &'a Option<PathBuf>,
@@ -899,6 +1104,8 @@ struct ProcessConfigHashView<'a> {
 /// different hash == tear down and respawn.
 pub fn compute_config_hash(cfg: &ProcessConfig, resolved_env: &BTreeMap<String, String>) -> String {
     let view = ProcessConfigHashView {
+        pre_start: &cfg.pre_start,
+        post_start: &cfg.post_start,
         command: &cfg.command,
         description: &cfg.description,
         working_dir: &cfg.working_dir,
@@ -1015,6 +1222,18 @@ pub fn build_process_instances(
             let disabled = proc_cfg.disabled;
 
             let spec = ProcessInstanceSpec {
+                pre_start: resolve_hooks(
+                    proc_cfg.pre_start.as_deref().unwrap_or_default(),
+                    &working_dir,
+                    &env,
+                    !cfg.disable_env_expansion,
+                ),
+                post_start: resolve_hooks(
+                    proc_cfg.post_start.as_deref().unwrap_or_default(),
+                    &working_dir,
+                    &env,
+                    !cfg.disable_env_expansion,
+                ),
                 name: instance_name.clone(),
                 base_name: base_name.clone(),
                 replica,
@@ -1044,6 +1263,7 @@ pub fn build_process_instances(
             out.insert(
                 instance_name,
                 ProcessRuntime {
+                    initialization: Default::default(),
                     spec,
                     status: if disabled {
                         ProcessStatus::Disabled
@@ -1075,6 +1295,135 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn hook_schema_rejects_ambiguous_or_unsupported_config() {
+        for hook in [
+            "{command: echo}",
+            "{name: setup}",
+            "{name: '', command: echo}",
+            "{name: bad/name, command: echo}",
+            "{name: setup, command: ' '}",
+            "{name: setup, command: echo, timeout_seconds: 0}",
+            "{name: setup, command: echo, unless: test, creates: file}",
+            "{name: setup, command: echo, env_file: []}",
+            "{name: setup, command: [echo, hi]}",
+            "{name: setup, command: echo, wait_for: {}}",
+            "{name: setup, command: echo, wait_for: {exec: {command: true}, success_threshold: 1}}",
+            "{name: setup, command: echo, wait_for: {exec: {command: echo, typo: 1}}}",
+            "{name: setup, command: echo, wait_for: {exec: {command: echo}, http_get: {port: 80}}}",
+            "{name: setup, command: echo, wait_for: {exec: {command: echo}, period_seconds: 0}}",
+            "{name: setup, command: echo, wait_for: {http_get: {port: 80, scheme: https}}}",
+        ] {
+            let yaml = format!("processes: {{svc: {{command: echo, pre_start: [{hook}]}}}}");
+            let result = serde_yaml_ng::from_str::<ProjectConfig>(&yaml)
+                .map_err(anyhow::Error::from)
+                .and_then(|c| validate_config(&c));
+            assert!(result.is_err(), "accepted {hook}");
+        }
+        for phase in ["pre_start", "post_start"] {
+            let yaml = format!("processes: {{svc: {{command: echo, {phase}: null}}}}");
+            assert!(serde_yaml_ng::from_str::<ProjectConfig>(&yaml).is_err());
+            let yaml = format!(
+                "processes: {{svc: {{command: echo, {phase}: [{{name: x, command: echo}}, {{name: x, command: echo}}]}}}}"
+            );
+            assert!(validate_config(&serde_yaml_ng::from_str(&yaml).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn hooks_replace_inherit_clear_and_affect_hash() {
+        let base: ProjectConfig = serde_yaml_ng::from_str("processes: {svc: {command: echo, pre_start: [{name: x, command: echo}], post_start: [{name: x, command: echo}]}}").unwrap();
+        validate_config(&base).unwrap(); // Names may repeat across phases.
+        let inherited = merge_configs(
+            base.clone(),
+            serde_yaml_ng::from_str("processes: {svc: {command: echo}}").unwrap(),
+        );
+        assert_eq!(
+            inherited.processes["svc"].pre_start.as_ref().unwrap().len(),
+            1
+        );
+        let cleared = merge_configs(
+            base.clone(),
+            serde_yaml_ng::from_str("processes: {svc: {command: echo, pre_start: []}}").unwrap(),
+        );
+        assert!(
+            cleared.processes["svc"]
+                .pre_start
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cleared.processes["svc"].post_start.as_ref().unwrap().len(),
+            1
+        );
+        assert_ne!(
+            compute_config_hash(&base.processes["svc"], &BTreeMap::new()),
+            compute_config_hash(&cleared.processes["svc"], &BTreeMap::new())
+        );
+        let replaced = merge_configs(
+            base,
+            serde_yaml_ng::from_str(
+                "processes: {svc: {command: echo, post_start: [{name: y, command: changed}]}}",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            replaced.processes["svc"].post_start.as_ref().unwrap()[0].name,
+            "y"
+        );
+    }
+
+    #[test]
+    fn hooks_resolve_env_and_paths_once_without_leaking_overrides() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("extra.env"), "FROM_FILE=file\n").unwrap();
+        let mut cfg: ProjectConfig = serde_yaml_ng::from_str(
+            r#"
+processes:
+  svc:
+    command: echo
+    working_dir: service
+    env_file: [extra.env]
+    environment: {VALUE: service}
+    pre_start:
+      - name: literal-name
+        command: '${VALUE} ${FROM_FILE} $$VALUE'
+        creates: '${VALUE}.done'
+        working_dir: subdir
+        environment: {VALUE: hook, ESCAPED: '$$VALUE'}
+        wait_for:
+          exec: {command: 'test ${VALUE} = hook'}
+          timeout_seconds: 2
+      - name: next
+        command: '${VALUE}'
+"#,
+        )
+        .unwrap();
+        apply_interpolation(&mut cfg);
+        let out = build_process_instances(&cfg, dir.path(), &BTreeMap::new());
+        let spec = &out["svc"].spec;
+        let h = &spec.pre_start[0];
+        assert_eq!(h.command, "hook file $VALUE");
+        assert_eq!(h.environment.0["ESCAPED"], "$VALUE");
+        assert_eq!(
+            h.creates.as_ref().unwrap(),
+            &dir.path().join("service/subdir/hook.done")
+        );
+        assert_eq!(
+            h.wait_for.as_ref().unwrap().exec.as_ref().unwrap().command,
+            "test hook = hook"
+        );
+        assert_eq!(spec.environment["VALUE"], "service");
+        assert_eq!(spec.pre_start[1].command, "service");
+        cfg.disable_env_expansion = true;
+        let out = build_process_instances(&cfg, dir.path(), &BTreeMap::new());
+        assert_eq!(
+            out["svc"].spec.pre_start[0].command,
+            "${VALUE} ${FROM_FILE} $$VALUE"
+        );
+    }
 
     #[test]
     fn env_vars_deserialize_from_map() {

@@ -181,7 +181,7 @@ async fn run_single_check(
     Ok(false)
 }
 
-async fn http_get_check(http: &HttpCheck) -> bool {
+pub(crate) async fn http_get_check(http: &HttpCheck) -> bool {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
 

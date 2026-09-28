@@ -36,6 +36,7 @@ pub mod completion;
 pub mod config;
 pub mod daemon;
 pub mod health_probes;
+mod hooks;
 pub mod ipc;
 mod logs;
 pub mod model;
@@ -1049,6 +1050,14 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
     apply_interpolation(&mut cfg);
     crate::config::validate_project_paths(&cfg, &config_dir)?;
 
+    let dotenv = load_dotenv_files(&config_dir, &global.env_files, global.disable_dotenv)?;
+    let instances = build_process_instances(&cfg, &config_dir, &dotenv);
+    for (name, service) in &mut cfg.processes {
+        if let Some(r) = instances.values().find(|r| &r.spec.base_name == name) {
+            service.pre_start = Some(r.spec.pre_start.clone());
+            service.post_start = Some(r.spec.post_start.clone());
+        }
+    }
     match output_mode {
         OutputMode::Json => {
             let json = serde_json::to_string_pretty(&cfg).context("failed to serialize config")?;
@@ -1332,11 +1341,12 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                         format!("{glyph} {label}")
                     };
                     println!(
-                        "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {:<w_base$}",
+                        "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {:<w_base$}  {}",
                         p.name,
                         styled(&cell, st),
                         pid_vals[i],
                         p.base,
+                        crate::output::initialization_detail(p),
                     );
                 }
             } else {
@@ -1353,10 +1363,11 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                         format!("{glyph} {label}")
                     };
                     println!(
-                        "{:<w_name$}  {:<w_state$}  {:<w_pid$}",
+                        "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {}",
                         p.name,
                         styled(&cell, st),
                         pid_vals[i],
+                        crate::output::initialization_detail(p),
                     );
                 }
             }
@@ -1416,10 +1427,11 @@ async fn wait_for_services_ready(
     let timeout = crate::tuning::daemon_ready_timeout();
 
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut waiting = String::new();
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for services to become ready");
+            bail!("timed out waiting for services to become ready: {waiting}");
         }
 
         match send_request(paths, Request::Ps).await {
@@ -1429,11 +1441,49 @@ async fn wait_for_services_ready(
                     .filter(|p| p.state != "disabled" && p.state != "not_started")
                     .collect();
 
+                for p in &active {
+                    if let Some(error) = p.initialization.failure() {
+                        emit_message(output_mode, "error", &format!("{}: {error}", p.name));
+                        bail!("{}: {error}", p.name);
+                    }
+                    if p.state == "failed" {
+                        emit_message(output_mode, "error", "services ready (some failed)");
+                        bail!("{}: {}", p.name, p.status);
+                    }
+                    if p.state == "exited"
+                        && !p.initialization.hooks.is_empty()
+                        && p.initialization.state != crate::model::InitializationState::Succeeded
+                    {
+                        bail!("{}: service exited before initialization completed", p.name);
+                    }
+                }
+                waiting = active
+                    .iter()
+                    .map(|p| {
+                        let detail = crate::output::initialization_detail(p);
+                        format!(
+                            "{}: {}",
+                            p.name,
+                            if detail.is_empty() {
+                                "waiting for initialization/readiness".into()
+                            } else {
+                                detail
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 let all_ready = !active.is_empty()
                     && active.iter().all(|p| {
                         if p.state == "failed" {
                             // Already failed — no point waiting.
                             return true;
+                        }
+                        if !p.initialization.hooks.is_empty()
+                            && p.initialization.state
+                                != crate::model::InitializationState::Succeeded
+                        {
+                            return false;
                         }
                         if p.has_readiness_probe {
                             p.ready
