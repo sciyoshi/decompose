@@ -1,0 +1,7 @@
+# Used by the flake's fragment check: substitution must preserve interpolation.
+processes:
+  check:
+    command: exec @runner@/bin/fragment-check
+    working_dir: ${DECOMPOSE_PROJECT_DIR}
+    environment:
+      RUNTIME_LITERAL: $$RUNTIME_VALUE

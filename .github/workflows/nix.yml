@@ -30,3 +30,5 @@ jobs:
           # to catch stale hashes even when the old output is already cached.
           # --rebuild requires the output to exist, hence the initial build.
           nix build --no-link --print-build-logs --rebuild .#packages.x86_64-linux.default.cargoDeps
+      - name: Verify packaged fragment substitution
+        run: nix build --no-link --print-build-logs .#checks.x86_64-linux.fragment
