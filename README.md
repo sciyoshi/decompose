@@ -28,7 +28,6 @@ Download a tarball for your platform from the [latest release](https://github.co
 |---|---|---|
 | `x86_64-unknown-linux-gnu` | Linux | x86_64 |
 | `aarch64-unknown-linux-gnu` | Linux | ARM64 |
-| `x86_64-apple-darwin` | macOS | Intel |
 | `aarch64-apple-darwin` | macOS | Apple Silicon |
 
 Quick install example (macOS Apple Silicon):
@@ -70,7 +69,7 @@ flox install fellowapp/decompose
 ```
 
 Releases publish to both `fellowapp/decompose` and `sciyoshi/decompose` for
-ARM64 and x64 on both macOS and Linux. The personal `sciyoshi` catalog is
+Apple Silicon macOS and ARM64 and x64 Linux. The personal `sciyoshi` catalog is
 only accessible to its owner.
 
 To build and publish a new version from this repository:

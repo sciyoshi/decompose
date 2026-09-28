@@ -33,8 +33,7 @@
       "libiconv": {
         "pkg-path": "libiconv",
         "systems": [
-          "aarch64-darwin",
-          "x86_64-darwin"
+          "aarch64-darwin"
         ]
       },
       "pkg-config": {
@@ -47,7 +46,6 @@
     "options": {
       "systems": [
         "aarch64-darwin",
-        "x86_64-darwin",
         "aarch64-linux",
         "x86_64-linux"
       ]
@@ -72,29 +70,27 @@
     {
       "attr_path": "cargo",
       "broken": false,
-      "derivation": "/nix/store/dl0dn79gzqkqk550kpak9pkgk6sdlc56-cargo-1.95.0.drv",
+      "derivation": "/nix/store/zssawcvwk9q7f2njq4rznnzrjycj2p5y-cargo-1.98.1.drv",
       "description": "Downloads your Rust project's dependencies and builds your project",
       "install_id": "cargo",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "cargo-1.95.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "cargo-1.98.1",
       "pname": "cargo",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:12:54.969229Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T04:58:21.906065Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.95.0",
+      "version": "1.98.1",
       "outputs_to_install": [
-        "out",
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/6ks3pm4wf78b4nir9biqy99hbld903yp-cargo-1.95.0"
+        "out": "/nix/store/0wqxsvcbbwxdrgdiv7gzpbzj3ysgc5md-cargo-1.98.1"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -103,28 +99,27 @@
     {
       "attr_path": "cargo",
       "broken": false,
-      "derivation": "/nix/store/i49w47kp6n3qbyx47ddbyv0a5lzlpkgc-cargo-1.95.0.drv",
+      "derivation": "/nix/store/vb2d08wwb60jdw3nisb6rbdmid035g5c-cargo-1.98.1.drv",
       "description": "Downloads your Rust project's dependencies and builds your project",
       "install_id": "cargo",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "cargo-1.95.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "cargo-1.98.1",
       "pname": "cargo",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:41:21.547929Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:29:50.122230Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.95.0",
+      "version": "1.98.1",
       "outputs_to_install": [
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/1pyc40aar7cymg1i1hvlrhnp3mcdva50-cargo-1.95.0"
+        "out": "/nix/store/db6sk165478iv0z0yjb4b1v5m5ll9kdc-cargo-1.98.1"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -133,59 +128,27 @@
     {
       "attr_path": "cargo",
       "broken": false,
-      "derivation": "/nix/store/ak37pwwiy0k67hzn1skggk2rw6nvg976-cargo-1.95.0.drv",
+      "derivation": "/nix/store/3y8fr9214cb6n32m7v13hj6dkr51yqh6-cargo-1.98.1.drv",
       "description": "Downloads your Rust project's dependencies and builds your project",
       "install_id": "cargo",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "cargo-1.95.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "cargo-1.98.1",
       "pname": "cargo",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:09:00.294203Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T06:05:42.354363Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.95.0",
+      "version": "1.98.1",
       "outputs_to_install": [
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/k2kynrir5rszv6dnx4lm8h39pjmsxr4c-cargo-1.95.0"
-      },
-      "system": "x86_64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "cargo",
-      "broken": false,
-      "derivation": "/nix/store/36gfn3aq76gz94brbxyfw35w3fsv570m-cargo-1.95.0.drv",
-      "description": "Downloads your Rust project's dependencies and builds your project",
-      "install_id": "cargo",
-      "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "cargo-1.95.0",
-      "pname": "cargo",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:40:24.174359Z",
-      "stabilities": [
-        "staging",
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "1.95.0",
-      "outputs_to_install": [
-        "out",
-        "out"
-      ],
-      "outputs": {
-        "out": "/nix/store/6gcrqjdzbx71bavmmrqpl3hw1ljml7vi-cargo-1.95.0"
+        "out": "/nix/store/w20n3pmhhd1av9llykxa3gd21c9jsm8l-cargo-1.98.1"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -194,19 +157,18 @@
     {
       "attr_path": "clang",
       "broken": false,
-      "derivation": "/nix/store/25rlxjsg6ili9a23rysq0prkq111sq7n-clang-wrapper-21.1.8.drv",
+      "derivation": "/nix/store/k9jsavhfz13wqhfqq72885y801hqmhsh-clang-wrapper-21.1.8.drv",
       "description": "C language family frontend for LLVM (wrapper script)",
       "install_id": "clang",
       "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
       "name": "clang-wrapper-21.1.8",
       "pname": "clang",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:12:55.148790Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T04:58:22.133985Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
@@ -214,14 +176,10 @@
       "outputs_to_install": [
         "out",
         "out",
-        "out",
-        "out",
-        "out",
-        "out",
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/qndx79izh6lanm535xj9pbayy6j8fz5n-clang-wrapper-21.1.8"
+        "out": "/nix/store/2yfrcmkvspsrjhj283gdawqp37aghxva-clang-wrapper-21.1.8"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -230,29 +188,27 @@
     {
       "attr_path": "clang",
       "broken": false,
-      "derivation": "/nix/store/zwjmd4gpr5h0ywdq2rkqfnci02gipb4s-clang-wrapper-21.1.8.drv",
+      "derivation": "/nix/store/vv37i43d4z9rrlsj2vyl608zjadwr3kb-clang-wrapper-21.1.8.drv",
       "description": "C language family frontend for LLVM (wrapper script)",
       "install_id": "clang",
       "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
       "name": "clang-wrapper-21.1.8",
       "pname": "clang",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:41:21.773028Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:29:50.402379Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
       "version": "21.1.8",
       "outputs_to_install": [
-        "out",
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/k6jpwp2fjbrhrhklncb4inf29qv4cn4g-clang-wrapper-21.1.8"
+        "out": "/nix/store/7v2w6x6h13zzswz6agxxcrx73vqdd0px-clang-wrapper-21.1.8"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -261,19 +217,18 @@
     {
       "attr_path": "clang",
       "broken": false,
-      "derivation": "/nix/store/phmpqx2l0gwmh4yhbs272bry7qjv51wy-clang-wrapper-21.1.8.drv",
+      "derivation": "/nix/store/7l5pwq76dlg35pai1kzdljmg40lx5hjx-clang-wrapper-21.1.8.drv",
       "description": "C language family frontend for LLVM (wrapper script)",
       "install_id": "clang",
       "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
       "name": "clang-wrapper-21.1.8",
       "pname": "clang",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:09:00.513525Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T06:05:42.646136Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
@@ -282,39 +237,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/vlqks7r68963zr1jbj8l546w4nw0i762-clang-wrapper-21.1.8"
-      },
-      "system": "x86_64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "clang",
-      "broken": false,
-      "derivation": "/nix/store/q0xkhdwhv452wj5daka6sxmwbm70wiza-clang-wrapper-21.1.8.drv",
-      "description": "C language family frontend for LLVM (wrapper script)",
-      "install_id": "clang",
-      "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "clang-wrapper-21.1.8",
-      "pname": "clang",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:40:24.416350Z",
-      "stabilities": [
-        "staging",
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "21.1.8",
-      "outputs_to_install": [
-        "out",
-        "out",
-        "out"
-      ],
-      "outputs": {
-        "out": "/nix/store/l6mji5kmnmpz1inr3ri3j5f6f527rfs6-clang-wrapper-21.1.8"
+        "out": "/nix/store/mn2y6cydn5phwf2hxgfc3n7zjf48d5xg-clang-wrapper-21.1.8"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -323,35 +246,35 @@
     {
       "attr_path": "gcc-unwrapped",
       "broken": false,
-      "derivation": "/nix/store/bmcdjrmrqkrwfv16d039mnn9974fhch1-gcc-15.2.0.drv",
-      "description": "GNU Compiler Collection, version 15.2.0",
+      "derivation": "/nix/store/nhqv30k4w3lrkf39fg7zmwidlsxnq9ld-gcc-15.3.0.drv",
+      "description": "GNU Compiler Collection, version 15.3.0",
       "install_id": "gcc-runtime",
       "license": "GPL-3.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "gcc-15.2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "gcc-15.3.0",
       "pname": "gcc-unwrapped",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:41:23.023389Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:29:51.742394Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "15.2.0",
+      "version": "15.3.0",
       "outputs_to_install": [
         "man",
+        "out",
         "out",
         "out"
       ],
       "outputs": {
-        "checksum": "/nix/store/6igpfz2rx7xxsr5kvxwlc57d5iafaabz-gcc-15.2.0-checksum",
-        "info": "/nix/store/khkipdd1fmlcbxnza01582fh7j2mfnf3-gcc-15.2.0-info",
-        "lib": "/nix/store/m3v5jbl1y7hxb1yimlyp0067acslkxf2-gcc-15.2.0-lib",
-        "libgcc": "/nix/store/5scis26lfzmcsbgbs3b1i4wraxg28pbp-gcc-15.2.0-libgcc",
-        "man": "/nix/store/bny95l0diywfwvg1lnwhm1m9fsxdm5pl-gcc-15.2.0-man",
-        "out": "/nix/store/8hwmjrgdixn4612zrlabmych64ix89mx-gcc-15.2.0"
+        "checksum": "/nix/store/4la7m9qax83lc8k3d3w84grgq3cfy3i0-gcc-15.3.0-checksum",
+        "info": "/nix/store/g255bdzmjwsp08lfbibixvdp6az71glv-gcc-15.3.0-info",
+        "lib": "/nix/store/n65q2br81z7a9g3hcvskd2pvr8s6a7ms-gcc-15.3.0-lib",
+        "libgcc": "/nix/store/ahg79xbgc81hkhj3xl8524i8pjp3sxkx-gcc-15.3.0-libgcc",
+        "man": "/nix/store/22mnvimbzqkqm3z0d3qdawwjcrd470gy-gcc-15.3.0-man",
+        "out": "/nix/store/mhx6dmg6whr7c85krk9rjwjsxrp9iggs-gcc-15.3.0"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -360,25 +283,23 @@
     {
       "attr_path": "gcc-unwrapped",
       "broken": false,
-      "derivation": "/nix/store/qlb1647jp7grq5fgp66fhk5qr9rzr1j6-gcc-15.2.0.drv",
-      "description": "GNU Compiler Collection, version 15.2.0",
+      "derivation": "/nix/store/71gxnaixis3nn5xr1ql6y9dnmc5p1n85-gcc-15.3.0.drv",
+      "description": "GNU Compiler Collection, version 15.3.0",
       "install_id": "gcc-runtime",
       "license": "GPL-3.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "gcc-15.2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "gcc-15.3.0",
       "pname": "gcc-unwrapped",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:40:25.791144Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T06:05:44.075940Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "15.2.0",
+      "version": "15.3.0",
       "outputs_to_install": [
-        "man",
         "man",
         "man",
         "out",
@@ -387,12 +308,12 @@
         "out"
       ],
       "outputs": {
-        "checksum": "/nix/store/scnas3kx869pfc8mz3fjqmfvl9m9sn6a-gcc-15.2.0-checksum",
-        "info": "/nix/store/2hbjnbfhaq4gq6p55xi9qvj6lx7x4g04-gcc-15.2.0-info",
-        "lib": "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib",
-        "libgcc": "/nix/store/7nww4d4yl7jzf66qllvyn61xb21vp7ry-gcc-15.2.0-libgcc",
-        "man": "/nix/store/5r95b3z75rc980dws0wp5ylawgzfkj6l-gcc-15.2.0-man",
-        "out": "/nix/store/sq0nrnfwhkc5ljvklnrk5ps4358g4nbj-gcc-15.2.0"
+        "checksum": "/nix/store/55s1dsmxycadggi6b61s7q7jsw4rdimk-gcc-15.3.0-checksum",
+        "info": "/nix/store/gjf6byy1grf66jaik7vh2cjfbwfvw8z7-gcc-15.3.0-info",
+        "lib": "/nix/store/604gsr59rj7dzd0nrhp143rpvf7gyiaz-gcc-15.3.0-lib",
+        "libgcc": "/nix/store/wkiqjb44n5k0fwhmc523dvflspd47q3b-gcc-15.3.0-libgcc",
+        "man": "/nix/store/s6iwcb0ba10002wnsia434zp8dmyq7al-gcc-15.3.0-man",
+        "out": "/nix/store/8sjgd7q3mdks1rb7rbcv0sallhvrhai5-gcc-15.3.0"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -401,35 +322,35 @@
     {
       "attr_path": "glibc",
       "broken": false,
-      "derivation": "/nix/store/fv5hzqsszrbwgq51ykpw6vad9n76frzz-glibc-2.42-67.drv",
+      "derivation": "/nix/store/3anccqfs680h0f0ib4gpgnky79k7dy4j-glibc-2.42-84.drv",
       "description": "GNU C Library",
       "install_id": "glibc",
       "license": "LGPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "glibc-2.42-67",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "glibc-2.42-84",
       "pname": "glibc",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:41:23.267964Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:29:52.012191Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "2.42-67",
+      "version": "2.42-84",
       "outputs_to_install": [
+        "bin",
         "bin",
         "bin",
         "bin"
       ],
       "outputs": {
-        "bin": "/nix/store/rpam9gvq8452lxla82mnk2867x68f40a-glibc-2.42-67-bin",
-        "debug": "/nix/store/l4zim22r7ffv7hfkp62xyryw6h9l6f62-glibc-2.42-67-debug",
-        "dev": "/nix/store/g5ss8x9195xalqwzqsmbla1xanh9sjy2-glibc-2.42-67-dev",
-        "getent": "/nix/store/ms8c3hw429m6qzj64s8z867hlhr1nrna-glibc-2.42-67-getent",
-        "out": "/nix/store/jp8avbmpfcdnm0axwrzyk072nmq9cr0d-glibc-2.42-67",
-        "static": "/nix/store/vxfviq9zplf2gj7sb3a0wsdwqvpvcp1g-glibc-2.42-67-static"
+        "bin": "/nix/store/r68vac903zffq3aiihz3hzjqag7dl63f-glibc-2.42-84-bin",
+        "debug": "/nix/store/pqwrr6pn0qv1lbnvspp2472v4gmdz550-glibc-2.42-84-debug",
+        "dev": "/nix/store/6rgkfqr5mcjr39irv7wlbhfih2r5s2nl-glibc-2.42-84-dev",
+        "getent": "/nix/store/i7wd82393v96yydq4bpnrvyhfx5adava-glibc-2.42-84-getent",
+        "out": "/nix/store/m54cs0m994hc3n9lax7sg98sgy729qsa-glibc-2.42-84",
+        "static": "/nix/store/kg9n5vwdb6jrw581c691ql4klp3gd5b9-glibc-2.42-84-static"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -438,23 +359,22 @@
     {
       "attr_path": "glibc",
       "broken": false,
-      "derivation": "/nix/store/8ky82wqb2hrwww20kbq2v3vlwvn0bddi-glibc-2.42-67.drv",
+      "derivation": "/nix/store/sayi2sas6kn7q181jy7ic8h8hy2jiqn7-glibc-2.42-84.drv",
       "description": "GNU C Library",
       "install_id": "glibc",
       "license": "LGPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "glibc-2.42-67",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "glibc-2.42-84",
       "pname": "glibc",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:40:26.052804Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T06:05:44.364644Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "2.42-67",
+      "version": "2.42-84",
       "outputs_to_install": [
         "bin",
         "bin",
@@ -463,12 +383,12 @@
         "bin"
       ],
       "outputs": {
-        "bin": "/nix/store/521dd0054ifhzmjfmpx9mz0hr7wh7sig-glibc-2.42-67-bin",
-        "debug": "/nix/store/ndzhn3ijyjxnil481xv6b2a1m2b1055q-glibc-2.42-67-debug",
-        "dev": "/nix/store/q5wv2ldpcv5w8yb2wmsngsygvlxb73fk-glibc-2.42-67-dev",
-        "getent": "/nix/store/fg4gkw8jr3w0cmikyxhcqr2bp2npm09w-glibc-2.42-67-getent",
-        "out": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67",
-        "static": "/nix/store/q8kp93rv8rw0zd9y4n17mrj8r1ikk8ls-glibc-2.42-67-static"
+        "bin": "/nix/store/fdpy1l72q9gvq8d9snrdq67gm0j5s1dg-glibc-2.42-84-bin",
+        "debug": "/nix/store/fk98h17sza0xxz9iw0fi5b2nn1h4c0pm-glibc-2.42-84-debug",
+        "dev": "/nix/store/lbjwxax9n0457lgd83rqwpd1l9lgfl7r-glibc-2.42-84-dev",
+        "getent": "/nix/store/6smny04v1q13rksspklvxn6qiqpi8jli-glibc-2.42-84-getent",
+        "out": "/nix/store/lm3pknxi0ipypy3lxh1wmm8wvvavdwrn-glibc-2.42-84",
+        "static": "/nix/store/dr8sxxby6x9k0kg0s054cmcxqzpiy2yy-glibc-2.42-84-static"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -477,108 +397,30 @@
     {
       "attr_path": "libiconv",
       "broken": false,
-      "derivation": "/nix/store/irkbdz86bxcbd2c206gqx4m1csj09g53-libiconv-113.drv",
+      "derivation": "/nix/store/lk6rhhn5mz7q48s1qbwa7vncl2dmavsg-libiconv-115.100.1.drv",
       "description": "Iconv(3) implementation",
       "install_id": "libiconv",
       "license": "[ BSD-2-Clause, BSD-3-Clause, APSL-1.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "libiconv-113",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "libiconv-115.100.1",
       "pname": "libiconv",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:13:14.028699Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T04:58:40.333693Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "113",
+      "version": "115.100.1",
       "outputs_to_install": [
-        "out",
-        "out",
-        "out",
-        "out",
-        "out",
-        "out",
-        "out",
-        "out",
-        "out",
         "out",
         "out",
         "out"
       ],
       "outputs": {
-        "dev": "/nix/store/x9zqgwph8i92jppic911kwpwld30drwn-libiconv-113-dev",
-        "out": "/nix/store/qla3pimj2nqrklkhar0yv7127fcd1v86-libiconv-113"
-      },
-      "system": "aarch64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "libiconv",
-      "broken": false,
-      "derivation": "/nix/store/b1m5y0h4r411yfvmfacyca5jsjv609r8-libiconv-113.drv",
-      "description": "Iconv(3) implementation",
-      "install_id": "libiconv",
-      "license": "[ BSD-2-Clause, BSD-3-Clause, APSL-1.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "libiconv-113",
-      "pname": "libiconv",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:09:24.042301Z",
-      "stabilities": [
-        "staging",
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "113",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "dev": "/nix/store/zdqs550dy4kdpfigwl7rbyyljnikrajs-libiconv-113-dev",
-        "out": "/nix/store/slbk44rhj2im5spq903ik7xpv1phz9rc-libiconv-113"
-      },
-      "system": "x86_64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "pkg-config",
-      "broken": false,
-      "derivation": "/nix/store/hgfmcqfq0jmdf5vwmjg1l9qgdhbyiyms-pkg-config-wrapper-0.29.2.drv",
-      "description": "Tool that allows packages to find out information about other packages (wrapper script)",
-      "install_id": "pkg-config",
-      "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "pkg-config-wrapper-0.29.2",
-      "pname": "pkg-config",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:13:34.958163Z",
-      "stabilities": [
-        "staging",
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "0.29.2",
-      "outputs_to_install": [
-        "man",
-        "man",
-        "man",
-        "out",
-        "out",
-        "out"
-      ],
-      "outputs": {
-        "doc": "/nix/store/lkf67m0zmwsklfrnxzr90maqhnqcin0c-pkg-config-wrapper-0.29.2-doc",
-        "man": "/nix/store/cww3k17vnqmn3nsbibninhgl3gabz3c9-pkg-config-wrapper-0.29.2-man",
-        "out": "/nix/store/jmy04kpx07ig9sdw478zcwinp8m0lh8w-pkg-config-wrapper-0.29.2"
+        "dev": "/nix/store/2gydsp69sx90iq1adjghdi033k1z1xln-libiconv-115.100.1-dev",
+        "out": "/nix/store/ls125wfdax9gk2ryq7fgzrncpi6x5v2s-libiconv-115.100.1"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -587,19 +429,50 @@
     {
       "attr_path": "pkg-config",
       "broken": false,
-      "derivation": "/nix/store/1nzw058inpnq5svxbpzx1im999wfvlb3-pkg-config-wrapper-0.29.2.drv",
+      "derivation": "/nix/store/sgan6cy0xg9dynljwxg4gghnhq9fpyws-pkg-config-wrapper-0.29.2.drv",
       "description": "Tool that allows packages to find out information about other packages (wrapper script)",
       "install_id": "pkg-config",
       "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
       "name": "pkg-config-wrapper-0.29.2",
       "pname": "pkg-config",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:42:19.714452Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T04:59:00.637819Z",
       "stabilities": [
-        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.29.2",
+      "outputs_to_install": [
+        "man",
+        "out"
+      ],
+      "outputs": {
+        "doc": "/nix/store/965s4sf55p20ipr6f2rzf4cc5dvl87cp-pkg-config-wrapper-0.29.2-doc",
+        "man": "/nix/store/505bk44lw9mz7qsyxvc3k041awhlfklj-pkg-config-wrapper-0.29.2-man",
+        "out": "/nix/store/kd2x1bj3gwfh2hb69fk5ym043h2qavxc-pkg-config-wrapper-0.29.2"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "pkg-config",
+      "broken": false,
+      "derivation": "/nix/store/mlfnx5bmdfzasmi8ib6yqhy0cb8b89j3-pkg-config-wrapper-0.29.2.drv",
+      "description": "Tool that allows packages to find out information about other packages (wrapper script)",
+      "install_id": "pkg-config",
+      "license": "GPL-2.0-or-later",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "pkg-config-wrapper-0.29.2",
+      "pname": "pkg-config",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:30:48.447177Z",
+      "stabilities": [
         "unstable"
       ],
       "unfree": false,
@@ -607,12 +480,13 @@
       "outputs_to_install": [
         "man",
         "out",
+        "out",
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/7fvjivp8r9pdhv3922508vjgzxidi6kp-pkg-config-wrapper-0.29.2-doc",
-        "man": "/nix/store/zcf4b05gl65i1ixnv9440h1zq15chh5l-pkg-config-wrapper-0.29.2-man",
-        "out": "/nix/store/arqxlwwxqmwycqs5zqcmbzair0mjfxjf-pkg-config-wrapper-0.29.2"
+        "doc": "/nix/store/l8kkikazpaqm903rswiyphzhf7mphivp-pkg-config-wrapper-0.29.2-doc",
+        "man": "/nix/store/40389sip5yjizpbjldjz25w1jz05snlb-pkg-config-wrapper-0.29.2-man",
+        "out": "/nix/store/96rqsbg8z242724qy85sbld7dbf4hipr-pkg-config-wrapper-0.29.2"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -621,69 +495,32 @@
     {
       "attr_path": "pkg-config",
       "broken": false,
-      "derivation": "/nix/store/1lcn6x97s98c9s8sjxv3k3iv05x4qvrh-pkg-config-wrapper-0.29.2.drv",
+      "derivation": "/nix/store/4f4faayl06s0gvr7cnvcpvrcwh7lxaan-pkg-config-wrapper-0.29.2.drv",
       "description": "Tool that allows packages to find out information about other packages (wrapper script)",
       "install_id": "pkg-config",
       "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
       "name": "pkg-config-wrapper-0.29.2",
       "pname": "pkg-config",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:09:50.236832Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T06:06:43.910876Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
       "version": "0.29.2",
       "outputs_to_install": [
         "man",
-        "out"
-      ],
-      "outputs": {
-        "doc": "/nix/store/y9vjqqsrn50xv6mar0ffpk3v90xk9n92-pkg-config-wrapper-0.29.2-doc",
-        "man": "/nix/store/9qd0n1nb130ixha7nn5f0hsnz89nl8vw-pkg-config-wrapper-0.29.2-man",
-        "out": "/nix/store/vplhggifvzl90sqphk9b37bjld2wsd5z-pkg-config-wrapper-0.29.2"
-      },
-      "system": "x86_64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "pkg-config",
-      "broken": false,
-      "derivation": "/nix/store/7mq8skw5qdwpypgy5jcci2qxvhmslnvm-pkg-config-wrapper-0.29.2.drv",
-      "description": "Tool that allows packages to find out information about other packages (wrapper script)",
-      "install_id": "pkg-config",
-      "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "pkg-config-wrapper-0.29.2",
-      "pname": "pkg-config",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:41:26.190149Z",
-      "stabilities": [
-        "staging",
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "0.29.2",
-      "outputs_to_install": [
-        "man",
-        "man",
-        "man",
-        "out",
         "out",
         "out",
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/5jahjjs08ip8fmz6fvrm716y1ldypn7l-pkg-config-wrapper-0.29.2-doc",
-        "man": "/nix/store/nb3pmiv91xq2824a0pxdwyp14yrllmw8-pkg-config-wrapper-0.29.2-man",
-        "out": "/nix/store/sq5p43ziv78vxp51rpaajhvz0584lgqw-pkg-config-wrapper-0.29.2"
+        "doc": "/nix/store/p5h371q0rzgrsphbbwp0y7svcbpa2faf-pkg-config-wrapper-0.29.2-doc",
+        "man": "/nix/store/889b8rd7z3n69b1m89b4sivmnzmmmm2n-pkg-config-wrapper-0.29.2-man",
+        "out": "/nix/store/29d1c5xk6w3rwl7yvdfwl90whslv5h54-pkg-config-wrapper-0.29.2"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -692,33 +529,30 @@
     {
       "attr_path": "rustc",
       "broken": false,
-      "derivation": "/nix/store/v10k4iza9w5zj3m3xiassblw6jfzsna7-rustc-wrapper-1.95.0.drv",
+      "derivation": "/nix/store/iwgmk79cs7bzp5pjchk9bv98nhhdj6j8-rustc-wrapper-1.98.1.drv",
       "description": "Safe, concurrent, practical language (wrapper script)",
       "install_id": "rustc",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "rustc-wrapper-1.95.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "rustc-wrapper-1.98.1",
       "pname": "rustc",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:14:34.122597Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:00:02.535500Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.95.0",
+      "version": "1.98.1",
       "outputs_to_install": [
         "man",
-        "man",
-        "out",
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/bsm0vxrb2hd84g8vi0qwbl3d13dm3lps-rustc-wrapper-1.95.0-doc",
-        "man": "/nix/store/j6bl3b3hx6admc3g17dyk1s376g2gpd6-rustc-wrapper-1.95.0-man",
-        "out": "/nix/store/r2pi7zvrvcrbhqnc9yjd08qhi7d0l6p7-rustc-wrapper-1.95.0"
+        "doc": "/nix/store/h2pcs09960accxf33b91isml19yqs9zc-rustc-wrapper-1.98.1-doc",
+        "man": "/nix/store/kvj0676h9ljr5vhrj7gsdmvzycpyilbk-rustc-wrapper-1.98.1-man",
+        "out": "/nix/store/0ifcc7s3fyvdp1jipi1nr4v339m47d0x-rustc-wrapper-1.98.1"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -727,31 +561,30 @@
     {
       "attr_path": "rustc",
       "broken": false,
-      "derivation": "/nix/store/bgcq6hw3zimwxaxk2mvifwj0wmh8msmz-rustc-wrapper-1.95.0.drv",
+      "derivation": "/nix/store/r0zjhgr9yac8xk0dy502mxd4yx0k7b0j-rustc-wrapper-1.98.1.drv",
       "description": "Safe, concurrent, practical language (wrapper script)",
       "install_id": "rustc",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "rustc-wrapper-1.95.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "rustc-wrapper-1.98.1",
       "pname": "rustc",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T03:43:31.282416Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T05:32:04.172167Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.95.0",
+      "version": "1.98.1",
       "outputs_to_install": [
         "man",
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/iamkk525c3q6ln5djq46kx5ddqga99iv-rustc-wrapper-1.95.0-doc",
-        "man": "/nix/store/pgs6qa8w0q8xzhmw3wgwm07fjc9mwyhr-rustc-wrapper-1.95.0-man",
-        "out": "/nix/store/00lwhlix1jqpy3k5m621qk0vaba3rwgj-rustc-wrapper-1.95.0"
+        "doc": "/nix/store/5qgaz5ph80rr6a3yy6mgrr89xmj23wcg-rustc-wrapper-1.98.1-doc",
+        "man": "/nix/store/mjjrr33kcdrympqvslx3ac295ppxrzk3-rustc-wrapper-1.98.1-man",
+        "out": "/nix/store/ch7hk64vvb2mac6w5l9lj7lsms7awdj6-rustc-wrapper-1.98.1"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -760,66 +593,30 @@
     {
       "attr_path": "rustc",
       "broken": false,
-      "derivation": "/nix/store/7ynqn4zyyxw22zdvbancppzcaca045ci-rustc-wrapper-1.95.0.drv",
+      "derivation": "/nix/store/9f6ax144s65vc17xp47mv6d02cd6h716-rustc-wrapper-1.98.1.drv",
       "description": "Safe, concurrent, practical language (wrapper script)",
       "install_id": "rustc",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "rustc-wrapper-1.95.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "name": "rustc-wrapper-1.98.1",
       "pname": "rustc",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:11:03.623372Z",
+      "rev": "e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa",
+      "rev_count": 1080189,
+      "rev_date": "2026-09-26T22:51:50Z",
+      "scrape_date": "2026-09-28T06:08:02.838936Z",
       "stabilities": [
-        "staging",
         "unstable"
       ],
       "unfree": false,
-      "version": "1.95.0",
+      "version": "1.98.1",
       "outputs_to_install": [
         "man",
         "out"
       ],
       "outputs": {
-        "doc": "/nix/store/750razfy70xi1fh4c18cm1lxipx0mykk-rustc-wrapper-1.95.0-doc",
-        "man": "/nix/store/jywgfsvf67p0ygi5q8dffq2kznrcfj6j-rustc-wrapper-1.95.0-man",
-        "out": "/nix/store/x7c0r6485pgxf2zjf9afhxp584qpdziv-rustc-wrapper-1.95.0"
-      },
-      "system": "x86_64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "rustc",
-      "broken": false,
-      "derivation": "/nix/store/6ag9phi7nq5kbdb6wyad3gg07ap6pjmr-rustc-wrapper-1.95.0.drv",
-      "description": "Safe, concurrent, practical language (wrapper script)",
-      "install_id": "rustc",
-      "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
-      "name": "rustc-wrapper-1.95.0",
-      "pname": "rustc",
-      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-      "rev_count": 1027867,
-      "rev_date": "2026-07-05T04:06:12Z",
-      "scrape_date": "2026-07-06T04:42:43.500521Z",
-      "stabilities": [
-        "staging",
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "1.95.0",
-      "outputs_to_install": [
-        "man",
-        "man",
-        "out",
-        "out"
-      ],
-      "outputs": {
-        "doc": "/nix/store/shjz14vp8z0368pyl3y1k9y25k033vdh-rustc-wrapper-1.95.0-doc",
-        "man": "/nix/store/bdimrwi4i9p5wxqzms5s8gh0vjqig9gb-rustc-wrapper-1.95.0-man",
-        "out": "/nix/store/qcpwgd3b95bxxylvb0na4hny75chrkzm-rustc-wrapper-1.95.0"
+        "doc": "/nix/store/h3yk6c9kc7rqfxccypqqvavgc1m5rb2d-rustc-wrapper-1.98.1-doc",
+        "man": "/nix/store/3wyrxmrdzlslwlmjadmj660lnv5ldgcj-rustc-wrapper-1.98.1-man",
+        "out": "/nix/store/vy0xilifxb02fwal0wihsrwc8s69rlyk-rustc-wrapper-1.98.1"
       },
       "system": "x86_64-linux",
       "group": "toplevel",

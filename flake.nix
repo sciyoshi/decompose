@@ -2,7 +2,8 @@
   description = "decompose - fast local process orchestration for coding workflows";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Match the latest Flox base catalog revision.
+    nixpkgs.url = "github:flox/nixpkgs/e158d9ed9b51c98974c5e66e1ba1c9e0255fecaa";
   };
 
   outputs = { self, nixpkgs }:
@@ -10,7 +11,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems = f:
@@ -61,7 +61,7 @@
             nativeBuildInputs = [ pkgs.cargo pkgs.cacert ];
             # Includes Cargo.lock: refresh even for package-only version bumps.
             # See the Nix vendor check in .github/workflows/nix.yml.
-            outputHash = "sha256-cUmOmFQAhq+7KE40CS5eQZ+GlpC6oXDTsNweBhMJaA4=";
+            outputHash = "sha256-JsvpPmNoZUi9otdFKlS5U/ZVWbUCYHU7id6/sPbVIic=";
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
             dontConfigure = true;
