@@ -1,0 +1,32 @@
+name: Nix vendor
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Source ref to validate before publishing
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  vendor:
+    name: Check vendor hash
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: cachix/install-nix-action@v31
+      - name: Verify Cargo.lock matches the Nix vendor hash
+        run: |
+          nix build --no-link --print-build-logs .#packages.x86_64-linux.default.cargoDeps
+          # A fixed-output path can be reused despite changed inputs. Rebuild
+          # to catch stale hashes even when the old output is already cached.
+          # --rebuild requires the output to exist, hence the initial build.
+          nix build --no-link --print-build-logs --rebuild .#packages.x86_64-linux.default.cargoDeps

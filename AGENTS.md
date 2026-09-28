@@ -41,6 +41,24 @@ cargo doc --locked --no-deps
 
 Use `nix develop` to get a toolchain-pinned shell if you prefer.
 
+After changing `Cargo.lock` (including a package version bump), `Cargo.toml`,
+`flake.lock`, or the vendoring derivation, verify the Nix vendor hash:
+
+```bash
+system=$(nix eval --impure --raw --expr builtins.currentSystem)
+nix build --no-link --print-build-logs ".#packages.$system.default.cargoDeps"
+nix build --no-link --print-build-logs --rebuild ".#packages.$system.default.cargoDeps"
+```
+
+The vendor output includes `Cargo.lock`, so even changing only decompose's
+version requires updating `outputHash` in `flake.nix`. On a hash mismatch,
+use the reported `got` hash, then rerun both commands. If a cached output
+causes only the rebuild to fail, temporarily set `outputHash` to
+`nixpkgs.lib.fakeHash` and run the first command to obtain the new hash.
+The initial build ensures an output exists; the rebuild prevents a cached
+fixed-output derivation from hiding stale inputs. CI runs this check on
+pull requests and main, and releases must pass it before publishing.
+
 ## Coding style
 
 - Follow `rustfmt` defaults. Run `cargo fmt --all` before committing.
@@ -100,6 +118,7 @@ chore(deps): bump tokio to 1.44
 
 1. Ensure `main` is green.
 2. Bump `version` in `Cargo.toml` (semver: breaking → major, new feature → minor, fix → patch).
+   Update `Cargo.lock` and refresh and verify the Nix vendor hash as above.
 3. Optionally update `CHANGELOG.md` — if present, the release workflow will embed the matching section in the GitHub Release notes.
 4. Commit: `chore(release): v0.x.y`.
 5. Tag: `git tag v0.x.y && git push --tags`.

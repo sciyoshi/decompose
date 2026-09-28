@@ -27,7 +27,9 @@
             name = "${cargoToml.package.name}-${cargoToml.package.version}-vendor";
             src = ./.;
             nativeBuildInputs = [ pkgs.cargo pkgs.cacert ];
-            outputHash = "sha256-5V86hNrRWMJgzcU8HvL1dEXJSdKOL94c/fwkLW4Dj1U=";
+            # Includes Cargo.lock: refresh even for package-only version bumps.
+            # See the Nix vendor check in .github/workflows/nix.yml.
+            outputHash = "sha256-GqHHZk1XAQpUrJFRz/Mba7wCvpBi1U63i1LMW+pa1tg=";
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
             dontConfigure = true;

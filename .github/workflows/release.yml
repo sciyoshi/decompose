@@ -26,8 +26,14 @@ env:
 # the changelog -- there is no CHANGELOG.md in this repo.
 
 jobs:
+  check-nix:
+    uses: ./.github/workflows/nix.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
   create-release:
     name: Create GitHub release
+    needs: check-nix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +149,7 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
+    needs: check-nix
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: crates-io
