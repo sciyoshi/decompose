@@ -18,6 +18,138 @@ override the same fields in earlier files:
 decompose -f base.yml -f dev-overrides.yml up -d
 ```
 
+## Includes and packaged fragments
+
+A top-level `include` list imports processes and global environment:
+
+```yaml
+include:
+  - ${FLOX_ENV}/share/decompose/nats.yaml
+  - path: ${FLOX_ENV}/share/decompose/temporal.yaml
+    processes: [temporal]
+
+processes:
+  nats:
+    environment:
+      NATS_PORT: '4223'
+  api:
+    command: ./api
+    depends_on:
+      nats: {condition: process_started}
+```
+
+Paths are interpolated and resolved relative to the file containing the
+include. Missing files are errors. Includes may nest, with cycle detection
+using canonical paths and a maximum depth of 32 edges.
+
+Files merge in include-list order, followed by the including file's local
+definitions. Two imports defining the same process are an error unless the
+immediate including file also defines that process. A partial local definition
+is sufficient: the imports merge in order, then the local fields override them.
+An ancestor's definition cannot resolve a conflict inside a nested include.
+
+`processes` selects names from the composed included file and brings their
+transitive dependencies. Omit it to import all processes; use `processes: []`
+to import only global environment. Unknown selected names are errors. Global
+environment is always imported, with later values winning. Dependencies may
+also refer to processes supplied elsewhere in the final project.
+
+Only processes and environment are imported. `exit_mode` and
+`disable_env_expansion` are controlled by root config files. With multiple
+`--file` arguments, each file's include tree is composed before applying the
+root-file overlays in argument order.
+
+The first root config determines the project directory and automatic `.env`.
+Included files never load their own `.env`, and their paths are not added to
+the instance identity. `up` on an existing daemon rereads included files;
+changes to effective process configuration participate in normal reloads.
+
+### Path anchors
+
+Two reserved interpolation variables are supplied by decompose:
+
+| Variable | Value | Typical use |
+|---|---|---|
+| `DECOMPOSE_PROJECT_DIR` | Canonical directory of the first root config | Writable data directories |
+| `DECOMPOSE_FILE_DIR` | Canonical directory of the file supplying the value | Assets next to a fragment |
+
+Field origins survive partial overrides. For example, an inherited command
+uses the fragment's `DECOMPOSE_FILE_DIR`, while a locally overridden environment
+value uses the local file's directory. These are interpolation variables, not
+automatically exported child environment variables. Environment declarations
+cannot override their meaning during interpolation.
+
+Relative `working_dir` and `env_file` paths use the **project directory**, even
+inside fragments. An `env_file` can resolve beneath either the project directory
+or the directory of the file that supplied that list. Canonical paths are checked,
+so symlinks cannot escape those directories. For a packaged asset, use:
+
+```yaml
+env_file: ['${DECOMPOSE_FILE_DIR}/defaults.env']
+working_dir: ${DECOMPOSE_PROJECT_DIR}
+```
+
+Include-path interpolation uses root `.env` / explicit `--env-file` values,
+shell environment, the declaring file's own global environment, and the anchors.
+Imported environment does not affect include discovery. Include-path expansion
+still runs when `disable_env_expansion: true`; that setting suppresses expansion
+of the composed config's content.
+
+This syntax follows Compose's `include` naming, but local conflict overrides,
+process selection, root-relative service paths, and root-only dotenv loading
+are deliberate differences from the Compose specification.
+
+### Provenance
+
+`decompose config --json` adds a `provenance.processes` map. Each entry contains
+`command_source` (the canonical file that supplied the command) and `files`
+(contributing files in first-contribution order). Internal field origins also
+track environment keys individually. Provenance metadata alone does not change
+process hashes or trigger a restart. Table/YAML output contains only the
+resolved configuration.
+
+### Building fragments with Nix
+
+Use `decompose.lib.mkFragment` from the decompose flake input:
+
+```nix
+natsFragment = decompose.lib.mkFragment {
+  inherit pkgs;
+  name = "nats";
+  src = ./nats.yaml;
+  substitutions = { natsServer = pkgs.nats-server; };
+};
+```
+
+The helper installs `share/decompose/nats.yaml`, replacing `@name@` placeholders
+with the supplied values. It preserves decompose interpolation and dollar
+escapes. The source fragment can contain:
+
+```yaml
+processes:
+  nats:
+    command: >-
+      exec @natsServer@/bin/nats-server --jetstream
+      --store_dir "${DECOMPOSE_PROJECT_DIR}/.data/nats"
+      --port "$${NATS_PORT:-4222}"
+```
+
+Combine fragments into one installable package:
+
+```nix
+stack-services = pkgs.symlinkJoin {
+  name = "stack-services";
+  paths = [ natsFragment temporalFragment ];
+};
+```
+
+Absolute store paths let services run without their binaries on `PATH` or an
+active Flox environment. Nix retains binaries referenced in the output as runtime
+dependencies; merely adding a package to build inputs does not retain it. Reference
+any required CLI tools in the shipped configuration or assets too. The consumer
+can then pin one fragment package, together with its binary closure, in its Flox
+manifest lock. The stack repository can include these same installed fragments.
+
 ## Minimal example
 
 ```yaml
@@ -85,10 +217,11 @@ These are top-level keys in the YAML file, alongside `processes`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `include` | list | `[]` | Paths or `{path, processes?}` entries importing reusable processes and global environment. |
 | `environment` | map or list | `{}` | Environment variables applied to every process. Accepts a YAML map (`KEY: value`) or a list of `KEY=VALUE` strings. |
 | `exit_mode` | string | `wait_all` | Controls daemon behavior when processes exit. See [exit modes](#exit-modes) below. |
-| `disable_env_expansion` | bool | `false` | When `true`, disables `${VAR}` interpolation in all string fields. |
-| `processes` | map | **required** | Map of process name to [process configuration](#process-settings). At least one process must be defined. |
+| `disable_env_expansion` | bool | `false` | When `true`, disables content interpolation. Include paths still expand. |
+| `processes` | map | `{}` | Process definitions and partial overrides. At least one process must exist after includes and overlays are merged. |
 
 ### Exit modes
 
@@ -124,11 +257,11 @@ processes:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `command` | string | **required** | Shell command to run. Executed via the system shell (`sh -c`). Must not be empty. |
+| `command` | string | **required after merging** | Shell command to run. Executed via the system shell (`sh -c`). Must not be empty. |
 | `description` | string | `null` | Optional human-readable description shown in `ps` output. |
-| `working_dir` | string | config file directory | Working directory for the process. Relative paths resolve from the config file location. |
+| `working_dir` | string | project directory | Working directory for the process. Relative paths resolve from the first root config directory, including in fragments. |
 | `environment` | map or list | `{}` | Per-process environment variables. Same format as the global `environment` field. Merged on top of global vars. |
-| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Paths are relative to the config file directory. |
+| `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Relative paths use the project directory; `${DECOMPOSE_FILE_DIR}` addresses fragment assets. |
 | `disabled` | bool | `false` | When `true`, the process is visible in `ps` output but not auto-started by `up`. Can be started explicitly with `decompose start`. |
 | `replicas` | integer | `1` | Number of instances to run. When greater than 1, instances are named `service[1]`, `service[2]`, etc. Must be at least 1. |
 | `ready_log_line` | string (regex) | `null` | A regex pattern matched against process stdout/stderr. When a line matches, the process is marked as "log ready". Required if another process depends on this one with the `process_log_ready` condition. |
@@ -322,8 +455,13 @@ override earlier ones:
 
 ### Variable interpolation
 
-String fields support `${VAR}` substitution from the merged environment at
-the point where the field is evaluated.
+String fields support `${VAR}` substitution after merging. For interpolation,
+root dotenv values are overridden by the shell environment, then global
+`environment`, then per-process `environment`; reserved anchors take precedence.
+Per-process `env_file` values are loaded into children, not used for interpolation.
+Global environment values are expanded in key order. Process environment values
+use a frozen snapshot of their unexpanded values, preserving non-recursive
+substitution semantics.
 
 | Syntax | Description |
 |---|---|
@@ -337,6 +475,8 @@ Interpolation is applied to these fields:
 - `command`
 - `description`
 - `working_dir`
+- `env_file`
+- Probe exec commands and HTTP host, scheme, and path
 - `ready_log_line`
 - `shutdown.command`
 - All environment variable values (both global and per-process)
@@ -386,8 +526,15 @@ order. The merge rules are:
   value replaces the earlier one.
 - **Global `environment`**: maps are merged key-by-key; later values override
   earlier values for the same key.
-- **`processes`**: if the same process name appears in both files, the later
-  definition replaces the earlier one entirely. New process names are added.
+- **`processes`**: definitions merge by process name; new names are added.
+  Omitted fields inherit. Explicit scalar values replace, including `false`
+  and `replicas: 1`. `environment` and `depends_on` merge by key. Lists replace
+  when supplied, including empty lists. Probes and `shutdown` replace as whole
+  blocks. Optional fields can be cleared with `null` where their schema allows it.
+- **Completeness**: `command` is required only after all files are merged.
+  An overlay can contain `api: {depends_on: {db: {}}}` or override one environment
+  variable without copying the command. Dependency validation also runs against
+  the complete project.
 
 This allows you to keep a base configuration and layer environment-specific
 overrides on top:
@@ -403,7 +550,8 @@ decompose -f base.yml -f dev.yml up -d
 `decompose` validates the configuration at load time and reports errors for:
 
 - No processes defined
-- Empty `command` on any process
+- Missing or empty `command` on any process
+- Missing include files, include conflicts, cycles, or nesting beyond 32 edges
 - `replicas` set to 0
 - `depends_on` referencing an unknown process name
 - `process_log_ready` condition on a dependency that has no `ready_log_line`

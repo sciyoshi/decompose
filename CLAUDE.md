@@ -46,7 +46,27 @@ otherwise JSON).
 
 Config files are discovered in order: `decompose.yml`, `decompose.yaml`,
 `compose.yml`, `compose.yaml`. Multiple `-f` flags merge with overlay
-semantics (later files override earlier ones).
+semantics (later files override earlier ones). Parsing preserves field presence:
+`command` and dependency completeness are validated only after merging. Explicit
+false/default values and empty lists override; environment and dependency maps
+merge by key, while probes and shutdown replace as whole blocks.
+
+`include` accepts paths or `{path, processes?}` entries. Imports merge in order,
+then locals; duplicate imported process names require a definition in the
+immediate including file. Selection brings transitive dependencies. Canonical
+paths detect include cycles; depth is limited to 32 edges. Only processes and
+global environment are imported; root files control global behavior settings.
+
+`config::load_project` is the shared resolver for CLI, preflight, daemon, and
+reload. It loads root dotenv once, composes raw files, interpolates once with
+field origins, and validates the final config and paths. Included files do not
+load dotenv or affect identity. Relative service paths stay project-relative.
+`DECOMPOSE_PROJECT_DIR` is the first root config's directory;
+`DECOMPOSE_FILE_DIR` is the directory supplying each field/environment value.
+Both are reserved interpolation variables. `env_file` may resolve beneath the
+project or its defining file's directory, with symlink targets checked.
+JSON config output adds provenance separately from runtime configuration hashes.
+The flake's `lib.mkFragment` packages substituted YAML under `share/decompose/`.
 
 ### YAML schema
 
@@ -58,7 +78,7 @@ disable_env_expansion: false
 
 processes:
   service_name:
-    command: "..."                    # Required. Shell command to run.
+    command: "..."                    # Required after merging. Shell command to run.
     description: "..."               # Optional description.
     working_dir: "/path"             # Defaults to config directory.
     environment:                     # Per-process env vars (map or list).
