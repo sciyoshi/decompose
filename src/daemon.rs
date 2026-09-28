@@ -2018,7 +2018,7 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
 /// services error out; services that aren't currently running are silently
 /// skipped (the signal only has a target for actively-Running PIDs).
 async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) -> Response {
-    let mut guard = state.lock().await;
+    let guard = state.lock().await;
     match resolve_services_or_error(&guard, &services) {
         Err(resp) => resp,
         Ok(names) => {
@@ -2031,11 +2031,13 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
                 {
                     tx.send_replace(true);
                 }
-                if let Some(runtime) = guard.processes.get_mut(name) {
-                    runtime.initialization.initialized = false;
-                    if let Some(cancel) = &runtime.hook_cancel {
-                        cancel.send_replace(true);
-                    }
+                // Signals need not terminate the child. Cancel active hooks,
+                // but retain completed initialization until the child exits.
+                if let Some(runtime) = guard.processes.get(name)
+                    && runtime.initialization.state == crate::model::InitializationState::Running
+                    && let Some(cancel) = &runtime.hook_cancel
+                {
+                    cancel.send_replace(true);
                 }
                 if let Some(runtime) = guard.processes.get(name)
                     && let ProcessStatus::Running { pid } = runtime.status

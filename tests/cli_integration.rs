@@ -7650,6 +7650,54 @@ fn startup_hooks_documented_example_runs_and_skips_on_restart() {
 }
 
 #[test]
+fn startup_hooks_nonterminating_signal_preserves_completed_initialization() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: "sleep 100"
+    post_start:
+      - name: prepare
+        command: "true"
+  dependent:
+    command: "sleep 100"
+    depends_on:
+      svc: {condition: process_initialized}
+"#,
+    );
+    env.up_started = true;
+    assert_success(&env.run(&["up", "-d", "--wait", "svc"]), "start service");
+    let before = env.ps_json_value();
+    assert_eq!(
+        hook_service(&before, "svc")["initialization"]["initialized"],
+        true
+    );
+    assert_eq!(hook_service(&before, "dependent")["state"], "not_started");
+
+    assert_success(
+        &env.run(&["kill", "--signal", "CONT", "svc"]),
+        "send nonterminating signal",
+    );
+    let after = env.ps_json_value();
+    assert_eq!(hook_service(&after, "svc")["state"], "running");
+    assert_eq!(
+        hook_service(&after, "svc")["pid"],
+        hook_service(&before, "svc")["pid"]
+    );
+    assert_eq!(
+        hook_service(&after, "svc")["initialization"],
+        hook_service(&before, "svc")["initialization"]
+    );
+
+    assert_success(&env.run(&["start", "dependent"]), "start dependent");
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "dependent")["state"] == "running"
+    });
+    env.down_json();
+}
+
+#[test]
 fn startup_hooks_kill_cancels_work_even_if_main_ignores_signal() {
     let mut env = TestEnv::new();
     env.with_config(
