@@ -95,9 +95,10 @@ process state — the daemon keeps running on disconnect.
 ### `decompose tui`
 
 Open the interactive terminal UI against a running environment. Shows
-process state, lets you tail logs per service, and search across them. The
-daemon and its services are unaffected by the TUI exiting; press `Q` (or
-Ctrl-C) to leave. See [Configuration](configuration.md) for keybindings.
+process state and combined logs, with search and service controls. Press
+`q` or Ctrl-C to detach and leave services running; uppercase `Q` stops the
+environment before exiting. See the [terminal UI reference](tui.md) for
+keybindings and shutdown behavior.
 
 ### `decompose config`
 
