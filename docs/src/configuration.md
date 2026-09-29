@@ -672,10 +672,11 @@ restart. There is no persistent success cache or exactly-once guarantee. Guards
 are not locks: use idempotent operations or application locks for shared resources,
 or use a separate setup service with one owner.
 
-A pre-start failure prevents spawn (`failed_to_start` in the human status;
-`failed` in JSON `state`). A post-start failure leaves the service running under
-`wait_all`. Hook failures do not trigger automatic restarts, but
-`exit_on_failure` stops the project and reports failure. `exit_on_end` responds
+A pre-start failure prevents spawn (`failed_to_start` in both human output and
+JSON `state`). A post-start failure leaves the service running under `wait_all`,
+with JSON `state: "running"`. In either case, `initialization.state` is `failed`
+and `initialization.initialized` is `false`. Hook failures do not trigger automatic
+restarts, but `exit_on_failure` stops the project and reports failure. `exit_on_end` responds
 only to service-child exits. Restart explicitly to retry failed initialization.
 
 `process_initialized` requires **every current replica** to be running with both
