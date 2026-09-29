@@ -5,6 +5,8 @@
 - [Managing a running project](managing-projects.md)
 - [Environment and interpolation](environment.md)
 - [Configuration](configuration.md)
+- [Startup hooks](startup-hooks.md)
+- [Includes and packaged fragments](fragments.md)
 - [Commands](commands.md)
 - [Output and scripting](output.md)
 - [Terminal UI](tui.md)

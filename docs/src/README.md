@@ -18,6 +18,12 @@ No image builds. No container cold starts. No bridge-network translation overhea
 ## Quick links
 
 - [Getting Started](getting-started.md) — Install and run your first project.
+- [Managing a running project](managing-projects.md) — Sessions, lifecycle, and applying changes.
+- [Environment and interpolation](environment.md) — Variable precedence and environment refresh.
+- [Output and scripting](output.md) — Output formats, readiness, and automation.
+- [Troubleshooting](troubleshooting.md) — Diagnose startup and runtime failures.
+- [Startup hooks](startup-hooks.md) — Guarded initialization for services.
+- [Includes and packaged fragments](fragments.md) — Share service definitions and package them with Nix.
 - [Configuration](configuration.md) — Full YAML schema reference.
 - [Commands](commands.md) — CLI command reference.
 - [Migrating from Docker Compose](migration.md) — Guide for Docker Compose users.

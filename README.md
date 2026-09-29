@@ -10,6 +10,15 @@ Just your real processes, fast, with a familiar compose-like interface.
 
 ![decompose tui demo](assets/tui-demo.gif)
 
+## Documentation
+
+- [Getting started](docs/src/getting-started.md)
+- [Managing a running project](docs/src/managing-projects.md)
+- [Environment and interpolation](docs/src/environment.md)
+- [Output and scripting](docs/src/output.md)
+- [Troubleshooting](docs/src/troubleshooting.md)
+- [Configuration reference](docs/src/configuration.md)
+
 ## Installing
 
 ### From crates.io
@@ -328,7 +337,7 @@ writable data and `${DECOMPOSE_FILE_DIR}` for assets next to a fragment.
 `decompose config --json` reports process provenance.
 
 The flake exposes `lib.mkFragment { pkgs, name, src, substitutions }` to package
-YAML with absolute binary store paths. See the [include and packaging guide](docs/src/configuration.md#includes-and-packaged-fragments)
+YAML with absolute binary store paths. See the [include and packaging guide](docs/src/fragments.md)
 for merge rules, path handling, and a complete Nix example.
 
 ### Output modes
@@ -875,6 +884,6 @@ hook progress and failures. Pre-start failure prevents spawn; post-start failure
 leaves a running service available for inspection under `wait_all`. Hook failures
 do not invoke restart policy. `run`/`exec` do not execute lifecycle hooks.
 
-See the [configuration guide](docs/src/configuration.md#startup-hooks) and the
+See the [configuration guide](docs/src/startup-hooks.md) and the
 [self-contained example](examples/startup-hooks.yml). Hooks execute natively;
 shared resources still require idempotent operations or application-side locking.

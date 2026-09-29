@@ -44,7 +44,7 @@ For ordinary service fields, later sources override earlier ones:
 The anchors identify the first root config's directory and the directory
 that supplied the individual field, respectively. They are interpolation
 values, not automatically injected child variables. See
-[includes](configuration.md#includes-and-packaged-fragments) for their use with fragments.
+[includes](fragments.md) for their use with fragments.
 
 Global environment values expand in alphabetical key order, so a later key
 can refer to an earlier resolved key. Service environment values and other
@@ -68,7 +68,7 @@ Interpolation applies to commands, descriptions, working directories,
 HTTP probe host/scheme/path, and YAML environment values. Set the top-level
 `disable_env_expansion: true` to disable content interpolation; include paths
 still expand. Startup hooks expand later, after service env files are loaded;
-see [startup hooks](configuration.md#startup-hooks) for their rules.
+see [startup hooks](startup-hooks.md) for their rules.
 
 ## The child environment
 

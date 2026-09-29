@@ -66,7 +66,7 @@ Fix files/configuration and run `up -d --wait`, or use `restart SERVICE` to
 retry the stored definition after fixing an external condition. Hook failure
 itself does not trigger automatic restarts. Repeating `up` on an unchanged
 running process does not rerun hooks; restart that service to retry a failed
-post-start hook. See [startup hooks](configuration.md#startup-hooks).
+post-start hook. See [startup hooks](startup-hooks.md).
 
 ## Changed environment values do not take effect
 

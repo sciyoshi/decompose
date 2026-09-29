@@ -67,5 +67,5 @@ An `unless` wrapper must distinguish absent resources (exit 1) from connection,
 authentication, or query errors (exit 2 or higher). Exit 0 means the state exists;
 it is required again after mutation to verify success. Use idempotent scripts,
 write artifact markers only after successful work, and provide locking for
-resources shared by replicas. See [Startup hooks](configuration.md#startup-hooks)
+resources shared by replicas. See [Startup hooks](startup-hooks.md)
 for the schema and lifecycle rules.
