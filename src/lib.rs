@@ -19,7 +19,7 @@
 //! - [`model`]    — runtime types shared by the daemon and its clients
 //!   (`ProcessInstanceSpec`, `ProcessRuntime`, `ProcessSnapshot`,
 //!   `HealthProbe`, …).
-//! - [`output`]   — JSON / table formatting and TTY-aware mode resolution.
+//! - [`output`]   — JSON / text formatting and coordinated output writers.
 //! - [`paths`]    — XDG path management and instance-ID hashing.
 //! - [`tui`]      — the optional interactive terminal UI built on `ratatui`.
 //! - [`tuning`]   — env-var-overridable timing knobs (supervisor tick, IPC
@@ -35,12 +35,14 @@ pub mod cli;
 pub mod completion;
 pub mod config;
 pub mod daemon;
+pub mod diagnostic;
 pub mod health_probes;
 mod hooks;
 pub mod ipc;
 mod logs;
 pub mod model;
 pub mod output;
+pub mod output_model;
 pub mod paths;
 #[cfg(unix)]
 mod process_table;
@@ -54,8 +56,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
-use serde_json::json;
 use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -64,11 +64,23 @@ use crate::cli::{Cli, Commands, ExecArgs, KillArgs, LogsArgs, RunArgs, ServiceAr
 use crate::config::{build_process_instances, load_project, resolve_config_paths};
 use crate::daemon::{run_daemon, spawn_daemon_process};
 use crate::ipc::{Request, Response, send_request};
-use crate::output::{
-    OutputMode, UpResult, UpStatusInfo, print_json, print_up_status, styled, unified_state,
-    use_color,
+use crate::output::{OutputMode, print_json, styled, unified_state, use_color};
+use crate::output_model::{
+    Acknowledgment, Changes, Daemon, DaemonAction, DaemonState, OperationResult, Outcome,
+    Readiness, ServiceOutcome, ServiceResult,
 };
 use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
+
+/// A one-off child's status, returned to library callers without terminating
+/// their process. The binary preserves this status without a CLI diagnostic.
+#[derive(Debug)]
+pub struct ChildExitStatus(pub i32);
+impl std::fmt::Display for ChildExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "child exited with status {}", self.0)
+    }
+}
+impl std::error::Error for ChildExitStatus {}
 
 /// Global config flags that live on the top-level `Cli` struct.
 #[derive(Debug, Clone)]
@@ -79,8 +91,164 @@ pub struct GlobalConfig {
     pub disable_dotenv: bool,
 }
 
+/// Parse and execute an invocation, rendering terminal failures exactly once.
+/// All decompose output uses the supplied writers. Child streams remain
+/// passthrough; `run_cli` remains available to callers handling errors.
+pub async fn run_cli_from(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) -> u8 {
+    let args: Vec<_> = args.into_iter().collect();
+    let mut mode = cli::diagnostic_mode(&args);
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                return if write!(stdout, "{error}").is_ok() {
+                    0
+                } else {
+                    1
+                };
+            }
+            let text = error.to_string();
+            let (summary, usage) = text.split_once("\n\n").unwrap_or((&text, ""));
+            let mut diagnostic = diagnostic::Diagnostic::error(
+                "invalid_arguments",
+                summary
+                    .trim()
+                    .strip_prefix("error: ")
+                    .unwrap_or(summary.trim()),
+            );
+            if !usage.is_empty() {
+                diagnostic.usage = Some(usage.trim().into());
+            }
+            let _ = diagnostic.write(mode, stderr);
+            return 2;
+        }
+    };
+    if matches!(&cli.command, Commands::Daemon(_)) {
+        mode = OutputMode::Json;
+    }
+    let read_only = matches!(
+        &cli.command,
+        Commands::Ps(_)
+            | Commands::Ls(_)
+            | Commands::Logs(_)
+            | Commands::Attach(_)
+            | Commands::Config(_)
+            | Commands::Completion(_)
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let invocation = output::STDOUT.scope(
+        sender,
+        diagnostic::WARNINGS.scope(std::cell::RefCell::new(Vec::new()), async {
+            let result = dispatch_cli(cli).await;
+            let warnings = diagnostic::WARNINGS.with(|warnings| warnings.take());
+            (result, warnings)
+        }),
+    );
+    tokio::pin!(invocation);
+    let mut output_error = None;
+    let (mut result, warnings) = loop {
+        tokio::select! {
+            result = &mut invocation => break result,
+            Some(bytes) = receiver.recv() => {
+                if output_error.is_none() && let Err(error) = stdout.write_all(&bytes) {
+                    output_error = Some(error);
+                    receiver.close();
+                }
+            }
+        }
+    };
+    while let Ok(bytes) = receiver.try_recv() {
+        if output_error.is_none()
+            && let Err(error) = stdout.write_all(&bytes)
+        {
+            output_error = Some(error);
+        }
+    }
+    if result.is_ok()
+        && let Some(error) = output_error
+    {
+        if read_only && error.kind() == std::io::ErrorKind::BrokenPipe {
+            return 0;
+        }
+        let mut diagnostic = diagnostic::Diagnostic::from_error(
+            &anyhow::Error::new(error).context("failed to write output"),
+        );
+        diagnostic.code = "output_write_failed".into();
+        result = Err(diagnostic.into());
+    }
+    for warning in warnings {
+        let _ = warning.write(mode, stderr);
+    }
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            if let Some(status) = error.downcast_ref::<ChildExitStatus>() {
+                return status.0 as u8;
+            }
+            if read_only
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+            {
+                return 0;
+            }
+            let diagnostic = diagnostic::Diagnostic::from_error(&error);
+            let code = if matches!(
+                diagnostic.code.as_str(),
+                "invalid_arguments" | "unknown_signal" | "invalid_environment_override"
+            ) {
+                2
+            } else if diagnostic.code == "interrupted" {
+                130
+            } else {
+                1
+            };
+            let _ = diagnostic.write(mode, stderr);
+            code
+        }
+    }
+}
+
+/// Execute the process arguments, returning errors to the library caller.
 pub async fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
+    dispatch_cli(Cli::try_parse_from(env::args_os())?).await
+}
+
+async fn dispatch_cli(mut cli: Cli) -> Result<()> {
+    let output = cli.output.clone();
+    match &mut cli.command {
+        Commands::Up(args) => args.output = output.clone(),
+        Commands::Down(args) => args.output = output.clone(),
+        Commands::Ps(args)
+        | Commands::Attach(args)
+        | Commands::Config(args)
+        | Commands::Ls(args) => args.output = output.clone(),
+        Commands::Start(args) | Commands::Stop(args) | Commands::Restart(args) => {
+            args.output = output.clone()
+        }
+        Commands::Kill(args) => args.output = output.clone(),
+        _ => {}
+    }
+    if output.json
+        && matches!(
+            &cli.command,
+            Commands::Tui | Commands::Up(UpArgs { tui: true, .. })
+        )
+    {
+        return Err(diagnostic::Diagnostic::error(
+            "invalid_arguments",
+            "--json is incompatible with the TUI",
+        )
+        .into());
+    }
 
     let global = GlobalConfig {
         config_files: cli.config_files,
@@ -95,7 +263,7 @@ pub async fn run_cli() -> Result<()> {
         Commands::Ps(args) => run_ps(global, args.output.resolve()).await,
         Commands::Attach(args) => run_attach(global, args.output.resolve()).await,
         Commands::Tui => run_tui(global).await,
-        Commands::Logs(args) => run_logs(global, args).await,
+        Commands::Logs(args) => run_logs(global, args, output.resolve()).await,
         Commands::Start(args) => run_service_command(global, args, ServiceOp::Start).await,
         Commands::Stop(args) => run_service_command(global, args, ServiceOp::Stop).await,
         Commands::Restart(args) => run_service_command(global, args, ServiceOp::Restart).await,
@@ -146,11 +314,19 @@ fn resolve_service_context(
 /// run -e KEY` semantics). Returns an error for empty keys or leading-`=`.
 fn parse_env_override(raw: &str) -> Result<(String, String)> {
     match raw.split_once('=') {
-        Some(("", _)) => bail!("invalid -e entry {raw:?}: empty key"),
+        Some(("", _)) => Err(diagnostic::Diagnostic::error(
+            "invalid_environment_override",
+            format!("invalid --env entry {raw:?}: empty key"),
+        )
+        .into()),
         Some((k, v)) => Ok((k.to_string(), v.to_string())),
         None => {
             if raw.is_empty() {
-                bail!("invalid -e entry: empty string");
+                return Err(diagnostic::Diagnostic::error(
+                    "invalid_environment_override",
+                    "invalid --env entry: empty string",
+                )
+                .into());
             }
             let v = env::var(raw).unwrap_or_default();
             Ok((raw.to_string(), v))
@@ -210,7 +386,7 @@ async fn run_run(global: GlobalConfig, args: RunArgs) -> Result<()> {
     let final_cwd = workdir.unwrap_or(cwd);
     let code = spawn_one_off(&final_cwd, &env_vars, &args.command)?;
     if code != 0 {
-        std::process::exit(code);
+        return Err(ChildExitStatus(code).into());
     }
     Ok(())
 }
@@ -250,7 +426,10 @@ async fn run_exec(global: GlobalConfig, args: ExecArgs) -> Result<()> {
                 );
             }
         }
-        Response::Error { message } => bail!("{message}"),
+        Response::Error {
+            message,
+            diagnostic,
+        } => return Err(Response::into_error(message, diagnostic)),
         _ => bail!("unexpected response from daemon"),
     }
 
@@ -269,7 +448,7 @@ async fn run_exec(global: GlobalConfig, args: ExecArgs) -> Result<()> {
     let final_cwd = workdir.unwrap_or(cwd);
     let code = spawn_one_off(&final_cwd, &env_vars, &args.command)?;
     if code != 0 {
-        std::process::exit(code);
+        return Err(ChildExitStatus(code).into());
     }
     Ok(())
 }
@@ -305,6 +484,16 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         paths,
     } = resolve_up_context(&global)?;
 
+    let wait_set = if args.wait {
+        let loaded = load_project(&config_files, &global.env_files, global.disable_dotenv)?;
+        Some(if args.processes.is_empty() {
+            loaded.config.processes.keys().cloned().collect()
+        } else {
+            crate::config::collect_process_subset(&loaded.config, &args.processes, !args.no_deps)?
+        })
+    } else {
+        None
+    };
     let (pid, state, got_ctrl_c, reload_summary) = ensure_daemon_running(
         &global,
         &args,
@@ -324,21 +513,93 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     // RemoveOrphans call here would be a no-op. The standalone
     // Request::RemoveOrphans variant is still used by other code paths.
 
-    emit_up_status(output_mode, state, pid);
-    maybe_print_up_block(
-        output_mode,
-        &paths,
-        &global,
-        attached,
-        state,
-        reload_summary,
-    )
-    .await;
+    if let Some(selected) = &wait_set {
+        wait_for_services_ready(&paths, selected).await?;
+    }
+    let mut acknowledgment = if let Some(result) = reload_summary {
+        result
+    } else {
+        let processes = match send_request(&paths, Request::Ps).await? {
+            Response::Ps { processes, .. } => processes,
+            _ => bail!("unexpected response to ps"),
+        };
+        let added = processes
+            .iter()
+            .map(|p| p.base.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Acknowledgment {
+            outcome: if args.no_start {
+                Outcome::Completed
+            } else {
+                Outcome::Accepted
+            },
+            services: processes
+                .into_iter()
+                .filter(|p| p.state != "disabled" && (args.no_start || p.state != "not_started"))
+                .map(|p| ServiceResult {
+                    name: p.name,
+                    outcome: if args.no_start {
+                        ServiceOutcome::Registered
+                    } else {
+                        ServiceOutcome::StartRequested
+                    },
+                })
+                .collect(),
+            changes: Some(Changes {
+                added,
+                ..Default::default()
+            }),
+        }
+    };
+    if args.wait {
+        acknowledgment.outcome = Outcome::Completed;
+        for service in &mut acknowledgment.services {
+            service.outcome = ServiceOutcome::Ready;
+        }
+    }
+    acknowledgment.services.sort_by(|a, b| a.name.cmp(&b.name));
+    let result = OperationResult {
+        schema_version: "1.0",
+        operation: "up".into(),
+        daemon: Daemon {
+            state: DaemonState::Running,
+            pid: Some(pid),
+            instance,
+        },
+        acknowledgment,
+        daemon_action: Some(if state == "started" {
+            DaemonAction::Started
+        } else {
+            DaemonAction::Reused
+        }),
+        readiness: Some(if args.wait {
+            Readiness::Satisfied
+        } else {
+            Readiness::NotRequested
+        }),
+        signal: None,
+    };
+    if !attached {
+        emit_operation(output_mode, &result)?;
+    } else if state == "started" {
+        emit_session_event(
+            output_mode,
+            output_model::SessionEvent::DaemonStarted {
+                daemon: result.daemon.clone(),
+            },
+        )?;
+    } else {
+        emit_session_event(
+            output_mode,
+            output_model::SessionEvent::ConfigurationReloaded {
+                changes: result.acknowledgment.changes.clone().unwrap_or_default(),
+            },
+        )?;
+    }
 
     if !attached {
-        if args.wait {
-            wait_for_services_ready(&paths, output_mode).await?;
-        }
         if args.tui {
             return tui::run(paths).await;
         }
@@ -348,7 +609,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         if state == "started" {
             stop_environment(&paths, pid, None).await?;
         } else {
-            emit_detach(output_mode);
+            emit_detach(output_mode)?;
         }
         return Ok(());
     }
@@ -401,10 +662,23 @@ async fn ensure_daemon_running(
     output_mode: OutputMode,
     ctrl_c_task: Option<&tokio::task::JoinHandle<()>>,
     attached: bool,
-) -> Result<(u32, &'static str, bool, Option<ReloadSummary>)> {
+) -> Result<(u32, &'static str, bool, Option<Acknowledgment>)> {
+    let response = send_request(paths, Request::Ping).await;
+    if let Err(error) = &response
+        && !is_no_daemon_error(error, paths)
+    {
+        return Err(response.unwrap_err()).context("daemon discovery failed");
+    }
+    if response.is_ok() && !matches!(&response, Ok(Response::Pong { .. })) {
+        return Err(diagnostic::Diagnostic::error(
+            "ipc_unexpected_response",
+            "unexpected response to ping",
+        )
+        .into());
+    }
     if let Ok(Response::Pong {
         pid, shutting_down, ..
-    }) = send_request(paths, Request::Ping).await
+    }) = response
     {
         if shutting_down {
             // Reload/Start would race against the supervisor's tear-down loop:
@@ -415,6 +689,8 @@ async fn ensure_daemon_running(
                 "decompose is stopping for this project — wait for it to finish, then run `decompose up` again"
             );
         }
+        preflight_validate_config(global, config_files, &args.processes)
+            .context("failed to reload configuration")?;
         let summary = reload_and_start_existing_daemon(args, paths, output_mode).await?;
         Ok((pid, "already_running", false, summary))
     } else {
@@ -440,6 +716,7 @@ async fn ensure_daemon_running(
             global.disable_dotenv,
             &args.processes,
             args.no_deps,
+            args.no_start,
             parent_pid,
         )?;
         let (pid, got_ctrl_c) = wait_for_daemon_ready(paths, ctrl_c_task).await?;
@@ -447,88 +724,11 @@ async fn ensure_daemon_running(
     }
 }
 
-/// Parsed counts from the daemon's reload Ack message. Used to render the
-/// human-readable summary on the `up` status line, and to distinguish a
-/// no-op reload from one that applied changes.
-#[derive(Debug, Default, Clone, Copy)]
-struct ReloadSummary {
-    added: u32,
-    changed: u32,
-    scaled: u32,
-    removed: u32,
-    renamed: u32,
-}
-
-impl ReloadSummary {
-    fn is_noop(&self) -> bool {
-        self.added == 0
-            && self.changed == 0
-            && self.scaled == 0
-            && self.removed == 0
-            && self.renamed == 0
-    }
-
-    /// Render as `"+2 added, 1 changed"`, skipping zero fields. Returns an
-    /// empty string for a no-op summary; callers should branch on `is_noop`.
-    fn human(&self) -> String {
-        let mut parts = Vec::with_capacity(5);
-        if self.added > 0 {
-            parts.push(format!("+{} added", self.added));
-        }
-        if self.changed > 0 {
-            parts.push(format!("{} changed", self.changed));
-        }
-        if self.scaled > 0 {
-            parts.push(format!("{} scaled", self.scaled));
-        }
-        if self.removed > 0 {
-            parts.push(format!("{} removed", self.removed));
-        }
-        if self.renamed > 0 {
-            parts.push(format!("{} renamed", self.renamed));
-        }
-        parts.join(", ")
-    }
-}
-
-/// Parse the daemon's `reloaded: ...` Ack message into a [`ReloadSummary`].
-/// Returns `None` if the message doesn't match the expected shape; callers
-/// fall back to printing the raw text in that case.
-fn parse_reload_message(msg: &str) -> Option<ReloadSummary> {
-    // Format: "reloaded: +N added, N changed, N scaled (DELTA replicas),
-    //          N orphan|removed[, N renamed]"
-    let rest = msg.strip_prefix("reloaded: ")?;
-    let mut summary = ReloadSummary::default();
-    for part in rest.split(", ") {
-        let part = part.trim();
-        if let Some(n) = part.strip_suffix(" added") {
-            summary.added = n.trim_start_matches('+').parse().ok()?;
-        } else if let Some(n) = part.strip_suffix(" changed") {
-            summary.changed = n.parse().ok()?;
-        } else if let Some((n, _delta)) = part.split_once(" scaled (") {
-            summary.scaled = n.parse().ok()?;
-        } else if let Some(n) = part
-            .strip_suffix(" orphan")
-            .or_else(|| part.strip_suffix(" removed"))
-        {
-            summary.removed = n.parse().ok()?;
-        } else if let Some(n) = part.strip_suffix(" renamed") {
-            summary.renamed = n.parse().ok()?;
-        }
-    }
-    Some(summary)
-}
-
-/// Reload and (optionally) start services against an already-running daemon.
-/// On parse/validation failure the reload request errors out before the
-/// start call, so users see config errors directly. Returns the parsed
-/// reload counts so the caller can render the status block; in JSON mode
-/// the raw Ack message is also emitted inline for backward compatibility.
 async fn reload_and_start_existing_daemon(
     args: &UpArgs,
     paths: &crate::model::RuntimePaths,
-    output_mode: OutputMode,
-) -> Result<Option<ReloadSummary>> {
+    _output_mode: OutputMode,
+) -> Result<Option<Acknowledgment>> {
     let reload_resp = send_request(
         paths,
         Request::Reload {
@@ -539,17 +739,36 @@ async fn reload_and_start_existing_daemon(
         },
     )
     .await
-    .map_err(|e| anyhow::anyhow!("failed to reload daemon config: {e}"))?;
-    let reload_message = expect_ack(reload_resp)?;
-    let summary = parse_reload_message(&reload_message);
-    if output_mode == OutputMode::Json {
-        emit_message(output_mode, "ok", &reload_message);
-    } else if summary.is_none() {
-        // Unrecognised Ack shape — fall back to printing it verbatim so the
-        // user isn't left wondering what happened.
-        println!("{reload_message}");
+    .context("failed to reload daemon config")?;
+    let mut result = expect_operation(reload_resp)?;
+    if let Some(changes) = &result.changes
+        && !changes.orphans.is_empty()
+    {
+        diagnostic::warning(
+            "orphan_services",
+            format!(
+                "orphan services left running: {}",
+                changes.orphans.join(", ")
+            ),
+        );
     }
-
+    if args.no_start
+        && let Response::Ps { processes, .. } = send_request(paths, Request::Ps).await?
+    {
+        result.services = processes
+            .into_iter()
+            .filter(|p| {
+                result
+                    .changes
+                    .as_ref()
+                    .is_some_and(|c| c.added.contains(&p.base) || c.changed.contains(&p.base))
+            })
+            .map(|p| ServiceResult {
+                name: p.name,
+                outcome: ServiceOutcome::Registered,
+            })
+            .collect();
+    }
     // Start is idempotent on already-running processes and picks up any
     // newly-added ones that reload inserted as Pending. Skipped under
     // --no-start: the user asked to register-but-not-launch.
@@ -561,10 +780,12 @@ async fn reload_and_start_existing_daemon(
             },
         )
         .await
-        .map_err(|e| anyhow::anyhow!("failed to start services on running daemon: {e}"))?;
-        let _ = expect_ack(start_resp)?;
+        .context("failed to start services on running daemon")?;
+        let start = expect_operation(start_resp)?;
+        result.services = start.services;
+        result.outcome = start.outcome;
     }
-    Ok(summary)
+    Ok(Some(result))
 }
 
 /// Validate the merged config and the requested service names before
@@ -614,51 +835,51 @@ async fn wait_for_daemon_ready(
         }
         sleep(Duration::from_millis(50)).await;
     }
-    bail!(
-        "daemon did not become ready; inspect {}",
-        paths.daemon_log.display()
-    );
+    Err(startup_diagnostic(paths).into())
 }
 
-/// Print the table-mode `up` status block: glyph + service count headline,
-/// followed by a dim hint line. Silently no-ops in JSON mode or if the
-/// daemon doesn't reply (the JSON `status`/`pid` line emitted earlier is
-/// enough on its own).
-async fn maybe_print_up_block(
-    output_mode: OutputMode,
-    paths: &crate::model::RuntimePaths,
-    global: &GlobalConfig,
-    attached: bool,
-    state: &str,
-    reload_summary: Option<ReloadSummary>,
-) {
-    if output_mode != OutputMode::Table {
-        return;
-    }
-    let Ok(Response::Ps { processes, .. }) = send_request(paths, Request::Ps).await else {
-        return;
-    };
-    let service_count = {
-        let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for p in &processes {
-            bases.insert(&p.base);
+fn startup_diagnostic(paths: &crate::model::RuntimePaths) -> diagnostic::Diagnostic {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut excerpt = Vec::new();
+    let mut truncated = false;
+    if let Ok(mut file) = std::fs::File::open(&paths.daemon_log) {
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = len.saturating_sub(16 * 1024);
+        truncated = start > 0;
+        if file.seek(SeekFrom::Start(start)).is_ok() {
+            let mut bytes = Vec::new();
+            if file.take(16 * 1024).read_to_end(&mut bytes).is_ok() {
+                excerpt = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect();
+                if start > 0 && !excerpt.is_empty() {
+                    excerpt.remove(0);
+                }
+                if excerpt.len() > 20 {
+                    excerpt.drain(..excerpt.len() - 20);
+                    truncated = true;
+                }
+            }
         }
-        bases.len()
-    };
-    let result = match (state, reload_summary) {
-        ("already_running", Some(s)) if s.is_noop() => UpResult::NoChange,
-        ("already_running", Some(s)) => UpResult::Reloaded(s.human()),
-        // Unparseable Ack on the already-running branch: we already printed
-        // the raw message, so don't try to summarise — treat as no-change.
-        ("already_running", None) => UpResult::NoChange,
-        _ => UpResult::Fresh,
-    };
-    print_up_status(&UpStatusInfo {
-        service_count,
-        session_name: global.session.as_deref(),
-        attached,
-        result,
+    }
+    let mut error = excerpt
+        .iter()
+        .rev()
+        .find_map(|line| {
+            serde_json::from_str::<diagnostic::Diagnostic>(line)
+                .ok()
+                .filter(|d| d.severity == "error")
+        })
+        .unwrap_or_else(|| {
+            diagnostic::Diagnostic::error("daemon_start_timeout", "daemon did not become ready")
+        });
+    error.details = Some(diagnostic::DiagnosticDetails::Startup {
+        daemon_log: paths.daemon_log.clone(),
+        log_excerpt: excerpt,
+        excerpt_truncated: truncated,
     });
+    error
 }
 
 /// Stream service logs until the Ctrl-C task fires, then stop the log
@@ -671,19 +892,30 @@ async fn stream_logs_until_ctrl_c(
     pid: u32,
 ) -> Result<()> {
     let (log_stop_tx, log_stop_rx) = watch::channel(false);
-    let log_handle = tokio::spawn(stream_daemon_logs(
+    let mut log_handle = output::spawn(stream_daemon_logs(
         paths.daemon_log.clone(),
         log_stop_rx,
         start_at_end,
+        output_mode,
     ));
     if start_at_end {
-        emit_attach(output_mode);
+        emit_attach(output_mode)?;
     } else {
-        emit_message(output_mode, "attached", "attached (Ctrl-C to stop)");
+        emit_session_event(
+            output_mode,
+            output_model::SessionEvent::Attached {
+                ownership: output_model::Ownership::Owner,
+            },
+        )?;
     }
     let outcome = if let Some(mut task) = ctrl_c_task {
         loop {
             tokio::select! {
+                result = &mut log_handle => {
+                    task.abort();
+                    if !start_at_end { stop_environment(paths, pid, None).await?; }
+                    return result?;
+                }
                 result = &mut task => {
                     result.context("failed waiting for shutdown signal")?;
                     break if start_at_end { Ok(()) } else { stop_environment(paths, pid, None).await };
@@ -700,12 +932,18 @@ async fn stream_logs_until_ctrl_c(
         Ok(())
     };
     let _ = log_stop_tx.send(true);
-    let _ = log_handle.await;
+    let log_outcome = log_handle.await;
     outcome?;
+    log_outcome??;
     if start_at_end {
-        emit_detach(output_mode);
+        emit_detach(output_mode)?;
     } else {
-        emit_message(output_mode, "ok", "environment stopped");
+        emit_session_event(
+            output_mode,
+            output_model::SessionEvent::EnvironmentStopped {
+                ownership: output_model::Ownership::Owner,
+            },
+        )?;
     }
     Ok(())
 }
@@ -717,6 +955,11 @@ async fn run_down(
 ) -> Result<()> {
     let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
+    let mut acknowledgment = Acknowledgment {
+        outcome: Outcome::Completed,
+        services: Vec::new(),
+        changes: None,
+    };
     let pid = match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { pid, .. }) => pid,
         Ok(_) => bail!("unexpected response from daemon"),
@@ -729,14 +972,63 @@ async fn run_down(
                 }
                 read_shutdown_receipt(&paths, pid)?;
             }
-            emit_message(output_mode, "ok", "no running environment");
-            return Ok(());
+            acknowledgment.outcome = Outcome::Unchanged;
+            return emit_down(output_mode, &paths, acknowledgment);
         }
         Err(err) => return Err(err),
     };
+    if let Response::Ps { processes, .. } = send_request(&paths, Request::Ps).await? {
+        acknowledgment.services = processes
+            .into_iter()
+            .map(|p| ServiceResult {
+                name: p.name,
+                outcome: if matches!(
+                    p.state.as_str(),
+                    "not_started"
+                        | "disabled"
+                        | "stopped"
+                        | "exited"
+                        | "failed"
+                        | "failed_to_start"
+                ) {
+                    ServiceOutcome::AlreadyStopped
+                } else {
+                    ServiceOutcome::Stopped
+                },
+            })
+            .collect();
+        acknowledgment.services.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     stop_environment(&paths, pid, timeout).await?;
-    emit_message(output_mode, "ok", "environment stopped");
-    Ok(())
+    emit_down(output_mode, &paths, acknowledgment)
+}
+
+fn emit_down(
+    mode: OutputMode,
+    paths: &crate::model::RuntimePaths,
+    acknowledgment: Acknowledgment,
+) -> Result<()> {
+    emit_operation(
+        mode,
+        &OperationResult {
+            schema_version: "1.0",
+            operation: "down".into(),
+            daemon: Daemon {
+                state: DaemonState::NotRunning,
+                pid: None,
+                instance: paths
+                    .socket
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+            acknowledgment,
+            daemon_action: None,
+            readiness: None,
+            signal: None,
+        },
+    )
 }
 
 async fn shutdown_budget(
@@ -752,7 +1044,10 @@ async fn shutdown_budget(
     .await?
     {
         Response::ShutdownBudget { seconds } => Ok(Duration::from_secs(seconds)),
-        Response::Error { message } => bail!("{message}"),
+        Response::Error {
+            message,
+            diagnostic,
+        } => Err(Response::into_error(message, diagnostic)),
         _ => bail!("unexpected shutdown budget response"),
     }
 }
@@ -790,7 +1085,20 @@ async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
     let response = match send_request(&paths, Request::Ps).await {
         Ok(response) => response,
         Err(err) if is_no_daemon_error(&err, &paths) => {
-            emit_ps_empty(output_mode);
+            emit_ps(
+                output_mode,
+                output_model::Daemon {
+                    state: output_model::DaemonState::NotRunning,
+                    pid: None,
+                    instance: paths
+                        .socket
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+                &[],
+            )?;
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -798,15 +1106,31 @@ async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
 
     match response {
         Response::Ps {
-            pid: _,
-            instance: _instance,
+            pid,
+            instance,
             mut processes,
+            shutting_down,
         } => {
             processes.sort_by(|a, b| a.name.cmp(&b.name));
-            emit_ps(output_mode, &processes);
+            emit_ps(
+                output_mode,
+                output_model::Daemon {
+                    state: if shutting_down {
+                        output_model::DaemonState::Stopping
+                    } else {
+                        output_model::DaemonState::Running
+                    },
+                    pid: Some(pid),
+                    instance,
+                },
+                &processes,
+            )?;
             Ok(())
         }
-        Response::Error { message } => bail!("{message}"),
+        Response::Error {
+            message,
+            diagnostic,
+        } => Err(Response::into_error(message, diagnostic)),
         _ => bail!("unexpected response from daemon"),
     }
 }
@@ -830,24 +1154,28 @@ async fn run_attach(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
         _ => bail!("no running environment for this project — start one with `decompose up`"),
     };
 
-    emit_attach(output_mode);
+    emit_attach(output_mode)?;
 
     let (log_stop_tx, log_stop_rx) = watch::channel(false);
-    let log_handle = tokio::spawn(stream_daemon_logs(
+    let mut log_handle = output::spawn(stream_daemon_logs(
         paths.daemon_log.clone(),
         log_stop_rx,
         false,
+        output_mode,
     ));
 
-    ctrl_c().await.context("failed to listen for Ctrl-C")?;
+    tokio::select! {
+        result = &mut log_handle => return result?,
+        signal = ctrl_c() => { signal.context("failed to listen for Ctrl-C")?; }
+    }
 
     let _ = log_stop_tx.send(true);
-    let _ = log_handle.await;
-    emit_detach(output_mode);
+    log_handle.await??;
+    emit_detach(output_mode)?;
     Ok(())
 }
 
-async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
+async fn run_logs(global: GlobalConfig, args: LogsArgs, mode: OutputMode) -> Result<()> {
     let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
 
     match send_request(&paths, Request::Ping).await {
@@ -857,19 +1185,20 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
 
     let mut reader = crate::logs::Reader::default();
     let backlog = reader
-        .poll(&paths.daemon_log, &args.processes, args.tail)
+        .poll_records(&paths.daemon_log, &args.processes, args.tail)
         .await?;
     if args.follow {
         for line in &backlog {
-            println!("{line}");
+            line.write(mode, args.processes.len() == 1)?;
         }
         let _ = std::io::stdout().flush();
         let (log_stop_tx, log_stop_rx) = watch::channel(false);
-        let mut log_handle = tokio::spawn(stream_filtered_logs(
+        let mut log_handle = output::spawn(stream_filtered_logs(
             paths.clone(),
             log_stop_rx,
             args.processes,
             reader,
+            mode,
         ));
         tokio::select! {
             result = &mut log_handle => result??,
@@ -880,7 +1209,7 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
             }
         }
     } else {
-        if backlog.is_empty() {
+        if backlog.is_empty() && mode == OutputMode::Table {
             if args.processes.is_empty() {
                 eprintln!("(no log output yet)");
             } else {
@@ -890,8 +1219,18 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
                 );
             }
         }
-        let lines: Vec<&str> = backlog.iter().map(String::as_str).collect();
-        write_logs_maybe_paged(&lines, args.no_pager);
+        if mode == OutputMode::Json {
+            for record in backlog {
+                record.write(mode, false)?;
+            }
+        } else {
+            let lines: Vec<String> = backlog
+                .iter()
+                .map(|r| r.render(args.processes.len() == 1))
+                .collect();
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            write_logs_maybe_paged(&lines, args.no_pager)?;
+        }
     }
 
     Ok(())
@@ -900,7 +1239,7 @@ async fn run_logs(global: GlobalConfig, args: LogsArgs) -> Result<()> {
 /// Write filtered, one-shot log output to stdout, optionally paging through
 /// `$PAGER` (or `less -R`) when stdout is a TTY. See [`should_page`] for the
 /// gate.
-fn write_logs_maybe_paged(lines: &[&str], no_pager: bool) {
+fn write_logs_maybe_paged(lines: &[&str], no_pager: bool) -> Result<()> {
     if should_page(no_pager)
         && let Some(mut child) = spawn_pager()
     {
@@ -923,12 +1262,14 @@ fn write_logs_maybe_paged(lines: &[&str], no_pager: bool) {
             child.wait()
         };
         let _ = status;
-        return;
+        return Ok(());
     }
     // Falls through to direct stdout on pager spawn failure.
     for line in lines {
-        println!("{line}");
+        crate::output::write_line(format_args!("{line}"))?;
     }
+
+    Ok(())
 }
 
 /// Whether `decompose logs` (one-shot, non-follow) output should be piped
@@ -984,6 +1325,12 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
     let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
     let output_mode = args.output.resolve();
 
+    let daemon = query_daemon(&paths).await?;
+    let operation = match op {
+        ServiceOp::Start => "start",
+        ServiceOp::Stop => "stop",
+        ServiceOp::Restart => "restart",
+    };
     let request = match op {
         ServiceOp::Start => Request::Start {
             services: args.services.clone(),
@@ -1009,7 +1356,7 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
         Err(err) => return Err(err),
     };
 
-    let message = expect_ack(response)?;
+    let mut acknowledgment = expect_operation(response)?;
     if let Some(budget) = stop_budget {
         let wait = async {
             loop {
@@ -1021,15 +1368,35 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
                 )
                 .await?
                 {
-                    Response::StopStatus { complete, errors } => {
+                    Response::StopStatus {
+                        complete,
+                        errors,
+                        failures,
+                    } => {
                         if !errors.is_empty() {
-                            bail!("{}", errors.join("; "));
+                            let failures = if failures.is_empty() {
+                                errors
+                                    .into_iter()
+                                    .map(|e| diagnostic::Diagnostic::error("remote_error", e))
+                                    .collect()
+                            } else {
+                                failures
+                            };
+                            return Err(diagnostic::Diagnostic::failures(
+                                "shutdown_failed",
+                                "failed to stop services",
+                                failures,
+                            )
+                            .into());
                         }
                         if complete {
                             return Ok::<(), anyhow::Error>(());
                         }
                     }
-                    Response::Error { message } => bail!("{message}"),
+                    Response::Error {
+                        message,
+                        diagnostic,
+                    } => return Err(Response::into_error(message, diagnostic)),
                     _ => bail!("unexpected stop status response"),
                 }
                 sleep(Duration::from_millis(50)).await;
@@ -1039,7 +1406,29 @@ async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: Servic
             .await
             .context("timed out waiting for services to stop")??;
     }
-    emit_message(output_mode, "ok", &message);
+    if stop_budget.is_some() {
+        acknowledgment.outcome = if acknowledgment
+            .services
+            .iter()
+            .all(|s| s.outcome == ServiceOutcome::AlreadyStopped)
+        {
+            Outcome::Unchanged
+        } else {
+            Outcome::Completed
+        };
+    }
+    emit_operation(
+        output_mode,
+        &OperationResult {
+            schema_version: "1.0",
+            operation: operation.into(),
+            daemon,
+            acknowledgment,
+            daemon_action: None,
+            readiness: None,
+            signal: None,
+        },
+    )?;
 
     Ok(())
 }
@@ -1065,12 +1454,12 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
             value["provenance"] = serde_json::to_value(&loaded.provenance)?;
             let json =
                 serde_json::to_string_pretty(&value).context("failed to serialize config")?;
-            println!("{json}");
+            crate::output::write_line(format_args!("{json}"))?;
         }
         OutputMode::Table => {
             let yaml =
                 serde_yaml_ng::to_string(&cfg).context("failed to serialize config as YAML")?;
-            print!("{yaml}");
+            crate::output::write_bytes(yaml.as_bytes())?;
         }
     }
 
@@ -1082,6 +1471,7 @@ async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
     let output_mode = args.output.resolve();
 
     let signal = parse_signal(&args.signal)?;
+    let daemon = query_daemon(&paths).await?;
 
     let request = Request::Kill {
         services: args.services.clone(),
@@ -1096,8 +1486,24 @@ async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
         Err(err) => return Err(err),
     };
 
-    let message = expect_ack(response)?;
-    emit_message(output_mode, "ok", &message);
+    let acknowledgment = expect_operation(response)?;
+    emit_operation(
+        output_mode,
+        &OperationResult {
+            schema_version: "1.0",
+            operation: "kill".into(),
+            daemon,
+            acknowledgment,
+            daemon_action: None,
+            readiness: None,
+            signal: Some(output_model::Signal {
+                number: signal,
+                name: nix::sys::signal::Signal::try_from(signal)
+                    .ok()
+                    .map(|s| s.as_str().into()),
+            }),
+        },
+    )?;
 
     Ok(())
 }
@@ -1107,8 +1513,11 @@ async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
 /// that previously appeared at every "fire-and-acknowledge" IPC callsite.
 fn expect_ack(response: Response) -> Result<String> {
     match response {
-        Response::Ack { message } => Ok(message),
-        Response::Error { message } => bail!("{message}"),
+        Response::Ack { message, .. } => Ok(message),
+        Response::Error {
+            message,
+            diagnostic,
+        } => Err(Response::into_error(message, diagnostic)),
         _ => bail!("unexpected response from daemon"),
     }
 }
@@ -1132,72 +1541,100 @@ fn parse_signal(s: &str) -> Result<i32> {
     use std::str::FromStr;
     match nix::sys::signal::Signal::from_str(&canonical) {
         Ok(sig) => Ok(sig as i32),
-        Err(_) => bail!("unknown signal: {s:?} (try e.g. SIGTERM, TERM, 15, or see `kill -l`)"),
+        Err(_) => Err(diagnostic::Diagnostic::error(
+            "unknown_signal",
+            format!("unknown signal: {s:?} (try e.g. SIGTERM, TERM, 15, or see `kill -l`)"),
+        )
+        .into()),
     }
 }
 
 async fn run_ls(output_mode: OutputMode) -> Result<()> {
+    use output_model::{Daemon, DaemonState, DiscoveryResult, Environment};
     let socket_dir = runtime_dir()?;
-
     let mut environments = Vec::new();
-
-    if socket_dir.is_dir() {
-        let entries = std::fs::read_dir(&socket_dir).with_context(|| {
-            format!("failed to read runtime directory {}", socket_dir.display())
-        })?;
-
+    let entries = match std::fs::read_dir(&socket_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to enumerate runtime directory"),
+    };
+    if let Some(entries) = entries {
         for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) != Some("sock") {
                 continue;
             }
-            let name = path
+            let instance = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-
-            let paths = runtime_paths_for(&name)?;
-            let status = match send_request(&paths, Request::Ping).await {
-                Ok(Response::Pong { .. }) => "running",
-                _ => "not responding",
+            let paths = runtime_paths_for(&instance)?;
+            let (state, pid, diagnostic) = match send_request(&paths, Request::Ping).await {
+                Ok(Response::Pong {
+                    pid, shutting_down, ..
+                }) => (
+                    if shutting_down {
+                        DaemonState::Stopping
+                    } else {
+                        DaemonState::Running
+                    },
+                    Some(pid),
+                    None,
+                ),
+                Err(error) if is_no_daemon_error(&error, &paths) => continue,
+                Err(error) => (
+                    DaemonState::Unreachable,
+                    None,
+                    Some(diagnostic::Diagnostic::from_error(&error)),
+                ),
+                Ok(_) => (
+                    DaemonState::Unreachable,
+                    None,
+                    Some(diagnostic::Diagnostic::error(
+                        "ipc_unexpected_response",
+                        "unexpected response to ping",
+                    )),
+                ),
             };
-
-            environments.push((name, status));
+            environments.push(Environment {
+                daemon: Daemon {
+                    state,
+                    pid,
+                    instance: instance.clone(),
+                },
+                instance,
+                diagnostic,
+            });
         }
     }
-
-    environments.sort_by(|a, b| a.0.cmp(&b.0));
-    emit_ls(output_mode, &environments);
-    Ok(())
-}
-
-fn emit_ls(mode: OutputMode, environments: &[(String, &str)]) {
-    match mode {
-        OutputMode::Json => {
-            let envs: Vec<serde_json::Value> = environments
-                .iter()
-                .map(|(name, status)| {
-                    json!({
-                        "name": name,
-                        "status": status
-                    })
-                })
-                .collect();
-            print_json(&json!({ "environments": envs }));
-        }
+    environments.sort_by(|a, b| a.instance.cmp(&b.instance));
+    let result = DiscoveryResult {
+        schema_version: "1.0",
+        environments,
+    };
+    match output_mode {
+        OutputMode::Json => print_json(&result)?,
         OutputMode::Table => {
-            if environments.is_empty() {
-                println!("No running environments");
+            if result.environments.is_empty() {
+                crate::output::write_line(format_args!("no running environments"))?;
             } else {
-                println!("NAME                             STATUS");
-                for (name, status) in environments {
-                    println!("{:<32} {status}", name);
+                crate::output::write_line(format_args!("instance                         state"))?;
+                for environment in result.environments {
+                    let state = match environment.daemon.state {
+                        DaemonState::Running => "running",
+                        DaemonState::Stopping => "stopping",
+                        _ => "not responding",
+                    };
+                    crate::output::write_line(format_args!(
+                        "{:<32} {state}",
+                        environment.instance
+                    ))?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 async fn runtime_context(
@@ -1247,37 +1684,156 @@ fn filter_log_lines<'a>(lines: &[&'a str], processes: &[String]) -> Vec<&'a str>
         .collect()
 }
 
-fn emit_up_status(mode: OutputMode, status: &str, pid: u32) {
-    match mode {
-        // Table mode now renders the `up` outcome via `print_up_status`,
-        // which folds status, count, session, and the next-step hint into a
-        // single two-line block. This function only emits the JSON record.
-        OutputMode::Table => {}
-        OutputMode::Json => print_json(&json!({
-            "status": status,
-            "pid": pid
-        })),
+fn emit_operation(mode: OutputMode, result: &OperationResult) -> Result<()> {
+    if mode == OutputMode::Json {
+        return print_json(result);
+    }
+    let message = if result.operation == "down" {
+        if result.acknowledgment.outcome == Outcome::Unchanged {
+            "daemon not running; nothing to stop".into()
+        } else {
+            "environment stopped".into()
+        }
+    } else if matches!(result.readiness, Some(Readiness::Satisfied)) {
+        if result.acknowledgment.services.is_empty() {
+            "no services to wait for".into()
+        } else {
+            "all requested services are ready".into()
+        }
+    } else if result.operation == "up" {
+        let changes = result.acknowledgment.changes.as_ref();
+        let mut parts = Vec::new();
+        if matches!(result.daemon_action, Some(DaemonAction::Started)) {
+            parts.push("daemon started".to_string());
+        }
+        if let Some(changes) = changes {
+            let counts = [
+                ("added", changes.added.len()),
+                ("changed", changes.changed.len()),
+                ("removed", changes.removed.len()),
+                ("orphans", changes.orphans.len()),
+                ("renamed", changes.renamed.len()),
+                ("scaled", changes.scaled.len()),
+            ];
+            let counts = counts
+                .into_iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(kind, count)| format!("{count} {kind}"))
+                .collect::<Vec<_>>();
+            if !counts.is_empty() {
+                parts.push(format!("configuration reloaded; {}", counts.join(", ")));
+            } else if matches!(result.daemon_action, Some(DaemonAction::Reused)) {
+                parts.push("no configuration changes".into());
+            }
+        }
+        parts.push(crate::output::operation_summary(&result.acknowledgment));
+        parts.join("; ")
+    } else {
+        let summary = crate::output::operation_summary(&result.acknowledgment);
+        if let Some(signal) = &result.signal {
+            summary.replace(
+                "sent signal to",
+                &format!(
+                    "sent {} to",
+                    signal
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| signal.number.to_string())
+                ),
+            )
+        } else {
+            summary
+        }
+    };
+    crate::output::write_line(format_args!("{message}"))?;
+    Ok(())
+}
+
+async fn query_daemon(paths: &crate::model::RuntimePaths) -> Result<Daemon> {
+    match send_request(paths, Request::Ping).await? {
+        Response::Pong {
+            pid,
+            instance,
+            shutting_down,
+            ..
+        } => Ok(Daemon {
+            state: if shutting_down {
+                DaemonState::Stopping
+            } else {
+                DaemonState::Running
+            },
+            pid: Some(pid),
+            instance,
+        }),
+        Response::Error {
+            message,
+            diagnostic,
+        } => Err(Response::into_error(message, diagnostic)),
+        _ => Err(diagnostic::Diagnostic::error(
+            "ipc_unexpected_response",
+            "unexpected response to ping",
+        )
+        .into()),
     }
 }
 
-fn emit_message(mode: OutputMode, status: &str, message: &str) {
-    match mode {
-        OutputMode::Table => println!("{message}"),
-        OutputMode::Json => print_json(&json!({
-            "status": status,
-            "message": message
-        })),
+fn expect_operation(response: Response) -> Result<Acknowledgment> {
+    match response {
+        Response::Ack {
+            result: Some(result),
+            ..
+        } => Ok(*result),
+        Response::Error {
+            message,
+            diagnostic,
+        } => Err(Response::into_error(message, diagnostic)),
+        _ => Err(diagnostic::Diagnostic::error(
+            "ipc_unexpected_response",
+            "daemon did not return a structured operation result",
+        )
+        .into()),
     }
 }
 
-fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
+fn emit_session_event(mode: OutputMode, event: output_model::SessionEvent) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Record {
+        schema_version: &'static str,
+        timestamp: String,
+        #[serde(flatten)]
+        event: output_model::SessionEvent,
+    }
+    if mode == OutputMode::Json {
+        print_json(&Record {
+            schema_version: "1.0",
+            timestamp: humantime::format_rfc3339(std::time::SystemTime::now()).to_string(),
+            event,
+        })
+    } else {
+        crate::output::write_line(format_args!("{}", event.text()))?;
+        Ok(())
+    }
+}
+
+fn emit_ps(
+    mode: OutputMode,
+    daemon: output_model::Daemon,
+    processes: &[crate::model::ProcessSnapshot],
+) -> Result<()> {
+    let result = output_model::StatusResult {
+        schema_version: "1.0",
+        daemon,
+        processes,
+    };
     match mode {
         OutputMode::Json => {
-            print_json(&json!({
-                "processes": processes
-            }));
+            print_json(&result)?;
         }
         OutputMode::Table => {
+            crate::output::write_line(format_args!("{}", result.summary()))?;
+            if processes.is_empty() {
+                return Ok(());
+            }
             let color = use_color();
             let has_replicas = processes.iter().any(|p| p.replica > 1 || p.name != p.base);
 
@@ -1311,19 +1867,19 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                 .map(|p| p.name.len())
                 .max()
                 .unwrap_or(0)
-                .max("NAME".len());
+                .max("name".len());
             let w_state = state_labels
                 .iter()
                 .map(|s| s.len())
                 .max()
                 .unwrap_or(0)
-                .max("STATE".len());
+                .max("state".len());
             let w_pid = pid_vals
                 .iter()
                 .map(|v| v.len())
                 .max()
                 .unwrap_or(0)
-                .max("PID".len());
+                .max("pid".len());
 
             if has_replicas {
                 let w_base = processes
@@ -1331,11 +1887,11 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     .map(|p| p.base.len())
                     .max()
                     .unwrap_or(0)
-                    .max("BASE".len());
-                println!(
+                    .max("base".len());
+                crate::output::write_line(format_args!(
                     "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {:<w_base$}",
-                    "NAME", "STATE", "PID", "BASE",
-                );
+                    "name", "state", "pid", "base",
+                ))?;
                 for (i, p) in processes.iter().enumerate() {
                     let (glyph, label, st) =
                         unified_state(&p.state, p.has_readiness_probe, p.ready, color);
@@ -1344,20 +1900,20 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     } else {
                         format!("{glyph} {label}")
                     };
-                    println!(
+                    crate::output::write_line(format_args!(
                         "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {:<w_base$}  {}",
                         p.name,
                         styled(&cell, st),
                         pid_vals[i],
                         p.base,
                         crate::output::initialization_detail(p),
-                    );
+                    ))?;
                 }
             } else {
-                println!(
+                crate::output::write_line(format_args!(
                     "{:<w_name$}  {:<w_state$}  {:<w_pid$}",
-                    "NAME", "STATE", "PID",
-                );
+                    "name", "state", "pid",
+                ))?;
                 for (i, p) in processes.iter().enumerate() {
                     let (glyph, label, st) =
                         unified_state(&p.state, p.has_readiness_probe, p.ready, color);
@@ -1366,53 +1922,38 @@ fn emit_ps(mode: OutputMode, processes: &[crate::model::ProcessSnapshot]) {
                     } else {
                         format!("{glyph} {label}")
                     };
-                    println!(
+                    crate::output::write_line(format_args!(
                         "{:<w_name$}  {:<w_state$}  {:<w_pid$}  {}",
                         p.name,
                         styled(&cell, st),
                         pid_vals[i],
                         crate::output::initialization_detail(p),
-                    );
+                    ))?;
                 }
             }
         }
     }
+
+    Ok(())
 }
 
-fn emit_ps_empty(mode: OutputMode) {
-    match mode {
-        OutputMode::Table => println!("No processes running"),
-        OutputMode::Json => print_json(&json!({
-            "running": false,
-            "processes": []
-        })),
-    }
+fn emit_attach(mode: OutputMode) -> Result<()> {
+    emit_session_event(
+        mode,
+        output_model::SessionEvent::Attached {
+            ownership: output_model::Ownership::Viewer,
+        },
+    )
+}
+fn emit_detach(mode: OutputMode) -> Result<()> {
+    emit_session_event(
+        mode,
+        output_model::SessionEvent::Detached {
+            ownership: output_model::Ownership::Viewer,
+        },
+    )
 }
 
-fn emit_attach(mode: OutputMode) {
-    match mode {
-        OutputMode::Table => println!("attached (Ctrl-C to detach)"),
-        OutputMode::Json => print_json(&json!({
-            "status": "attached"
-        })),
-    }
-}
-
-fn emit_detach(mode: OutputMode) {
-    match mode {
-        OutputMode::Table => println!("detached"),
-        OutputMode::Json => print_json(&json!({
-            "status": "detached"
-        })),
-    }
-}
-
-/// Remove stale socket and PID files left behind by a killed daemon.
-///
-/// Called when a Ping to the existing socket failed, meaning the daemon is
-/// dead.  Cleaning up here (in addition to the daemon's own startup cleanup)
-/// avoids races where the new daemon's `remove_file` is beaten by a concurrent
-/// `up` invocation.
 fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
     let _ = std::fs::remove_file(&paths.socket);
     let _ = std::fs::remove_file(&paths.pid);
@@ -1425,98 +1966,113 @@ fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
 /// `DECOMPOSE_DAEMON_READY_TIMEOUT_MS`).
 async fn wait_for_services_ready(
     paths: &crate::model::RuntimePaths,
-    output_mode: OutputMode,
+    selected: &std::collections::HashSet<String>,
 ) -> Result<()> {
-    let poll_interval = crate::tuning::daemon_ready_poll();
-    let timeout = crate::tuning::daemon_ready_timeout();
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut waiting = String::new();
-
+    let mut signals = shutdown::Signals::new()?;
+    let deadline = tokio::time::Instant::now() + crate::tuning::daemon_ready_timeout();
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for services to become ready: {waiting}");
-        }
-
-        match send_request(paths, Request::Ps).await {
-            Ok(Response::Ps { processes, .. }) => {
-                let active: Vec<&crate::model::ProcessSnapshot> = processes
-                    .iter()
-                    .filter(|p| p.state != "disabled" && p.state != "not_started")
-                    .collect();
-
-                for p in &active {
-                    if p.state != "pending"
-                        && let Some(error) = p.initialization.failure()
-                    {
-                        emit_message(output_mode, "error", &format!("{}: {error}", p.name));
-                        bail!("{}: {error}", p.name);
-                    }
-                    if p.state == "failed" {
-                        emit_message(output_mode, "error", "services ready (some failed)");
-                        bail!("{}: {}", p.name, p.status);
-                    }
-                    if p.state == "exited"
-                        && !p.initialization.hooks.is_empty()
-                        && p.initialization.state != crate::model::InitializationState::Succeeded
-                    {
-                        bail!("{}: service exited before initialization completed", p.name);
-                    }
+        let response = send_request(paths, Request::Ps)
+            .await
+            .context("lost connection to daemon while waiting for services")?;
+        let Response::Ps {
+            pid,
+            instance,
+            processes,
+            ..
+        } = response
+        else {
+            return Err(diagnostic::Diagnostic::error(
+                "ipc_unexpected_response",
+                "unexpected response while waiting for services",
+            )
+            .into());
+        };
+        let eligible = processes.into_iter().filter(|p| {
+            selected.contains(&p.base) && p.state != "disabled" && p.state != "not_started"
+        });
+        let mut pending = Vec::new();
+        let mut failures = Vec::new();
+        for process in eligible {
+            if (process.state != "pending" && process.initialization.failure().is_some())
+                || matches!(process.state.as_str(), "failed" | "failed_to_start")
+            {
+                failures.push(process);
+            } else {
+                let initialized = process.initialization.hooks.is_empty()
+                    || process.initialization.state == crate::model::InitializationState::Succeeded;
+                let ready = if process.has_readiness_probe {
+                    process.ready
+                } else {
+                    matches!(process.state.as_str(), "running" | "exited")
+                };
+                if !initialized && process.state == "exited" {
+                    failures.push(process);
+                } else if !initialized || !ready {
+                    pending.push(process);
                 }
-                waiting = active
+            }
+        }
+        let failed = !failures.is_empty();
+        if failed || (tokio::time::Instant::now() >= deadline && !pending.is_empty()) {
+            let summary = if failed {
+                failures
                     .iter()
                     .map(|p| {
-                        let detail = crate::output::initialization_detail(p);
                         format!(
                             "{}: {}",
                             p.name,
-                            if detail.is_empty() {
-                                "waiting for initialization/readiness".into()
-                            } else {
-                                detail
-                            }
+                            p.initialization
+                                .failure()
+                                .unwrap_or_else(|| p.status.clone())
                         )
                     })
                     .collect::<Vec<_>>()
-                    .join("; ");
-                let all_ready = !active.is_empty()
-                    && active.iter().all(|p| {
-                        if p.state == "failed" {
-                            // Already failed — no point waiting.
-                            return true;
-                        }
-                        if !p.initialization.hooks.is_empty()
-                            && p.initialization.state
-                                != crate::model::InitializationState::Succeeded
-                        {
-                            return false;
-                        }
-                        if p.has_readiness_probe {
-                            p.ready
-                        } else {
-                            p.state == "running" || p.state == "exited"
-                        }
-                    });
-
-                if all_ready {
-                    let any_failed = active.iter().any(|p| p.state == "failed");
-                    if any_failed {
-                        emit_message(output_mode, "error", "services ready (some failed)");
-                        bail!("one or more services failed while waiting for readiness");
-                    } else {
-                        emit_message(output_mode, "ok", "all services are ready");
-                    }
-                    return Ok(());
-                }
-            }
-            Ok(_) => {}
-            Err(_) => {
-                // Daemon may have crashed.
-                bail!("lost connection to daemon while waiting for services");
-            }
+                    .join(", ")
+            } else {
+                format!(
+                    "timed out waiting for service readiness: {}",
+                    pending
+                        .iter()
+                        .map(|p| format!("{}: {}", p.name, crate::output::initialization_detail(p)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let mut error = diagnostic::Diagnostic::error(
+                if failed {
+                    "readiness_failed"
+                } else {
+                    "readiness_timeout"
+                },
+                summary,
+            );
+            error.context = Some(diagnostic::DiagnosticContext {
+                operation: Some("up".into()),
+                timeout_ms: Some(
+                    crate::tuning::daemon_ready_timeout()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                ),
+                ..Default::default()
+            });
+            error.details = Some(diagnostic::DiagnosticDetails::Readiness {
+                daemon: Daemon {
+                    state: DaemonState::Running,
+                    pid: Some(pid),
+                    instance,
+                },
+                pending,
+                failures,
+            });
+            return Err(error.into());
         }
-
-        sleep(poll_interval).await;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = signals.recv() => return Err(diagnostic::Diagnostic::error("interrupted", "interrupted while waiting for service readiness; environment remains running").into()),
+            _ = sleep(crate::tuning::daemon_ready_poll()) => {}
+        }
     }
 }
 
@@ -1536,7 +2092,21 @@ fn read_shutdown_receipt(paths: &crate::model::RuntimePaths, pid: u32) -> Result
         bail!("daemon exited without confirming process cleanup for pid {pid}");
     }
     if !receipt.errors.is_empty() {
-        bail!("{}", receipt.errors.join("; "));
+        let failures = if receipt.failures.is_empty() {
+            receipt
+                .errors
+                .into_iter()
+                .map(|e| diagnostic::Diagnostic::error("remote_error", e))
+                .collect()
+        } else {
+            receipt.failures
+        };
+        return Err(diagnostic::Diagnostic::failures(
+            "shutdown_failed",
+            "shutdown cleanup failed",
+            failures,
+        )
+        .into());
     }
     Ok(())
 }
@@ -1557,47 +2127,43 @@ async fn wait_for_daemon_stop(
 }
 
 fn is_no_daemon_error(err: &anyhow::Error, paths: &crate::model::RuntimePaths) -> bool {
-    if !paths.socket.exists() {
-        return true;
+    // Only concrete missing/refused transport errors can establish absence.
+    // A timeout or an unreadable PID file must never permit stale cleanup.
+    let missing = err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        });
+    if !missing {
+        return false;
     }
-    // Walk the full anyhow error chain — the root cause (e.g. "Connection
-    // refused") is typically nested inside a context like "failed to connect
-    // to /path/to/socket".
-    for cause in err.chain() {
-        let msg = cause.to_string().to_ascii_lowercase();
-        if msg.contains("connection refused")
-            || msg.contains("no such file or directory")
-            || msg.contains("not found")
-            || msg.contains("timed out")
-        {
-            return true;
-        }
+    match std::fs::read_to_string(&paths.pid) {
+        Ok(pid) => pid
+            .trim()
+            .parse::<u32>()
+            .is_ok_and(|pid| !crate::daemon::parent_alive(pid)),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
-    false
 }
 
 async fn stream_daemon_logs(
-    log_path: std::path::PathBuf,
+    log_path: PathBuf,
     mut stop_rx: watch::Receiver<bool>,
     start_at_end: bool,
-) {
+    mode: OutputMode,
+) -> Result<()> {
     let mut reader = crate::logs::Reader::default();
-    if start_at_end && let Err(error) = reader.poll(&log_path, &[], Some(0)).await {
-        eprintln!("failed to read logs: {error}");
+    if start_at_end {
+        reader.poll_records(&log_path, &[], Some(0)).await?;
     }
     loop {
-        match reader.poll(&log_path, &[], None).await {
-            Ok(lines) => {
-                for line in lines {
-                    println!("{line}");
-                }
-            }
-            Err(error) => {
-                eprintln!("failed to read logs: {error}");
-                return;
-            }
+        for record in reader.poll_records(&log_path, &[], None).await? {
+            record.write(mode, false)?;
         }
-        let _ = std::io::stdout().flush();
         if *stop_rx.borrow() {
             break;
         }
@@ -1606,6 +2172,7 @@ async fn stream_daemon_logs(
             _ = sleep(Duration::from_millis(100)) => {},
         }
     }
+    Ok(())
 }
 
 async fn stream_filtered_logs(
@@ -1613,11 +2180,15 @@ async fn stream_filtered_logs(
     mut stop_rx: watch::Receiver<bool>,
     processes: Vec<String>,
     mut reader: crate::logs::Reader,
+    mode: OutputMode,
 ) -> Result<()> {
     let mut poll_counter = 0u32;
     loop {
-        for line in reader.poll(&paths.daemon_log, &processes, None).await? {
-            println!("{line}");
+        for line in reader
+            .poll_records(&paths.daemon_log, &processes, None)
+            .await?
+        {
+            line.write(mode, processes.len() == 1)?;
         }
         let _ = std::io::stdout().flush();
         if *stop_rx.borrow() {
@@ -1714,5 +2285,53 @@ mod tests {
     fn parse_signal_empty_string_fails_clearly() {
         let err = parse_signal("").unwrap_err();
         assert!(err.to_string().contains("unknown signal"));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    struct FailingWriter(std::io::ErrorKind);
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn boundary_writes_to_injected_writers_and_handles_closed_consumers() {
+        let args = || {
+            ["decompose", "--json", "completion", "bash"]
+                .into_iter()
+                .map(Into::into)
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run_cli_from(args(), &mut stdout, &mut stderr).await, 0);
+        assert!(!stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(
+            run_cli_from(
+                args(),
+                &mut FailingWriter(std::io::ErrorKind::BrokenPipe),
+                &mut stderr
+            )
+            .await,
+            0
+        );
+        assert!(stderr.is_empty());
+        assert_eq!(
+            run_cli_from(
+                args(),
+                &mut FailingWriter(std::io::ErrorKind::PermissionDenied),
+                &mut stderr
+            )
+            .await,
+            1
+        );
+        let error: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+        assert_eq!(error["severity"], "error");
     }
 }

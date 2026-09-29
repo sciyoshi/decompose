@@ -21,6 +21,8 @@ Config files: decompose.yml, decompose.yaml, compose.yml, compose.yaml
 Docs: https://github.com/sciyoshi/decompose"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    pub output: OutputArgs,
     /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
     #[arg(long = "file", global = true)]
     pub config_files: Vec<PathBuf>,
@@ -118,7 +120,7 @@ pub struct RunArgs {
     pub service: String,
     /// Command and arguments to execute. Everything after SERVICE is treated
     /// as the command.
-    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
     pub command: Vec<String>,
 }
 
@@ -133,19 +135,19 @@ pub struct ExecArgs {
     /// Service whose environment to attach to.
     pub service: String,
     /// Command and arguments to execute.
-    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
     pub command: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct OutputOnlyArgs {
-    #[command(flatten)]
+    #[arg(skip)]
     pub output: OutputArgs,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct DownArgs {
-    #[command(flatten)]
+    #[arg(skip)]
     pub output: OutputArgs,
     /// Override shutdown timeout in seconds for all processes.
     #[arg(short = 't', long = "timeout")]
@@ -154,13 +156,13 @@ pub struct DownArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
-    #[command(flatten)]
+    #[arg(skip)]
     pub output: OutputArgs,
     /// Start and return immediately.
     #[arg(short = 'd', long = "detach")]
     pub detach: bool,
     /// Wait until all services are initialized and healthy/started (requires -d).
-    #[arg(long = "wait", requires = "detach")]
+    #[arg(long = "wait", requires = "detach", conflicts_with = "no_start")]
     pub wait: bool,
     /// Do not start dependency processes automatically.
     #[arg(long = "no-deps")]
@@ -188,7 +190,7 @@ pub struct UpArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct ServiceArgs {
-    #[command(flatten)]
+    #[arg(skip)]
     pub output: OutputArgs,
     /// Service(s) to operate on. If none, the operation applies to all services.
     pub services: Vec<String>,
@@ -211,7 +213,7 @@ pub struct LogsArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct KillArgs {
-    #[command(flatten)]
+    #[arg(skip)]
     pub output: OutputArgs,
     /// Signal to send (default: SIGKILL). Name (e.g. SIGTERM) or number (e.g. 15).
     #[arg(short = 's', long = "signal", default_value = "SIGKILL")]
@@ -236,9 +238,139 @@ pub struct DaemonArgs {
     pub processes: Vec<String>,
     #[arg(long = "no-deps")]
     pub no_deps: bool,
+    #[arg(long = "no-start")]
+    pub no_start: bool,
     /// Owner PID to watch. If it exits, stop after the configured grace
     /// period, regardless of other IPC traffic. Omitted in detached mode so the daemon
     /// survives its launching process by design.
     #[arg(long = "parent-pid")]
     pub parent_pid: Option<u32>,
+}
+
+/// Recover only decompose format flags after a failed parse. Option arity comes
+/// from Clap's command definition, so option values and child argv are never
+/// mistaken for output flags.
+pub fn diagnostic_mode(args: &[std::ffi::OsString]) -> crate::output::OutputMode {
+    scan_output(args).0
+}
+
+fn scan_output(args: &[std::ffi::OsString]) -> (crate::output::OutputMode, Option<usize>) {
+    use crate::output::OutputMode;
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    command.build();
+    let mut current = &command;
+    let mut index = 1;
+    let mut json = false;
+    let mut child_boundary = None;
+    while index < args.len() {
+        let token = args[index].to_string_lossy();
+        if token == "--" {
+            break;
+        }
+        if token == "--json" {
+            json = true;
+        }
+        if let Some(subcommand) = current.find_subcommand(token.as_ref()) {
+            current = subcommand;
+        } else if token.starts_with('-') {
+            let name = token
+                .trim_start_matches('-')
+                .split('=')
+                .next()
+                .unwrap_or_default();
+            let arg = current
+                .get_arguments()
+                .chain(command.get_arguments())
+                .find(|arg| {
+                    if token.starts_with("--") {
+                        arg.get_long() == Some(name)
+                    } else {
+                        arg.get_short() == token.chars().nth(1)
+                    }
+                });
+            if let Some(arg) = arg {
+                let takes_value = arg.get_num_args().is_some_and(|n| n.takes_values());
+                let inline = token.contains('=') || (!token.starts_with("--") && token.len() > 2);
+                if takes_value && !inline {
+                    index += 1;
+                }
+            }
+        } else if matches!(current.get_name(), "run" | "exec") {
+            // The first positional is SERVICE; all following argv is the child.
+            child_boundary = Some(index + 1);
+            break;
+        }
+        index += 1;
+    }
+    (
+        if json {
+            OutputMode::Json
+        } else {
+            OutputMode::Table
+        },
+        child_boundary,
+    )
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_bootstrap_observes_values_and_trailing_argv() {
+        for (argv, json) in [
+            (vec!["decompose", "--file", "--json", "ps"], false),
+            (vec!["decompose", "run", "api", "echo", "--json"], false),
+            (
+                vec!["decompose", "--json", "run", "api", "echo", "--table"],
+                true,
+            ),
+            (
+                vec!["decompose", "run", "--workdir", "--json", "api"],
+                false,
+            ),
+            (vec!["decompose", "--table", "ps", "--json"], true),
+            (vec!["decompose", "logs", "--tail", "--json"], false),
+        ] {
+            let args = argv.into_iter().map(Into::into).collect::<Vec<_>>();
+            assert_eq!(
+                diagnostic_mode(&args) == crate::output::OutputMode::Json,
+                json,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod child_boundary_tests {
+    use super::*;
+    #[test]
+    fn output_flags_after_service_are_child_arguments() {
+        let cli = Cli::try_parse_from(["decompose", "run", "api", "--json", "arg"]).unwrap();
+        assert!(!cli.output.json);
+        let Commands::Run(args) = cli.command else {
+            panic!("run");
+        };
+        assert_eq!(args.command, ["--json", "arg"]);
+    }
+}
+
+impl Cli {
+    /// Clap globals otherwise consume flags between SERVICE and the first
+    /// command positional. Establish the documented child boundary explicitly.
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        if let Some(boundary) = scan_output(&args).1
+            && boundary < args.len()
+            && args[boundary] != "--"
+        {
+            args.insert(boundary, "--".into());
+        }
+        <Self as clap::Parser>::try_parse_from(args)
+    }
 }

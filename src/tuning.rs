@@ -52,14 +52,18 @@ pub fn millis_from_env(name: &str, default_ms: u64) -> u64 {
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(n) if n > 0 => n,
             Ok(_) => {
-                eprintln!(
-                    "warning: {name}={raw:?} is zero or negative; using default {default_ms}ms"
+                crate::diagnostic::warning(
+                    "invalid_tuning_value",
+                    format!(" {name}={raw:?} is zero or negative; using default {default_ms}ms"),
                 );
                 default_ms
             }
             Err(_) => {
-                eprintln!(
-                    "warning: {name}={raw:?} is not a valid u64 millisecond value; using default {default_ms}ms"
+                crate::diagnostic::warning(
+                    "invalid_tuning_value",
+                    format!(
+                        " {name}={raw:?} is not a valid u64 millisecond value; using default {default_ms}ms"
+                    ),
                 );
                 default_ms
             }

@@ -241,7 +241,7 @@ impl ProcessStatus {
             ProcessStatus::Running { .. } => "running",
             ProcessStatus::Exited { code: 0 } => "exited",
             ProcessStatus::Exited { .. } => "failed",
-            ProcessStatus::FailedToStart { .. } => "failed",
+            ProcessStatus::FailedToStart { .. } => "failed_to_start",
             ProcessStatus::Stopped => "stopped",
             ProcessStatus::Restarting => "restarting",
             ProcessStatus::Disabled => "disabled",
@@ -262,6 +262,7 @@ impl ProcessStatus {
 
 #[derive(Debug, Clone)]
 pub struct ProcessRuntime {
+    pub failure: Option<crate::diagnostic::Diagnostic>,
     /// Cancels post-start work independently of signals sent to the service.
     pub hook_cancel: Option<tokio::sync::watch::Sender<bool>>,
     pub initialization: Initialization,
@@ -306,6 +307,8 @@ pub struct RuntimePaths {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::diagnostic::Diagnostic>,
     #[serde(default)]
     pub initialization: Initialization,
     #[serde(default)]
@@ -353,6 +356,13 @@ impl From<&ProcessRuntime> for ProcessSnapshot {
             _ => None,
         };
         ProcessSnapshot {
+            failure: runtime.failure.clone().or_else(|| {
+                runtime
+                    .initialization
+                    .hooks
+                    .iter()
+                    .find_map(|h| h.diagnostic.clone())
+            }),
             initialization: runtime.initialization.clone(),
             initialization_blockers: Vec::new(),
             name: runtime.spec.name.clone(),
@@ -396,6 +406,8 @@ pub enum InitializationState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<crate::diagnostic::Diagnostic>,
     pub phase: String,
     pub name: String,
     pub stage: Option<String>,

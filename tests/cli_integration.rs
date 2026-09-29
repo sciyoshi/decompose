@@ -288,7 +288,7 @@ fn cli_supports_json_and_table_modes() {
     let up = env.up_detach_json();
     let up_json: Value = serde_json::from_slice(&up.stdout).expect("up json");
     assert_eq!(
-        up_json.get("status").and_then(Value::as_str),
+        up_json.get("daemon_action").and_then(Value::as_str),
         Some("started")
     );
 
@@ -298,16 +298,19 @@ fn cli_supports_json_and_table_modes() {
     let ps_table = env.run(&["ps", "--table"]);
     assert_success(&ps_table, "ps --table");
     let ps_table_text = String::from_utf8_lossy(&ps_table.stdout);
-    assert!(ps_table_text.contains("NAME"));
+    assert!(ps_table_text.contains("name"));
     assert!(ps_table_text.contains("sleeper"));
 
     let down = env.down_json();
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
-    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        down_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 }
 
 #[test]
-fn default_output_mode_uses_ci_or_llm_table_else_json() {
+fn default_output_mode_is_text_with_or_without_ci_and_llm() {
     let (_root, project, runtime, state, config) = setup_project();
     let home = project.parent().expect("parent").join("home");
     let cfg = config.to_string_lossy().to_string();
@@ -334,7 +337,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
     );
     assert_success(&ps_default_table, "default table ps");
     let table_text = String::from_utf8_lossy(&ps_default_table.stdout);
-    assert!(table_text.contains("NAME"));
+    assert!(table_text.contains("name"));
 
     let ps_default_json = run_cmd(
         &project,
@@ -346,9 +349,7 @@ fn default_output_mode_uses_ci_or_llm_table_else_json() {
         &["CI", "LLM"],
     );
     assert_success(&ps_default_json, "default json ps");
-    let parsed: Value =
-        serde_json::from_slice(&ps_default_json.stdout).expect("default json output");
-    assert!(parsed.get("processes").and_then(Value::as_array).is_some());
+    assert!(String::from_utf8_lossy(&ps_default_json.stdout).contains("daemon running"));
 
     let down = run_cmd(
         &project,
@@ -456,7 +457,10 @@ processes:
     );
     assert_success(&stop, "stop alpha");
     let stop_json: Value = serde_json::from_slice(&stop.stdout).expect("stop json");
-    assert_eq!(stop_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        stop_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 
     // Top-level stop with no args stops all remaining services.
     let stop_all = run_cmd(
@@ -506,7 +510,7 @@ fn down_when_not_running_exits_zero() {
     let down = env.run(&["down", "--json"]);
     assert_success(&down, "down when nothing is running");
     let parsed: Value = serde_json::from_slice(&down.stdout).expect("down json");
-    assert_eq!(parsed.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(parsed["outcome"], "unchanged");
 }
 
 #[test]
@@ -514,7 +518,7 @@ fn ps_when_not_running_is_empty_not_error() {
     let env = TestEnv::new();
 
     let parsed = env.ps_json_value();
-    assert_eq!(parsed.get("running").and_then(Value::as_bool), Some(false));
+    assert_eq!(parsed["daemon"]["state"], "not_running");
     assert_eq!(
         parsed
             .get("processes")
@@ -526,7 +530,7 @@ fn ps_when_not_running_is_empty_not_error() {
     let ps_table = env.run(&["ps", "--table"]);
     assert_success(&ps_table, "ps --table when not running");
     let table = String::from_utf8_lossy(&ps_table.stdout);
-    assert!(table.contains("No processes running"));
+    assert!(table.contains("daemon not running"));
 }
 
 #[test]
@@ -752,7 +756,10 @@ processes:
     );
     assert_success(&kill, "kill sleeper");
     let kill_json: Value = serde_json::from_slice(&kill.stdout).expect("kill json");
-    assert_eq!(kill_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        kill_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 
     thread::sleep(Duration::from_millis(500));
 
@@ -827,7 +834,7 @@ fn ls_lists_running_environments() {
         .expect("environments array");
     assert!(!envs.is_empty(), "should have at least one environment");
     assert_eq!(
-        envs[0].get("status").and_then(Value::as_str),
+        envs[0]["daemon"].get("state").and_then(Value::as_str),
         Some("running")
     );
 
@@ -842,7 +849,7 @@ fn ls_lists_running_environments() {
     );
     assert_success(&ls_table, "ls --table");
     let table_text = String::from_utf8_lossy(&ls_table.stdout);
-    assert!(table_text.contains("NAME"));
+    assert!(table_text.contains("instance"));
     assert!(table_text.contains("running"));
 
     let down = run_cmd(
@@ -1073,7 +1080,10 @@ fn down_with_timeout_flag() {
     );
     assert_success(&down, "down --timeout 1");
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
-    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        down_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 }
 
 #[test]
@@ -1419,11 +1429,10 @@ processes:
     env.up_started = true;
     assert!(!up.status.success(), "up -d --wait should fail");
 
-    let stdout = String::from_utf8_lossy(&up.stdout);
-    assert!(
-        stdout.contains(r#""status":"error""#) && stdout.contains("services ready (some failed)"),
-        "stdout should include JSON error status, got: {stdout}"
-    );
+    assert!(up.stdout.is_empty());
+    let diagnostic: Value = serde_json::from_slice(&up.stderr).expect("one diagnostic");
+    assert_eq!(diagnostic["code"], "readiness_failed");
+    assert_eq!(diagnostic["details"]["daemon"]["state"], "running");
 
     env.down_json();
 }
@@ -1460,7 +1469,10 @@ processes:
 
     let down = env.down_json();
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
-    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        down_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 }
 
 #[test]
@@ -1489,7 +1501,10 @@ processes:
     assert_success(&down, "down after timeout escalation to SIGKILL");
     env.up_started = false;
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
-    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        down_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 
     // The process ignores SIGTERM so must wait for the 1-second timeout
     // before SIGKILL. Verify it didn't take longer than 10 seconds (generous
@@ -1526,7 +1541,10 @@ processes:
     let elapsed = start.elapsed();
 
     let down_json: Value = serde_json::from_slice(&down.stdout).expect("down json");
-    assert_eq!(down_json.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        down_json.get("outcome").and_then(Value::as_str),
+        Some("completed")
+    );
 
     // With the custom signal (SIGINT) handled, the process should exit promptly
     // without needing the 5-second timeout escalation to SIGKILL.
@@ -1702,8 +1720,8 @@ processes:
     assert_success(&ps_default, "ps default session");
     let ps_def_json: Value = serde_json::from_slice(&ps_default.stdout).expect("ps default json");
     assert_eq!(
-        ps_def_json.get("running").and_then(Value::as_bool),
-        Some(false),
+        ps_def_json["daemon"].get("state").and_then(Value::as_str),
+        Some("not_running"),
         "default session should not be running when only named session is up"
     );
     let procs_def = ps_def_json
@@ -1937,14 +1955,17 @@ fn up_json_structure_has_status_and_pid() {
 
     // Must have "status" string field.
     let status = parsed
-        .get("status")
+        .get("daemon_action")
         .and_then(Value::as_str)
         .expect("up response must have string 'status'");
     assert_eq!(status, "started");
 
     // Must have "pid" numeric field.
     assert!(
-        parsed.get("pid").and_then(Value::as_u64).is_some(),
+        parsed["daemon"]
+            .get("pid")
+            .and_then(Value::as_u64)
+            .is_some(),
         "up response must have numeric 'pid', got: {parsed}"
     );
 
@@ -1992,10 +2013,10 @@ fn down_json_structure_has_status_ok() {
 
     // Must have "status" string field with value "ok".
     let status = parsed
-        .get("status")
+        .get("outcome")
         .and_then(Value::as_str)
         .expect("down response must have string 'status'");
-    assert_eq!(status, "ok");
+    assert_eq!(status, "completed");
 }
 
 #[test]
@@ -2016,12 +2037,8 @@ fn ps_empty_json_structure_has_running_false_and_empty_processes() {
     assert_success(&ps, "ps --json when not running");
     let parsed: Value = serde_json::from_slice(&ps.stdout).expect("ps json parse");
 
-    // Must have "running" boolean field set to false.
-    let running = parsed
-        .get("running")
-        .and_then(Value::as_bool)
-        .expect("empty ps response must have bool 'running'");
-    assert!(!running, "running should be false when no daemon");
+    assert_eq!(parsed["daemon"]["state"], "not_running");
+    assert!(parsed["daemon"]["pid"].is_null());
 
     // Must have "processes" array that is empty.
     let processes = parsed
@@ -2179,8 +2196,8 @@ processes:
     assert_success(&start, "start beta");
     let start_json: Value = serde_json::from_slice(&start.stdout).expect("start json");
     assert_eq!(
-        start_json.get("status").and_then(Value::as_str),
-        Some("ok"),
+        start_json.get("outcome").and_then(Value::as_str),
+        Some("accepted"),
         "start should ack"
     );
     thread::sleep(Duration::from_millis(500));
@@ -4907,8 +4924,8 @@ processes:
     };
     let a_json = parse_last_json(&out_a.stdout, "a json");
     let b_json = parse_last_json(&out_b.stdout, "b json");
-    let pid_a = a_json.get("pid").and_then(Value::as_u64);
-    let pid_b = b_json.get("pid").and_then(Value::as_u64);
+    let pid_a = a_json["daemon"].get("pid").and_then(Value::as_u64);
+    let pid_b = b_json["daemon"].get("pid").and_then(Value::as_u64);
     assert!(pid_a.is_some(), "a must report a daemon pid");
     assert_eq!(pid_a, pid_b, "both invocations must see the same daemon");
 
@@ -5632,10 +5649,7 @@ fn is_daemon_live_ipc(
         Ok(v) => v,
         Err(_) => return false,
     };
-    match parsed.get("running") {
-        Some(Value::Bool(b)) => *b,
-        _ => parsed.get("processes").is_some(),
-    }
+    parsed["daemon"]["state"] == "running"
 }
 
 /// Observe daemon liveness using its PID file and native process state,
@@ -6771,7 +6785,9 @@ processes:
         }
         let logs = run(&["logs", "--no-pager", "beta"]);
         assert_success(&logs, "beta logs");
-        assert_eq!(String::from_utf8_lossy(&logs.stdout), "BETA_ONLY\n");
+        let text = String::from_utf8_lossy(&logs.stdout);
+        assert!(text.lines().any(|line| line == "BETA_ONLY"));
+        assert!(!text.contains("END_LONG"));
     });
     assert_success(&run(&["down"]), "down drains final output");
     if let Err(panic) = checks {
@@ -6929,7 +6945,9 @@ processes:
 "#,
     );
     env.up_detach_json();
-    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "db")["state"] == "failed");
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "db")["state"] == "failed_to_start"
+    });
     let db = hook_service(&ps, "db");
     assert!(db["pid"].is_null());
     assert_eq!(db["restart_count"], 0);
@@ -7179,7 +7197,9 @@ processes:
     );
     env.up_detach_json();
     let started = std::time::Instant::now();
-    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "svc")["state"] == "failed");
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["state"] == "failed_to_start"
+    });
     assert!(started.elapsed() < Duration::from_secs(9));
     assert_eq!(
         hook_service(&ps, "svc")["initialization"]["hooks"][0]["stage"],
@@ -7212,7 +7232,9 @@ processes:
 "#,
     );
     env.up_detach_json();
-    let ps = wait_hook_snapshot(&env, |ps| hook_service(ps, "svc")["state"] == "failed");
+    let ps = wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["state"] == "failed_to_start"
+    });
     assert_eq!(
         hook_service(&ps, "svc")["initialization"]["hooks"][0]["stage"],
         "verifying"
@@ -7773,7 +7795,9 @@ processes:
 "#,
     );
     env.up_detach_json();
-    wait_hook_snapshot(&env, |ps| hook_service(ps, "svc")["state"] == "failed");
+    wait_hook_snapshot(&env, |ps| {
+        hook_service(ps, "svc")["state"] == "failed_to_start"
+    });
     fs::write(env.project.join("fixed"), "").unwrap();
     assert_success(
         &env.run(&["up", "-d", "--wait"]),
@@ -7876,11 +7900,11 @@ processes:
     let second = serde_json::Deserializer::from_slice(&output.stdout)
         .into_iter::<Value>()
         .map(Result::unwrap)
-        .find(|record| record.get("pid").is_some())
+        .find(|record| record.get("daemon").is_some())
         .expect("up status record");
-    assert!(first["pid"].is_u64());
+    assert!(first["daemon"]["pid"].is_u64());
     assert_eq!(
-        first["pid"], second["pid"],
+        first["daemon"]["pid"], second["daemon"]["pid"],
         "same daemon handles include edits"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -7991,4 +8015,105 @@ processes:
     );
     assert!(env.project.join("local-marker").exists());
     env.down_json();
+}
+
+#[test]
+fn output_flags_are_global_and_parse_errors_respect_child_boundaries() {
+    let env = TestEnv::new();
+    for args in [vec!["--json", "ps"], vec!["ps", "--json"]] {
+        let output = env.run(&args);
+        assert_success(&output, "global json");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["schema_version"], "1.0");
+        assert_eq!(result["daemon"]["state"], "not_running");
+    }
+    for args in [
+        vec!["ps", "--json", "--table"],
+        vec!["--json", "up", "-d", "--wait", "--no-start"],
+        vec!["tui", "--json"],
+        vec!["--json", "up", "--tui"],
+    ] {
+        let output = env.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["code"], "invalid_arguments");
+    }
+    for args in [
+        vec!["--session=--json", "bad-command"],
+        vec!["run", "missing", "echo", "--json"],
+    ] {
+        let output = env.run(&args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).starts_with("error:"));
+    }
+    let help = env.run(&["--json", "--help"]);
+    assert_success(&help, "help");
+    assert!(help.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
+    let child = env.run(&["--json", "run", "sleeper", "printf", "%s", "--json"]);
+    assert_success(&child, "child passthrough");
+    assert_eq!(child.stdout, b"--json");
+}
+
+#[test]
+fn fresh_no_start_and_empty_wait_have_truthful_results() {
+    let mut env = TestEnv::new();
+    let up = env.run(&["up", "-d", "--no-start", "--json"]);
+    assert_success(&up, "fresh no-start");
+    env.up_started = true;
+    let result: Value = serde_json::from_slice(&up.stdout).unwrap();
+    assert_eq!(result["services"][0]["outcome"], "registered");
+    assert_eq!(env.ps_json_value()["processes"][0]["state"], "not_started");
+    let text = env.run(&["ps"]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("daemon running; no processes started"));
+    env.down_json();
+    env.with_config("processes:\n  disabled:\n    command: sleep 300\n    disabled: true\n");
+    let up = env.run(&["up", "-d", "--wait", "--json"]);
+    assert_success(&up, "empty eligible wait");
+    env.up_started = true;
+    let result: Value = serde_json::from_slice(&up.stdout).unwrap();
+    assert_eq!(result["services"], serde_json::json!([]));
+    assert_eq!(result["readiness"], "satisfied");
+    env.down_json();
+}
+
+#[test]
+fn json_logs_preserve_streams_and_validation_warnings_are_diagnostics() {
+    let mut env = TestEnv::new();
+    env.with_config("processes:\n  source:\n    command: \"printf 'Mixed Case\\\\n'; printf 'Error Data\\\\n' >&2\"\n");
+    let up = env.run(&["up", "-d", "--wait", "--json"]);
+    assert_success(&up, "one-shot logs");
+    env.up_started = true;
+    let output = env.run(&["logs", "--json"]);
+    assert_success(&output, "json logs");
+    let records: Vec<Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|r| r["type"] == "log" && r["stream"] == "stdout" && r["message"] == "Mixed Case")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["type"] == "log" && r["stream"] == "stderr" && r["message"] == "Error Data")
+    );
+    assert!(records.iter().all(|r| r["schema_version"] == "1.0"));
+    assert!(output.stderr.is_empty());
+    let empty = env.run(&["logs", "--json", "nonexistent"]);
+    assert_success(&empty, "empty logs");
+    assert!(empty.stdout.is_empty());
+    assert!(empty.stderr.is_empty());
+    env.down_json();
+
+    env.with_config("processes:\n  test:\n    command: sleep 300\n    readiness_probe:\n      exec: {command: 'true'}\n      period_seconds: 1\n      timeout_seconds: 1\n");
+    let output = env.run(&["config", "--json"]);
+    assert_success(&output, "warning with result");
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warning: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(warning["severity"], "warning");
+    assert_eq!(warning["code"], "probe_timing_no_slack");
 }

@@ -29,6 +29,7 @@ pub(crate) async fn begin(state: &SharedState, handle: &NameHandle, spec: &Proce
             .into_iter()
             .flat_map(|(phase, hooks)| {
                 hooks.iter().map(move |h| HookRecord {
+                    diagnostic: None,
                     phase: phase.into(),
                     name: h.name.clone(),
                     stage: None,
@@ -145,7 +146,7 @@ impl Step<'_> {
         .await;
         self.check()
     }
-    async fn log(&self, stage: &str, message: &str) {
+    async fn log(&self, stage: &str, message: &str, event: crate::output_model::Lifecycle) {
         let logs = self.state.lock().await.logs.clone();
         if let Ok(writer) = logs.writer(&self.spec.base_name, self.spec.replica) {
             let name = crate::model::read_name(self.handle);
@@ -156,12 +157,11 @@ impl Step<'_> {
             );
             let message = message.to_owned();
             let _ = tokio::task::spawn_blocking(move || {
-                writer.lock().unwrap().write_hook(
+                writer.lock().unwrap().write_event(
                     &name,
-                    "event",
                     &message,
-                    false,
-                    (&metadata.0, &metadata.1, &metadata.2),
+                    Some((&metadata.0, &metadata.1, &metadata.2)),
+                    event,
                 )
             })
             .await;
@@ -400,7 +400,12 @@ pub(crate) async fn run_phase(
             h.started_at = Some(now());
         })
         .await;
-        step.log("checking", "hook started").await;
+        step.log(
+            "checking",
+            "hook started",
+            crate::output_model::Lifecycle::HookStarted,
+        )
+        .await;
         let result = step.run().await;
         let message = match &result {
             Ok(true) => "hook skipped: already_satisfied".into(),
@@ -426,6 +431,19 @@ pub(crate) async fn run_phase(
                     h.status = if e.cancelled { "cancelled" } else { "failed" }.into();
                     h.exit_code = e.code;
                     h.error = (!e.cancelled).then(|| e.message.clone());
+                    h.diagnostic = (!e.cancelled).then(|| {
+                        let mut diagnostic =
+                            crate::diagnostic::Diagnostic::error("hook_failed", e.message.clone());
+                        diagnostic.context = Some(crate::diagnostic::DiagnosticContext {
+                            service: Some(spec.base_name.clone()),
+                            process: Some(spec.name.clone()),
+                            hook_phase: Some(phase.into()),
+                            hook_name: Some(hook.name.clone()),
+                            hook_stage: h.stage.clone(),
+                            ..Default::default()
+                        });
+                        diagnostic
+                    });
                     h.reason = e.cancelled.then(|| "cancelled".into());
                     i.state = if e.cancelled {
                         InitializationState::Cancelled
@@ -463,7 +481,13 @@ pub(crate) async fn run_phase(
         if result.as_ref().is_err_and(|e| !e.cancelled) {
             crate::daemon::initialization_failed(state).await;
         }
-        step.log(&stage, &message).await;
+        let event = match &result {
+            Ok(true) => crate::output_model::Lifecycle::HookSkipped,
+            Ok(false) => crate::output_model::Lifecycle::HookSucceeded,
+            Err(e) if e.cancelled => crate::output_model::Lifecycle::HookCancelled,
+            Err(_) => crate::output_model::Lifecycle::HookFailed,
+        };
+        step.log(&stage, &message, event).await;
         if result.is_err() {
             return false;
         }

@@ -39,8 +39,11 @@ decompose ls
 Global flags (`--file`, `--session`, `-e/--env-file`, `--disable-dotenv`)
 appear before the subcommand, matching `docker compose -f FILE <cmd>` shape.
 
-Output modes: `--json`, `--table`, or auto-detect (TTY/CI/LLM -> table,
-otherwise JSON).
+Output modes: global `--json` or `--table`; text is always the default.
+Finite JSON results use schema 1.0; streams use JSON Lines. Diagnostics go to
+stderr through `diagnostic.rs`. `output_model.rs` owns public result types;
+IPC acknowledgments retain typed outcomes and legacy messages. See
+`docs/cli-output.md` for the migration and native-output exceptions.
 
 ## Configuration
 

@@ -13,6 +13,8 @@ use crate::model::ProcessInstanceSpec;
 pub(crate) struct Receipt {
     pub pid: u32,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<crate::diagnostic::Diagnostic>,
 }
 
 pub(crate) struct Signals {

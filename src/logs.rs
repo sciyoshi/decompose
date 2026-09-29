@@ -66,6 +66,8 @@ impl Identity {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<crate::output_model::Lifecycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_name: Option<String>,
@@ -74,6 +76,7 @@ pub(crate) struct Record {
     pub timestamp: String,
     pub service: String,
     pub replica: u16,
+    #[serde(rename = "process", alias = "name")]
     pub name: String,
     pub stream: String,
     pub message: String,
@@ -203,7 +206,17 @@ impl Writer {
         metadata: (&str, &str, &str),
     ) -> io::Result<()> {
         // Readers already use bounded chunks, like service output.
-        self.write_record_with_hook(name, stream, message, partial, Some(metadata))
+        self.write_record_with_hook(name, stream, message, partial, Some(metadata), None)
+    }
+
+    pub fn write_event(
+        &mut self,
+        name: &str,
+        message: &str,
+        metadata: Option<(&str, &str, &str)>,
+        event: crate::output_model::Lifecycle,
+    ) -> io::Result<()> {
+        self.write_record_with_hook(name, "event", message, false, metadata, Some(event))
     }
 
     fn write_record(
@@ -213,8 +226,9 @@ impl Writer {
         message: &str,
         partial: bool,
     ) -> io::Result<()> {
-        self.write_record_with_hook(name, stream, message, partial, None)
+        self.write_record_with_hook(name, stream, message, partial, None, None)
     }
+    #[allow(clippy::too_many_arguments)] // Storage combines attribution with either a log or lifecycle payload.
     fn write_record_with_hook(
         &mut self,
         name: &str,
@@ -222,11 +236,13 @@ impl Writer {
         message: &str,
         partial: bool,
         metadata: Option<(&str, &str, &str)>,
+        event: Option<crate::output_model::Lifecycle>,
     ) -> io::Result<()> {
         // Clamp clock corrections per replica to preserve its observed order.
         let time = SystemTime::now().max(self.last_time);
         self.last_time = time;
         let record = Record {
+            event,
             hook_phase: metadata.map(|m| m.0.into()),
             hook_name: metadata.map(|m| m.1.into()),
             hook_stage: metadata.map(|m| m.2.into()),
@@ -340,6 +356,85 @@ impl<R: AsyncBufRead + Unpin> Chunks<R> {
     }
 }
 
+/// Stored application data, preserved until the consumer selects a renderer.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum LogEntry {
+    Log(Box<Record>),
+    DaemonLog {
+        timestamp: Option<String>,
+        message: String,
+    },
+    Diagnostic {
+        timestamp: Option<String>,
+        diagnostic: Box<crate::diagnostic::Diagnostic>,
+    },
+}
+
+impl LogEntry {
+    pub fn render(&self, strip: bool) -> String {
+        match self {
+            Self::Log(record) => record.render(strip),
+            Self::DaemonLog { message, .. } => message.clone(),
+            Self::Diagnostic { diagnostic, .. } => {
+                format!("{}: {}", diagnostic.severity, diagnostic.summary)
+            }
+        }
+    }
+
+    pub fn write(&self, mode: crate::output::OutputMode, strip: bool) -> anyhow::Result<()> {
+        let encoded = if mode == crate::output::OutputMode::Json {
+            if let Self::Log(record) = self
+                && let Some(event) = &record.event
+            {
+                #[derive(Serialize)]
+                struct LifecycleRecord<'a> {
+                    schema_version: &'static str,
+                    #[serde(flatten)]
+                    event: &'a crate::output_model::Lifecycle,
+                    timestamp: &'a str,
+                    service: &'a str,
+                    process: &'a str,
+                    replica: u16,
+                    message: &'a str,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    hook_phase: &'a Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    hook_name: &'a Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    hook_stage: &'a Option<String>,
+                }
+                return crate::output::print_json(&LifecycleRecord {
+                    schema_version: "1.0",
+                    event,
+                    timestamp: &record.timestamp,
+                    service: &record.service,
+                    process: &record.name,
+                    replica: record.replica,
+                    message: &record.message,
+                    hook_phase: &record.hook_phase,
+                    hook_name: &record.hook_name,
+                    hook_stage: &record.hook_stage,
+                });
+            }
+            #[derive(Serialize)]
+            struct Event<'a> {
+                schema_version: &'static str,
+                #[serde(flatten)]
+                record: &'a LogEntry,
+            }
+            serde_json::to_string(&Event {
+                schema_version: "1.0",
+                record: self,
+            })?
+        } else {
+            self.render(strip)
+        };
+        crate::output::write_line(format_args!("{encoded}"))?;
+        Ok(())
+    }
+}
+
 /// Byte offsets belong to immutable generation filenames, so rotating a file
 /// cannot cause duplicates or confuse a follower. Incomplete records are retried.
 #[derive(Default)]
@@ -350,18 +445,46 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
-    /// Keep disk reads and JSON decoding off the async UI/IPC executor.
     pub async fn poll(
         &mut self,
         path: &Path,
         filters: &[String],
         tail: Option<usize>,
     ) -> io::Result<Vec<String>> {
+        Ok(self
+            .poll_records(path, filters, tail)
+            .await?
+            .iter()
+            .map(|r| r.render(filters.len() == 1))
+            .collect())
+    }
+
+    #[cfg(test)]
+    pub fn read(
+        &mut self,
+        path: &Path,
+        filters: &[String],
+        tail: Option<usize>,
+    ) -> io::Result<Vec<String>> {
+        Ok(self
+            .read_records(path, filters, tail)?
+            .iter()
+            .map(|r| r.render(filters.len() == 1))
+            .collect())
+    }
+
+    /// Keep disk reads and JSON decoding off the async UI/IPC executor.
+    pub async fn poll_records(
+        &mut self,
+        path: &Path,
+        filters: &[String],
+        tail: Option<usize>,
+    ) -> io::Result<Vec<LogEntry>> {
         let mut reader = std::mem::take(self);
         let path = path.to_owned();
         let filters = filters.to_vec();
         let (reader, result) = tokio::task::spawn_blocking(move || {
-            let result = reader.read(&path, &filters, tail);
+            let result = reader.read_records(&path, &filters, tail);
             (reader, result)
         })
         .await
@@ -370,12 +493,12 @@ impl Reader {
         result
     }
 
-    pub fn read(
+    pub fn read_records(
         &mut self,
         daemon_log: &Path,
         filters: &[String],
         tail: Option<usize>,
-    ) -> io::Result<Vec<String>> {
+    ) -> io::Result<Vec<LogEntry>> {
         let root = directory(daemon_log);
         let session = match fs::read_to_string(root.join("session")) {
             Ok(s) => s,
@@ -471,7 +594,7 @@ impl Reader {
                 tie += 1;
                 records.insert(
                     (record.timestamp.clone(), tie),
-                    record.render(filters.len() == 1),
+                    LogEntry::Log(Box::new(record)),
                 );
                 if let Some(limit) = tail
                     && records.len() > limit
@@ -480,7 +603,18 @@ impl Reader {
                 }
             }
         }
-        Ok(records.into_values().collect())
+        let mut output = if filters.is_empty() {
+            self.legacy(daemon_log, filters, tail)?
+        } else {
+            Vec::new()
+        };
+        output.extend(records.into_values());
+        if let Some(limit) = tail
+            && output.len() > limit
+        {
+            output.drain(..output.len() - limit);
+        }
+        Ok(output)
     }
 
     fn legacy(
@@ -488,7 +622,7 @@ impl Reader {
         path: &Path,
         filters: &[String],
         tail: Option<usize>,
-    ) -> io::Result<Vec<String>> {
+    ) -> io::Result<Vec<LogEntry>> {
         let mut file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -516,7 +650,18 @@ impl Reader {
             self.legacy_offset += count as u64;
             let text = String::from_utf8_lossy(&bytes);
             for line in crate::filter_log_lines(&[text.trim_end_matches(['\r', '\n'])], filters) {
-                output.push_back(line.to_owned());
+                output.push_back(
+                    match serde_json::from_str::<crate::diagnostic::Diagnostic>(line) {
+                        Ok(diagnostic) => LogEntry::Diagnostic {
+                            timestamp: None,
+                            diagnostic: Box::new(diagnostic),
+                        },
+                        Err(_) => LogEntry::DaemonLog {
+                            timestamp: None,
+                            message: line.to_owned(),
+                        },
+                    },
+                );
                 if let Some(limit) = tail
                     && output.len() > limit
                 {

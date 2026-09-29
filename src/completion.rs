@@ -10,8 +10,6 @@
 //! (`--file`, `-e`/`--env-file`, `--session`, `--disable-dotenv`) so dynamic
 //! completion works in multi-project / multi-session setups.
 
-use std::io;
-
 use anyhow::{Context, Result};
 use clap::CommandFactory;
 use clap_complete::{Shell, generate};
@@ -43,10 +41,7 @@ pub fn run_completion(shell: CompletionShell) -> Result<()> {
         CompletionShell::PowerShell => inject_powershell_dynamic(&script),
         CompletionShell::Elvish => script,
     };
-    use io::Write as _;
-    let stdout = io::stdout();
-    let mut lock = stdout.lock();
-    lock.write_all(final_script.as_bytes())
+    crate::output::write_bytes(final_script.as_bytes())
         .context("failed to write completion script")?;
     Ok(())
 }
@@ -190,10 +185,10 @@ __decompose_sessions() {
     local names raw
     raw=$(decompose ls --json 2>/dev/null) || return 0
     if command -v jq >/dev/null 2>&1; then
-        names=$(printf '%s' "$raw" | jq -r '.environments[]?.name' 2>/dev/null)
+        names=$(printf '%s' "$raw" | jq -r '.environments[]?.instance' 2>/dev/null)
     else
         names=$(printf '%s' "$raw" \
-            | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            | tr '{' '\n' | sed -n 's/.*"instance"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sort -u)
     fi
     COMPREPLY=( $(compgen -W "${names}" -- "${cur}") )
 }
@@ -310,9 +305,9 @@ __decompose_sessions() {
     local raw
     raw=$(decompose ls --json 2>/dev/null) || return 0
     if (( $+commands[jq] )); then
-        names=(${(f)"$(print -r -- "$raw" | jq -r '.environments[]?.name' 2>/dev/null)"})
+        names=(${(f)"$(print -r -- "$raw" | jq -r '.environments[]?.instance' 2>/dev/null)"})
     else
-        names=(${(f)"$(print -r -- "$raw" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"})
+        names=(${(f)"$(print -r -- "$raw" | tr '{' '\n' | sed -n 's/.*"instance"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sort -u)"})
     fi
     if (( ${#names} )); then
         _values 'session' "${names[@]}"
@@ -409,9 +404,9 @@ function __decompose_sessions
         return 0
     end
     if type -q jq
-        printf '%s' $raw | jq -r '.environments[]?.name' 2>/dev/null
+        printf '%s' $raw | jq -r '.environments[]?.instance' 2>/dev/null
     else
-        printf '%s' $raw | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+        printf '%s' $raw | tr '{' '\n' | sed -n 's/.*"instance"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sort -u
     end
 end
 
@@ -474,7 +469,7 @@ function __DecomposeSessions {
         if (-not $raw) { return @() }
         $data = $raw | ConvertFrom-Json -ErrorAction Stop
         if ($null -ne $data.environments) {
-            return @($data.environments | ForEach-Object { $_.name })
+            return @($data.environments | ForEach-Object { $_.instance })
         }
     } catch { }
     return @()
@@ -599,5 +594,72 @@ mod tests {
         assert!(s.contains("__DecomposeCollectGlobals"));
         assert!(s.contains("__DecomposeSessions"));
         assert!(s.contains("Register-ArgumentCompleter"));
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    #[test]
+    fn installed_shells_extract_all_sessions_with_and_without_jq() {
+        let fixture = r#"{"schema_version":"1.0","environments":[{"instance":"alpha","daemon":{"instance":"alpha","state":"running","pid":1}},{"instance":"beta","daemon":{"instance":"beta","state":"running","pid":2}}]}"#;
+        for (shell, snippet, setup, invoke) in [
+            (
+                "bash",
+                BASH_DYNAMIC_SNIPPET,
+                "",
+                "cur=''; __decompose_sessions; printf '%s\\n' \"${COMPREPLY[@]}\"",
+            ),
+            (
+                "zsh",
+                ZSH_DYNAMIC_SNIPPET,
+                "compdef() { :; }; _values() { shift; printf '%s\\n' \"$@\"; };",
+                "__decompose_sessions",
+            ),
+        ] {
+            let shell_path = if shell == "bash" && std::path::Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                shell
+            };
+            let Ok(executable) = which::which(shell_path) else {
+                continue;
+            };
+            for fallback in [false, true] {
+                let tools = tempfile::tempdir().unwrap();
+                #[cfg(unix)]
+                for utility in ["tr", "sed", "sort"] {
+                    std::os::unix::fs::symlink(
+                        which::which(utility).unwrap(),
+                        tools.path().join(utility),
+                    )
+                    .unwrap();
+                }
+                let script = format!(
+                    "{setup}\ndecompose() {{ printf '%s\\n' \"$DECOMPOSE_TEST_ENVIRONMENTS\"; }}\n{snippet}\n{invoke}"
+                );
+                let mut command = std::process::Command::new(&executable);
+                command
+                    .args(["-c", &script])
+                    .env("DECOMPOSE_TEST_ENVIRONMENTS", fixture);
+                if fallback {
+                    command.env("PATH", tools.path());
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .collect::<Vec<_>>(),
+                    ["alpha", "beta"],
+                    "{shell}, fallback={fallback}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 }

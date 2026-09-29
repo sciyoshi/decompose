@@ -52,7 +52,7 @@ impl Env {
     fn up(&mut self) {
         let out = self.run(&["up", "-d", "--json"]);
         self.daemon = Some(
-            serde_json::from_slice::<Value>(&out.stdout).unwrap()["pid"]
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()["daemon"]["pid"]
                 .as_u64()
                 .unwrap() as u32,
         );
@@ -474,7 +474,7 @@ fn shutdown_needs_no_process_utilities_on_path() {
         String::from_utf8_lossy(&out.stderr)
     );
     env.daemon = Some(
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()["pid"]
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["daemon"]["pid"]
             .as_u64()
             .unwrap() as u32,
     );

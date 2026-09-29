@@ -341,7 +341,7 @@ decompose ps --json
 decompose ps --table
 
 # Pipe JSON into jq
-decompose ps --json | jq '.[] | select(.status == "running")'
+decompose ps --json | jq '.processes[] | select(.state == "running")'
 ```
 
 ### Session isolation
@@ -381,12 +381,15 @@ decompose --disable-dotenv up -d
 
 ## Output modes
 
-- `--json`: machine-readable
-- `--table`: human-friendly
-- default:
-  - `table` when stdout is a TTY
-  - `table` when `LLM=true` or `CI=true`
-  - otherwise `json`
+Text is the default, including in pipes and CI. Global `--json` selects
+structured results and diagnostics; `--table` explicitly selects text.
+Finite commands emit one result on stdout, while logs and attached sessions
+emit JSON Lines. Command failures go to stderr once. `run`/`exec` child streams,
+help/version, and completion scripts retain their native output.
+
+This changes the previous implicit piped JSON and result shapes. See
+[CLI output and migration](docs/cli-output.md) for schemas, exceptions, and
+updated scripting examples.
 
 ## Runtime model
 

@@ -1,3 +1,6 @@
+use crate::output_model::{
+    Acknowledgment, Changes, Outcome, Rename, Scale, ServiceOutcome, ServiceResult,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -151,7 +154,7 @@ pub(crate) struct DaemonState {
     /// Persistent stop intent, retained until an explicit start or recreate.
     stopping: BTreeSet<String>,
     stop_versions: BTreeMap<String, u64>,
-    stop_errors: BTreeMap<String, String>,
+    stop_errors: BTreeMap<String, crate::diagnostic::Diagnostic>,
     pub(crate) force_shutdown: Arc<AtomicBool>,
     pub(crate) logs: Arc<crate::logs::Store>,
 }
@@ -226,7 +229,7 @@ async fn wait_for_terminal(state: &SharedState, names: &[String]) -> Result<()> 
             }) {
                 for name in names {
                     if let Some(error) = guard.stop_errors.get(name) {
-                        anyhow::bail!("{name}: {error}");
+                        return Err(error.clone().into());
                     }
                 }
                 return Ok(());
@@ -320,6 +323,7 @@ pub fn spawn_daemon_process(
     disable_dotenv: bool,
     processes: &[String],
     no_deps: bool,
+    no_start: bool,
     parent_pid: Option<u32>,
 ) -> Result<()> {
     let exe = env::current_exe().context("failed to locate current executable")?;
@@ -374,6 +378,9 @@ pub fn spawn_daemon_process(
         cmd.arg("--process").arg(proc_name);
     }
 
+    if no_start {
+        cmd.arg("--no-start");
+    }
     if no_deps {
         cmd.arg("--no-deps");
     }
@@ -452,6 +459,14 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
     let exit_mode = config.exit_mode;
     let mut process_map = build_process_instances(&config, &args.cwd, &dotenv);
     crate::config::validate_resolved_hooks(&process_map)?;
+
+    if args.no_start {
+        for runtime in process_map.values_mut() {
+            if matches!(runtime.status, ProcessStatus::Pending) {
+                runtime.status = ProcessStatus::NotStarted;
+            }
+        }
+    }
 
     // Mark non-selected services as NotStarted instead of Pending so the
     // supervisor won't auto-launch them.
@@ -572,19 +587,20 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
         }
     }
 
-    let errors = {
+    let failures = {
         let guard = state.lock().await;
         let mut errors = guard.stop_errors.values().cloned().collect::<Vec<_>>();
         errors.extend(guard.processes.values().filter_map(|r| {
-            r.initialization
-                .failure()
-                .map(|e| format!("{}: {e}", r.spec.name))
+            r.initialization.failure().map(|e| {
+                crate::diagnostic::Diagnostic::error("hook_failed", format!("{}: {e}", r.spec.name))
+            })
         }));
         errors
     };
     let receipt = crate::shutdown::Receipt {
         pid: std::process::id(),
-        errors,
+        errors: failures.iter().map(ToString::to_string).collect(),
+        failures,
     };
     write_secure(
         &paths.pid.with_extension("shutdown.json"),
@@ -594,7 +610,12 @@ pub async fn run_daemon(args: DaemonArgs) -> Result<()> {
     let _ = fs::remove_file(&paths.pid);
     let _ = fs::remove_file(&paths.lock);
     if !receipt.errors.is_empty() {
-        anyhow::bail!("shutdown cleanup failed: {}", receipt.errors.join("; "));
+        return Err(crate::diagnostic::Diagnostic::failures(
+            "shutdown_failed",
+            "shutdown cleanup failed",
+            receipt.failures,
+        )
+        .into());
     }
     Ok(())
 }
@@ -869,6 +890,14 @@ async fn publish_running(
             r.initialization.hook = None;
         }
     }
+    drop(guard);
+    write_process_event(
+        state,
+        handle,
+        &format!("started (pid {pid})"),
+        crate::output_model::Lifecycle::ProcessStarted { pid },
+    )
+    .await;
 }
 
 pub(crate) async fn initialization_failed(state: &SharedState) {
@@ -884,9 +913,10 @@ pub(crate) async fn record_hook_cleanup_error(
     error: String,
 ) {
     let mut guard = state.lock().await;
-    guard
-        .stop_errors
-        .insert(crate::model::read_name(handle), error);
+    guard.stop_errors.insert(
+        crate::model::read_name(handle),
+        crate::diagnostic::Diagnostic::error("shutdown_failed", error),
+    );
 }
 
 async fn prepare_attempt(
@@ -1013,10 +1043,27 @@ async fn mark_failed_to_start(
     state: &SharedState,
     err: &anyhow::Error,
 ) {
-    let name = crate::model::read_name(name_handle);
-    eprintln!("[{name}] {err:#}");
-    write_process_event(state, name_handle, &format!("{err:#}")).await;
+    write_process_event(
+        state,
+        name_handle,
+        &format!("{err:#}"),
+        crate::output_model::Lifecycle::Diagnostic {
+            diagnostic: Box::new(crate::diagnostic::Diagnostic::from_error(err)),
+        },
+    )
+    .await;
     with_process_mut(state, name_handle, |runtime| {
+        let mut diagnostic = crate::diagnostic::Diagnostic::from_error(err);
+        diagnostic.code = "process_spawn_failed".into();
+        diagnostic.context = Some(crate::diagnostic::DiagnosticContext {
+            operation: Some("start".into()),
+            service: Some(runtime.spec.base_name.clone()),
+            process: Some(runtime.spec.name.clone()),
+            command: Some(runtime.spec.command.clone()),
+            working_dir: Some(runtime.spec.working_dir.clone()),
+            ..Default::default()
+        });
+        runtime.failure = Some(diagnostic);
         runtime.status = ProcessStatus::FailedToStart {
             reason: format!("{err:#}"),
         };
@@ -1173,7 +1220,9 @@ async fn wait_for_child_exit(
         let name = crate::model::read_name(name_handle);
         let message = format!("{name}: cleanup failed: {error:#}");
         eprintln!("{message}");
-        state.lock().await.stop_errors.insert(name, message.clone());
+        let mut diagnostic = crate::diagnostic::Diagnostic::from_error(&error);
+        diagnostic.code = "shutdown_failed".into();
+        state.lock().await.stop_errors.insert(name, diagnostic);
         return (ProcessStatus::FailedToStart { reason: message }, None);
     }
     match outcome {
@@ -1295,6 +1344,17 @@ async fn process_lifecycle(
             let _ = task.await;
         }
 
+        let exit_code = match &final_status {
+            ProcessStatus::Exited { code } => Some(*code),
+            _ => None,
+        };
+        write_process_event(
+            &state,
+            &name_handle,
+            &final_status.to_human(),
+            crate::output_model::Lifecycle::ProcessExited { exit_code },
+        )
+        .await;
         let should_restart = apply_restart_decision(&name_handle, &state, final_status).await;
         if !should_restart {
             let mut guard = state.lock().await;
@@ -1314,7 +1374,16 @@ async fn process_lifecycle(
             let name = crate::model::read_name(&name_handle);
             let line = format_restart_separator(&name, reason, attempt, max);
             let message = line.strip_prefix(&format!("[{name}] ")).unwrap_or(&line);
-            write_process_event(&state, &name_handle, message).await;
+            write_process_event(
+                &state,
+                &name_handle,
+                message,
+                crate::output_model::Lifecycle::ProcessRestartRequested {
+                    attempt,
+                    limit: max,
+                },
+            )
+            .await;
         }
 
         // Backoff delay. Look up the current spec under the lock, since a
@@ -1388,6 +1457,7 @@ async fn write_process_event(
     state: &SharedState,
     handle: &crate::model::NameHandle,
     message: &str,
+    event: crate::output_model::Lifecycle,
 ) {
     let (logs, identity) = {
         let guard = state.lock().await;
@@ -1407,7 +1477,7 @@ async fn write_process_event(
             logs.writer(&base, replica)?
                 .lock()
                 .unwrap()
-                .write(&name, "event", &message, false)
+                .write_event(&name, &message, None, event)
         })
         .await;
         if !matches!(result, Ok(Ok(()))) {
@@ -1562,14 +1632,6 @@ fn resolve_services(
     }
 }
 
-fn describe_services(services: &[String]) -> String {
-    if services.is_empty() {
-        "all services".to_string()
-    } else {
-        services.join(", ")
-    }
-}
-
 /// Resolve services and convert any unknown-name error into a
 /// `Response::Error` so IPC handlers can exit early with `?`-style control
 /// flow. Mirrors the check/format used by Stop/Start/Kill/Restart.
@@ -1577,8 +1639,16 @@ fn resolve_services_or_error(
     state: &DaemonState,
     services: &[String],
 ) -> std::result::Result<Vec<String>, Response> {
-    resolve_services(state, services).map_err(|unknown| Response::Error {
-        message: format!("unknown service(s): {}", unknown.join(", ")),
+    resolve_services(state, services).map_err(|unknown| {
+        let mut diagnostic = crate::diagnostic::Diagnostic::error(
+            "unknown_service",
+            format!("unknown service(s): {}", unknown.join(", ")),
+        );
+        diagnostic.details = Some(crate::diagnostic::DiagnosticDetails::Targets {
+            requested: unknown,
+            known: state.processes.keys().cloned().collect(),
+        });
+        Response::failure(diagnostic.into())
     })
 }
 
@@ -1749,9 +1819,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             // A newer client may send a command this daemon does not know.
             // Reply using the stable error envelope instead of dropping the
             // connection, which hides the reason from the client.
-            let response = Response::Error {
-                message: format!("invalid request json: {err}"),
-            };
+            let response = Response::error(format!("invalid request json: {err}"));
             write_half
                 .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
                 .await?;
@@ -1766,9 +1834,10 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             Request::Start { .. } | Request::Restart { .. } | Request::Reload { .. }
         )
     {
-        let response = Response::Error {
-            message: "environment is shutting down".into(),
-        };
+        let response = Response::failure(
+            crate::diagnostic::Diagnostic::error("daemon_stopping", "environment is shutting down")
+                .into(),
+        );
         write_half
             .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
             .await?;
@@ -1781,6 +1850,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 pid: std::process::id(),
                 instance: guard.instance.clone(),
                 shutting_down: guard.shutdown_requested,
+                capabilities: vec!["structured_operations_v1".into()],
             }
         }
         Request::ShutdownBudget { timeout_seconds } => {
@@ -1802,9 +1872,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 guard.shutdown_timeout_override = timeout_seconds;
             }
             guard.request_shutdown();
-            Response::Ack {
-                message: "shutdown requested".to_string(),
-            }
+            Response::ack("shutdown requested".to_string())
         }
         Request::StopStatus { services } => {
             let guard = state.lock().await;
@@ -1818,9 +1886,13 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                                 .get(n)
                                 .is_none_or(|r| r.status.is_terminal())
                     }),
-                    errors: names
+                    failures: names
                         .iter()
                         .filter_map(|n| guard.stop_errors.get(n).cloned())
+                        .collect(),
+                    errors: names
+                        .iter()
+                        .filter_map(|n| guard.stop_errors.get(n).map(ToString::to_string))
                         .collect(),
                 },
             }
@@ -1829,9 +1901,7 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
             let mut guard = state.lock().await;
             guard.force_shutdown.store(true, Ordering::Relaxed);
             guard.request_shutdown();
-            Response::Ack {
-                message: "forced shutdown requested".into(),
-            }
+            Response::ack("forced shutdown requested".into())
         }
         Request::Stop { services } => handle_stop(&state, services).await,
         Request::Start { services } => handle_start(&state, services).await,
@@ -1892,9 +1962,23 @@ async fn handle_ps(state: &SharedState) -> Response {
         .collect::<Vec<_>>();
 
     Response::Ps {
+        shutting_down: guard.shutdown_requested,
         pid: std::process::id(),
         instance: guard.instance.clone(),
         processes,
+    }
+}
+
+fn operation_ack(outcome: Outcome, mut services: Vec<ServiceResult>) -> Response {
+    services.sort_by(|a, b| a.name.cmp(&b.name));
+    let result = Acknowledgment {
+        outcome,
+        services,
+        changes: None,
+    };
+    Response::Ack {
+        message: crate::output::operation_summary(&result),
+        result: Some(Box::new(result)),
     }
 }
 
@@ -1906,10 +1990,19 @@ async fn handle_stop(state: &SharedState, services: Vec<String>) -> Response {
     match resolve_services_or_error(&guard, &services) {
         Err(resp) => resp,
         Ok(names) => {
+            let results = names
+                .iter()
+                .map(|name| ServiceResult {
+                    name: name.clone(),
+                    outcome: if guard.controllers.contains_key(name) {
+                        ServiceOutcome::Stopped
+                    } else {
+                        ServiceOutcome::AlreadyStopped
+                    },
+                })
+                .collect();
             guard.stop_instances(&names);
-            Response::Ack {
-                message: format!("stopping {}", describe_services(&services)),
-            }
+            operation_ack(Outcome::Accepted, results)
         }
     }
 }
@@ -1920,9 +2013,10 @@ async fn handle_stop(state: &SharedState, services: Vec<String>) -> Response {
 async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
     let mut guard = state.lock().await;
     if guard.shutdown_requested {
-        return Response::Error {
-            message: "environment is shutting down".into(),
-        };
+        return Response::failure(
+            crate::diagnostic::Diagnostic::error("daemon_stopping", "environment is shutting down")
+                .into(),
+        );
     }
 
     // Empty `services` means "start every eligible service" (e.g. the
@@ -1958,14 +2052,22 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
                 }
             }
 
-            let mut started = 0;
             for name in &to_start {
                 if let Some(error) = guard.stop_errors.get(name) {
-                    return Response::Error {
-                        message: error.clone(),
-                    };
+                    return Response::failure(error.clone().into());
+                }
+            }
+            let mut started = 0;
+            let mut results = Vec::new();
+            for name in &to_start {
+                if let Some(error) = guard.stop_errors.get(name) {
+                    return Response::failure(error.clone().into());
                 }
                 if guard.controllers.contains_key(name) {
+                    results.push(ServiceResult {
+                        name: name.clone(),
+                        outcome: ServiceOutcome::AlreadyRunning,
+                    });
                     continue;
                 }
                 guard.stopping.remove(name);
@@ -1978,6 +2080,7 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
                     if !explicit_start && runtime.spec.disabled {
                         continue;
                     }
+                    runtime.failure = None;
                     runtime.status = ProcessStatus::Pending;
                     runtime.log_ready = false;
                     runtime.ready = false;
@@ -1994,17 +2097,30 @@ async fn handle_start(state: &SharedState, services: Vec<String>) -> Response {
                         runtime.spec.disabled = false;
                     }
                     started += 1;
+                    results.push(ServiceResult {
+                        name: name.clone(),
+                        outcome: ServiceOutcome::StartRequested,
+                    });
+                } else if guard
+                    .processes
+                    .get(name)
+                    .is_some_and(|r| matches!(r.status, ProcessStatus::Pending))
+                {
+                    started += 1;
+                    results.push(ServiceResult {
+                        name: name.clone(),
+                        outcome: ServiceOutcome::StartRequested,
+                    });
                 }
             }
-            if started == 0 {
-                Response::Ack {
-                    message: format!("{} already running", describe_services(&services)),
-                }
-            } else {
-                Response::Ack {
-                    message: format!("starting {}", describe_services(&services)),
-                }
-            }
+            operation_ack(
+                if started == 0 {
+                    Outcome::Unchanged
+                } else {
+                    Outcome::Accepted
+                },
+                results,
+            )
         }
     }
 }
@@ -2017,6 +2133,7 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
     match resolve_services_or_error(&guard, &services) {
         Err(resp) => resp,
         Ok(names) => {
+            let mut results = Vec::new();
             for name in &names {
                 if guard
                     .processes
@@ -2038,14 +2155,40 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
                     && let ProcessStatus::Running { pid } = runtime.status
                     && let Err(e) = crate::shutdown::signal_group(pid, signal)
                 {
-                    return Response::Error {
-                        message: format!("{name}: {e:#}"),
-                    };
+                    let mut failure = crate::diagnostic::Diagnostic::from_error(
+                        &e.context(format!("failed to signal {name}")),
+                    );
+                    failure.code = "process_signal_failed".into();
+                    let mut error = crate::diagnostic::Diagnostic::error(
+                        "process_signal_failed",
+                        "failed to signal services",
+                    );
+                    error.details = Some(crate::diagnostic::DiagnosticDetails::PartialOperation {
+                        daemon: crate::output_model::Daemon {
+                            state: crate::output_model::DaemonState::Running,
+                            pid: Some(std::process::id()),
+                            instance: guard.instance.clone(),
+                        },
+                        accepted: Vec::new(),
+                        completed: results,
+                        failures: vec![failure],
+                    });
+                    return Response::failure(error.into());
                 }
+                let running = guard
+                    .processes
+                    .get(name)
+                    .is_some_and(|r| matches!(r.status, ProcessStatus::Running { .. }));
+                results.push(ServiceResult {
+                    name: name.clone(),
+                    outcome: if running {
+                        ServiceOutcome::Signalled
+                    } else {
+                        ServiceOutcome::AlreadyStopped
+                    },
+                });
             }
-            Response::Ack {
-                message: format!("killed {}", describe_services(&services)),
-            }
+            operation_ack(Outcome::Completed, results)
         }
     }
 }
@@ -2056,9 +2199,10 @@ async fn handle_kill(state: &SharedState, services: Vec<String>, signal: i32) ->
 async fn handle_restart(state: &SharedState, services: Vec<String>) -> Response {
     let mut guard = state.lock().await;
     if guard.shutdown_requested {
-        return Response::Error {
-            message: "environment is shutting down".into(),
-        };
+        return Response::failure(
+            crate::diagnostic::Diagnostic::error("daemon_stopping", "environment is shutting down")
+                .into(),
+        );
     }
 
     match resolve_services_or_error(&guard, &services) {
@@ -2085,6 +2229,7 @@ async fn handle_restart(state: &SharedState, services: Vec<String>) -> Response 
                     }
                     guard.stopping.remove(name);
                     if let Some(runtime) = guard.processes.get_mut(name) {
+                        runtime.failure = None;
                         runtime.status = ProcessStatus::Pending;
                         runtime.log_ready = false;
                         runtime.ready = false;
@@ -2092,9 +2237,16 @@ async fn handle_restart(state: &SharedState, services: Vec<String>) -> Response 
                     }
                 }
             });
-            Response::Ack {
-                message: format!("restarting {}", describe_services(&services)),
-            }
+            operation_ack(
+                Outcome::Accepted,
+                names
+                    .into_iter()
+                    .map(|name| ServiceResult {
+                        name,
+                        outcome: ServiceOutcome::RestartRequested,
+                    })
+                    .collect(),
+            )
         }
     }
 }
@@ -2136,7 +2288,7 @@ async fn handle_remove_orphans(state: &SharedState, keep: Vec<String>) -> Respon
     } else {
         format!("removing orphan(s): {}", orphans.join(", "))
     };
-    Response::Ack { message: msg }
+    Response::ack(msg)
 }
 
 /// Report whether `name` matches any tracked service (by base-name or
@@ -2181,10 +2333,9 @@ async fn handle_reload(
     // slips through with both flags set, refuse rather than silently picking
     // one interpretation.
     if force_recreate && no_recreate {
-        return Response::Error {
-            message: "reload: --force-recreate and --no-recreate are mutually exclusive"
-                .to_string(),
-        };
+        return Response::error(
+            "reload: --force-recreate and --no-recreate are mutually exclusive".to_string(),
+        );
     }
     // Snapshot the daemon-launch args so we don't hold the state lock across
     // disk I/O.
@@ -2203,9 +2354,7 @@ async fn handle_reload(
     let loaded = match load_project(&config_files, &env_files, disable_dotenv) {
         Ok(loaded) => loaded,
         Err(e) => {
-            return Response::Error {
-                message: format!("reload: invalid config: {e:#}"),
-            };
+            return Response::failure(e.context("failed to reload configuration"));
         }
     };
     let new_config = loaded.config;
@@ -2213,9 +2362,7 @@ async fn handle_reload(
 
     let new_process_map = build_process_instances(&new_config, &cwd, &dotenv);
     if let Err(e) = crate::config::validate_resolved_hooks(&new_process_map) {
-        return Response::Error {
-            message: e.to_string(),
-        };
+        return Response::failure(e);
     }
 
     // 2. Build fingerprints keyed by base-name. Replicas share a config_hash,
@@ -2288,7 +2435,7 @@ async fn handle_reload(
         no_recreate,
     ) {
         Ok(p) => p,
-        Err(msg) => return Response::Error { message: msg },
+        Err(msg) => return Response::error(msg),
     };
 
     // 5. Execute the plan. We only touch running state past this point.
@@ -2402,9 +2549,7 @@ async fn handle_reload(
     if !to_stop.is_empty()
         && let Err(e) = wait_for_terminal(&state, &to_stop).await
     {
-        return Response::Error {
-            message: e.to_string(),
-        };
+        return Response::failure(e);
     }
 
     // 5c. Under the lock: drop old changed + orphaned + scaled-down entries
@@ -2419,9 +2564,13 @@ async fn handle_reload(
     let (n_added, n_changed, n_removed, n_scaled_services, replica_delta, n_renamed) = {
         let mut guard = state.lock().await;
         if guard.shutdown_requested {
-            return Response::Error {
-                message: "environment is shutting down".into(),
-            };
+            return Response::failure(
+                crate::diagnostic::Diagnostic::error(
+                    "daemon_stopping",
+                    "environment is shutting down",
+                )
+                .into(),
+            );
         }
         for name in &to_stop {
             guard.stopping.remove(name);
@@ -2527,6 +2676,7 @@ async fn handle_reload(
                 } else {
                     runtime.spec.disabled = false;
                     if matches!(runtime.status, ProcessStatus::Disabled) {
+                        runtime.failure = None;
                         runtime.status = ProcessStatus::Pending;
                         runtime.log_ready = false;
                         runtime.ready = false;
@@ -2575,13 +2725,48 @@ async fn handle_reload(
     } else {
         String::new()
     };
-    Response::Ack {
-        message: format!(
-            "reloaded: +{n_added} added, {n_changed} changed, \
+    let mut response = Response::ack(format!(
+        "reloaded: +{n_added} added, {n_changed} changed, \
              {n_scaled_services} scaled ({delta_sign}{replica_delta} replicas), \
              {n_removed} {removed_label}{rename_suffix}",
-        ),
+    ));
+    if let Response::Ack { result, .. } = &mut response {
+        *result = Some(Box::new(Acknowledgment {
+            outcome: Outcome::Completed,
+            services: Vec::new(),
+            changes: Some(Changes {
+                added: plan.added.clone(),
+                changed: plan.changed.clone(),
+                removed: if remove_orphans {
+                    plan.removed.clone()
+                } else {
+                    Vec::new()
+                },
+                orphans: if remove_orphans {
+                    Vec::new()
+                } else {
+                    plan.removed.clone()
+                },
+                renamed: rename_plan
+                    .iter()
+                    .map(|(from, to)| Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                    })
+                    .collect(),
+                scaled: plan
+                    .scaled
+                    .iter()
+                    .map(|(service, (from, to))| Scale {
+                        service: service.clone(),
+                        from_replicas: *from,
+                        to_replicas: *to,
+                    })
+                    .collect(),
+            }),
+        }));
     }
+    response
 }
 
 #[cfg(test)]
@@ -2596,6 +2781,7 @@ mod tests {
 
     fn runtime_with(base: &str, status: ProcessStatus, started_once: bool) -> ProcessRuntime {
         ProcessRuntime {
+            failure: None,
             hook_cancel: None,
             initialization: Default::default(),
             spec: ProcessInstanceSpec {

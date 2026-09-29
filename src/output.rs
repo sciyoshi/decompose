@@ -8,11 +8,12 @@ use serde::Serialize;
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct OutputArgs {
-    /// Emit JSON output.
-    #[arg(long, conflicts_with = "table")]
+    /// Emit JSON results and diagnostics (JSON Lines for streams). Help, completion,
+    /// and child streams retain their native formats; config keeps its own schema.
+    #[arg(long, global = true, conflicts_with = "table")]
     pub json: bool,
     /// Emit table/text output.
-    #[arg(long, conflicts_with = "json")]
+    #[arg(long, global = true, conflicts_with = "json")]
     pub table: bool,
 }
 
@@ -27,14 +28,7 @@ impl OutputArgs {
         if self.json {
             return OutputMode::Json;
         }
-        if self.table {
-            return OutputMode::Table;
-        }
-        if std::io::stdout().is_terminal() || env_truthy("LLM") || env_truthy("CI") {
-            OutputMode::Table
-        } else {
-            OutputMode::Json
-        }
+        OutputMode::Table
     }
 }
 
@@ -49,12 +43,12 @@ pub fn env_truthy(name: &str) -> bool {
     )
 }
 
-pub fn print_json<T: Serialize>(value: &T) {
-    if let Ok(encoded) = serde_json::to_string(value) {
-        println!("{encoded}");
-    } else {
-        println!("{{\"error\":\"failed to serialize json output\"}}");
-    }
+pub fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    // Serialize before touching stdout, including the record terminator.
+    let mut encoded = serde_json::to_vec(value)?;
+    encoded.push(b'\n');
+    write_bytes(&encoded)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -119,11 +113,12 @@ pub fn unified_state(
         "initializing" => ("\u{25cc}", "initializing", YELLOW),
         "pending" => ("\u{25cc}", "pending", YELLOW), // ◌
         "restarting" => ("\u{25cc}", "restarting", YELLOW), // ◌
-        "failed" | "failed_to_start" => ("\u{2715}", "failed", RED), // ✕
+        "failed" => ("\u{2715}", "failed", RED),
+        "failed_to_start" => ("\u{2715}", "failed_to_start", RED), // ✕
         "exited" => ("-", "exited", DIM),
         "stopped" => ("-", "stopped", DIM),
         "disabled" => ("-", "disabled", DIM),
-        "not_started" => ("-", "", DIM),
+        "not_started" => ("-", "not_started", DIM),
         _ => ("-", "", Style::new()),
     };
     (g, label, maybe(s, color))
@@ -183,7 +178,7 @@ pub struct UpStatusInfo<'a> {
 
 /// Print the two-line status block after `up`. Renders a colored glyph + count
 /// headline and a dim hint line pointing at the next likely command.
-pub fn print_up_status(info: &UpStatusInfo<'_>) {
+pub fn print_up_status(info: &UpStatusInfo<'_>) -> anyhow::Result<()> {
     let color = use_color();
     let dim = maybe(DIM, color);
 
@@ -213,13 +208,13 @@ pub fn print_up_status(info: &UpStatusInfo<'_>) {
         suffix.push_str(&format!(" · session {name}"));
     }
 
-    println!(
+    crate::output::write_line(format_args!(
         "{} {} {}{}",
         styled(glyph, glyph_style),
         info.service_count,
         count_label,
         styled(&suffix, dim),
-    );
+    ))?;
 
     // Hint line: dim, two-space indent. Attached `up` will start streaming
     // logs immediately; distinguish ownership from viewing. Detached
@@ -237,12 +232,33 @@ pub fn print_up_status(info: &UpStatusInfo<'_>) {
         }
         format!("  {}", parts.join(" · "))
     };
-    println!("{}", styled(&hint, dim));
+    crate::output::write_line(format_args!("{}", styled(&hint, dim)))?;
+    Ok(())
 }
 
 /// Display initialization separately from child state and readiness.
 pub(crate) fn initialization_detail(p: &crate::model::ProcessSnapshot) -> String {
     let detail = p.initialization.detail();
+    let detail = if let Some(code) = p.exit_code {
+        format!(
+            "exit code {code}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("; {detail}")
+            }
+        )
+    } else {
+        detail
+    };
+    let detail = if detail.is_empty() {
+        p.failure
+            .as_ref()
+            .map(|d| d.summary.clone())
+            .unwrap_or_default()
+    } else {
+        detail
+    };
     if !detail.is_empty() {
         return detail;
     }
@@ -375,7 +391,7 @@ mod tests {
         );
         assert_eq!(
             unified_state("failed_to_start", false, false, true),
-            ("\u{2715}", "failed", RED)
+            ("\u{2715}", "failed_to_start", RED)
         );
         // stopped / disabled / not_started = dim
         assert_eq!(
@@ -388,7 +404,7 @@ mod tests {
         );
         assert_eq!(
             unified_state("not_started", false, false, true),
-            ("-", "", DIM)
+            ("-", "not_started", DIM)
         );
         // exited = dim
         assert_eq!(
@@ -412,5 +428,101 @@ mod tests {
     fn styled_display_with_width_pads() {
         let s = styled("hi", Style::new());
         assert_eq!(format!("{s:<10}"), "hi        ");
+    }
+}
+
+pub fn operation_summary(result: &crate::output_model::Acknowledgment) -> String {
+    use crate::output_model::ServiceOutcome;
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for service in &result.services {
+        let verb = match service.outcome {
+            ServiceOutcome::StartRequested => "starting",
+            ServiceOutcome::RestartRequested => "restarting",
+            ServiceOutcome::Registered => "registered",
+            ServiceOutcome::AlreadyRunning => "already running:",
+            ServiceOutcome::Stopped => "stopped",
+            ServiceOutcome::AlreadyStopped => "already stopped:",
+            ServiceOutcome::Signalled => "sent signal to",
+            ServiceOutcome::Ready => "ready:",
+        };
+        if let Some((_, names)) = groups.iter_mut().find(|(v, _)| *v == verb) {
+            names.push(&service.name);
+        } else {
+            groups.push((verb, vec![&service.name]));
+        }
+    }
+    if groups.is_empty() {
+        return "no eligible services".into();
+    }
+    groups
+        .into_iter()
+        .map(|(verb, names)| format!("{verb} {}", names.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+tokio::task_local! {
+    pub(crate) static STDOUT: tokio::sync::mpsc::UnboundedSender<Vec<u8>>;
+}
+
+/// One command boundary owns the descriptor. Producers enqueue complete records;
+/// library users without a boundary write synchronously to process stdout.
+pub(crate) fn write_bytes(bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match STDOUT.try_with(|sender| sender.send(bytes.to_vec())) {
+        Ok(result) => result.map_err(|_| std::io::ErrorKind::BrokenPipe.into()),
+        Err(_) => std::io::stdout().lock().write_all(bytes),
+    }
+}
+
+pub(crate) fn write_line(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    let mut text = args.to_string();
+    text.push('\n');
+    write_bytes(text.as_bytes())
+}
+
+pub(crate) fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let sender = STDOUT.try_with(Clone::clone).ok();
+    tokio::spawn(async move {
+        if let Some(sender) = sender {
+            STDOUT.scope(sender, future).await
+        } else {
+            future.await
+        }
+    })
+}
+
+/// Compact notices share one catalog across terminal UI actions.
+pub(crate) enum Notice<'a> {
+    Following(bool),
+    NothingToYank,
+    Yanked { lines: usize, full: bool },
+    Match { line: usize, total: usize },
+    NoMatch(&'a str),
+    ForcingShutdown,
+    Stopping,
+}
+impl std::fmt::Display for Notice<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Following(true) => f.write_str("following"),
+            Self::Following(false) => f.write_str("paused"),
+            Self::NothingToYank => f.write_str("nothing to yank"),
+            Self::Yanked { lines, full } => write!(
+                f,
+                "yanked {lines} {}line{}{}",
+                if *full { "" } else { "visible " },
+                if *lines == 1 { "" } else { "s" },
+                if *full { " (full buffer)" } else { "" }
+            ),
+            Self::Match { line, total } => write!(f, "match on line {line} of {total}"),
+            Self::NoMatch(query) => write!(f, "no match for /{query}/"),
+            Self::ForcingShutdown => f.write_str("forcing shutdown…"),
+            Self::Stopping => f.write_str("stopping services… (ctrl-c or Q to force)"),
+        }
     }
 }

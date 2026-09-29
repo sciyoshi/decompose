@@ -109,10 +109,45 @@ impl RawProcess {
 
 impl RawProject {
     pub fn read(path: &Path) -> Result<Self> {
-        let data = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let mut raw: Self = serde_yaml_ng::from_str(&data)
-            .with_context(|| format!("config error: {}", path.display()))?;
+        let data = fs::read_to_string(path).map_err(|error| {
+            let mut diagnostic = crate::diagnostic::Diagnostic::error(
+                "config_read_failed",
+                format!("failed to read config file {}", path.display()),
+            );
+            diagnostic.source = Some(crate::diagnostic::Source {
+                path: path.into(),
+                range: None,
+            });
+            crate::diagnostic::LocalError {
+                diagnostic,
+                cause: error.into(),
+            }
+        })?;
+        let mut raw: Self =
+            serde_yaml_ng::from_str(&data).map_err(|error: serde_yaml_ng::Error| {
+                let mut diagnostic = crate::diagnostic::Diagnostic::error(
+                    "config_parse_failed",
+                    format!("config error: {}", path.display()),
+                );
+                let range = error.location().map(|location| {
+                    let position = crate::diagnostic::Position {
+                        line: location.line(),
+                        column: location.column(),
+                    };
+                    crate::diagnostic::SourceRange {
+                        start: position.clone(),
+                        end: position,
+                    }
+                });
+                diagnostic.source = Some(crate::diagnostic::Source {
+                    path: path.into(),
+                    range,
+                });
+                crate::diagnostic::LocalError {
+                    diagnostic,
+                    cause: error.into(),
+                }
+            })?;
         // Check supplied field types now, but defer completeness and graph
         // validation until every overlay has been applied.
         raw.environment_sources = raw

@@ -524,10 +524,13 @@ fn validate_probe(process: &str, kind: &str, probe: &HealthProbe) -> Result<()> 
         );
     }
     if probe.timeout_seconds == probe.period_seconds {
-        eprintln!(
-            "warning: process `{process}` {kind}.timeout_seconds == period_seconds ({}) \
+        crate::diagnostic::warning(
+            "probe_timing_no_slack",
+            format!(
+                "process `{process}` {kind}.timeout_seconds == period_seconds ({}) \
              leaves no slack between probe attempts",
-            probe.timeout_seconds
+                probe.timeout_seconds
+            ),
         );
     }
     if probe.success_threshold == 0 {
@@ -803,9 +806,12 @@ pub fn parse_dotenv_with_source(
 
 fn warn_malformed_dotenv(source: Option<&str>, line_no: usize, line: &str, reason: &str) {
     let src = source.unwrap_or("<env>");
-    eprintln!(
-        "warning: {src}:{line_no}: skipping malformed env line ({reason}): {:?}",
-        line.trim_end()
+    crate::diagnostic::warning(
+        "malformed_env_line",
+        format!(
+            "{src}:{line_no}: skipping malformed env line ({reason}): {:?}",
+            line.trim_end()
+        ),
     );
 }
 
@@ -1228,6 +1234,7 @@ pub fn build_process_instances(
             out.insert(
                 instance_name,
                 ProcessRuntime {
+                    failure: None,
                     hook_cancel: None,
                     initialization: Default::default(),
                     spec,

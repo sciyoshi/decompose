@@ -170,6 +170,10 @@ impl App {
         self.logs.push_back(LogLine { plain, styled });
     }
 
+    fn set_notice(&mut self, notice: crate::output::Notice<'_>) {
+        self.set_status(notice.to_string());
+    }
+
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((Instant::now(), msg.into()));
     }
@@ -292,23 +296,33 @@ fn strip_ansi(s: &str) -> String {
 pub async fn run(paths: RuntimePaths) -> Result<()> {
     let mut terminal = setup_terminal().context("failed to initialise terminal for TUI")?;
     let result = run_app(&mut terminal, paths).await;
-    restore_terminal(&mut terminal).ok();
-    result
+    let restore = restore_terminal(&mut terminal);
+    result.and(restore)
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
-    let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    let result = (|| {
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen)?;
+        Ok(Terminal::new(CrosstermBackend::new(out))?)
+    })();
+    if result.is_err() {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+    }
+    result
 }
 
 fn restore_terminal(term: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    term.show_cursor()?;
+    let raw = disable_raw_mode();
+    let screen = execute!(term.backend_mut(), LeaveAlternateScreen);
+    let cursor = term.show_cursor();
+    raw?;
+    screen?;
+    cursor?;
     Ok(())
 }
 
@@ -398,7 +412,7 @@ async fn refresh_processes(app: &mut App) {
                 app.list_state.select(Some(idx));
             }
         }
-        Ok(Response::Error { message }) => {
+        Ok(Response::Error { message, .. }) => {
             app.set_status(format!("daemon error: {message}"));
         }
         Err(e) => {
@@ -432,8 +446,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL)))
     {
         match send_request(&app.paths, Request::ForceDown).await {
-            Ok(Response::Ack { .. }) => app.set_status("forcing shutdown…"),
-            Ok(Response::Error { message }) => app.set_status(message),
+            Ok(Response::Ack { .. }) => app.set_notice(crate::output::Notice::ForcingShutdown),
+            Ok(Response::Error { message, .. }) => app.set_status(message),
             Ok(_) => app.set_status("unexpected shutdown response"),
             Err(e) => app.set_status(format!("forced shutdown failed: {e}")),
         }
@@ -451,7 +465,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             // Shift-Q: stop everything and quit, mirroring `decompose down`.
             // Lower-case q detaches without touching services.
             let paths = app.paths.clone();
-            app.set_status("stopping services… (Ctrl-C or Q to force)");
+            app.set_notice(crate::output::Notice::Stopping);
             app.shutdown_task = Some(tokio::spawn(async move {
                 let pid = match send_request(&paths, Request::Ping).await? {
                     Response::Pong { pid, .. } => pid,
@@ -486,18 +500,22 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         (KeyCode::Char('p'), _) if app.focus == Focus::Logs => {
             app.follow = !app.follow;
-            app.set_status(if app.follow { "following" } else { "paused" });
+            app.set_notice(crate::output::Notice::Following(app.follow));
         }
         (KeyCode::Char('y'), _) if app.focus == Focus::Logs => {
             let lines: Vec<&str> = app.visible_log_lines().collect();
             if lines.is_empty() {
-                app.set_status("nothing to yank");
+                app.set_notice(crate::output::Notice::NothingToYank);
             } else {
                 let n = lines.len();
                 let text = lines.join("\n");
                 let ok = copy_to_clipboard(&text);
                 app.set_status(if ok {
-                    format!("yanked {n} visible line{}", if n == 1 { "" } else { "s" })
+                    crate::output::Notice::Yanked {
+                        lines: n,
+                        full: false,
+                    }
+                    .to_string()
                 } else {
                     "clipboard copy failed".to_string()
                 });
@@ -505,7 +523,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         (KeyCode::Char('Y'), _) if app.focus == Focus::Logs => {
             if app.logs.is_empty() {
-                app.set_status("nothing to yank");
+                app.set_notice(crate::output::Notice::NothingToYank);
             } else {
                 let n = app.logs.len();
                 let text = app
@@ -516,7 +534,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     .join("\n");
                 let ok = copy_to_clipboard(&text);
                 app.set_status(if ok {
-                    format!("yanked {n} lines (full buffer)")
+                    crate::output::Notice::Yanked {
+                        lines: n,
+                        full: true,
+                    }
+                    .to_string()
                 } else {
                     "clipboard copy failed".to_string()
                 });
@@ -601,9 +623,9 @@ fn jump_to_match(app: &mut App, direction: i32) {
             app.follow = false;
             // Position the matching line at the bottom of the viewport.
             app.log_scrollback = total.saturating_sub(i + 1);
-            app.set_status(format!("match on line {} of {total}", i + 1));
+            app.set_notice(crate::output::Notice::Match { line: i + 1, total });
         }
-        None => app.set_status(format!("no match for /{}/", app.search.input)),
+        None => app.set_status(crate::output::Notice::NoMatch(&app.search.input).to_string()),
     }
 }
 
@@ -667,8 +689,18 @@ async fn send_service_action(app: &mut App, action: ServiceAction) {
         ),
     };
     match send_request(&app.paths, req).await {
-        Ok(Response::Ack { .. }) => app.set_status(format!("{verb} {target}")),
-        Ok(Response::Error { message }) => app.set_status(format!("{verb} failed: {message}")),
+        Ok(Response::Ack {
+            result: Some(result),
+            ..
+        }) => app.set_status(crate::output::operation_summary(&result)),
+        Ok(Response::Ack { message, .. }) => app.set_status(message),
+        Ok(Response::Error {
+            message,
+            diagnostic,
+        }) => app.set_status(format!(
+            "{verb} failed: {:#}",
+            Response::into_error(message, diagnostic)
+        )),
         Err(e) => app.set_status(format!("{verb} failed: {e}")),
         _ => {}
     }
@@ -1190,6 +1222,7 @@ mod tests {
 
     fn sample_snapshot(name: &str) -> ProcessSnapshot {
         ProcessSnapshot {
+            failure: None,
             initialization: Default::default(),
             initialization_blockers: Vec::new(),
             name: name.to_string(),

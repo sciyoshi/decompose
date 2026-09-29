@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::traits::tokio::Stream as _;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
@@ -81,6 +81,8 @@ pub enum Response {
     StopStatus {
         complete: bool,
         errors: Vec<String>,
+        #[serde(default)]
+        failures: Vec<crate::diagnostic::Diagnostic>,
     },
     Pong {
         pid: u32,
@@ -90,14 +92,20 @@ pub enum Response {
         /// will omit the field entirely (see the `serde(default)` below).
         #[serde(default)]
         shutting_down: bool,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     Ps {
+        #[serde(default)]
+        shutting_down: bool,
         pid: u32,
         instance: String,
         processes: Vec<ProcessSnapshot>,
     },
     Ack {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Box<crate::output_model::Acknowledgment>>,
     },
     /// Reply to `ServiceRunState`. `known` is whether the service is in the
     /// daemon's process map at all; `any_running` is whether any replica is
@@ -108,7 +116,40 @@ pub enum Response {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<Box<crate::diagnostic::Diagnostic>>,
     },
+}
+
+impl Response {
+    pub fn ack(message: String) -> Self {
+        Self::Ack {
+            message,
+            result: None,
+        }
+    }
+    pub fn error(message: String) -> Self {
+        let diagnostic = crate::diagnostic::Diagnostic::error("operation_failed", message.clone());
+        Self::Error {
+            message,
+            diagnostic: Some(Box::new(diagnostic)),
+        }
+    }
+    pub fn failure(error: anyhow::Error) -> Self {
+        Self::Error {
+            message: format!("{error:#}"),
+            diagnostic: Some(Box::new(crate::diagnostic::Diagnostic::from_error(&error))),
+        }
+    }
+    pub fn into_error(
+        message: String,
+        diagnostic: Option<Box<crate::diagnostic::Diagnostic>>,
+    ) -> anyhow::Error {
+        diagnostic
+            .map(|d| *d)
+            .unwrap_or_else(|| crate::diagnostic::Diagnostic::error("remote_error", message))
+            .into()
+    }
 }
 
 /// Default timeout for a single IPC round-trip. Local sockets are fast; if
@@ -116,12 +157,37 @@ pub enum Response {
 /// Override via `DECOMPOSE_IPC_TIMEOUT_MS` (default 5000ms) — see
 /// [`crate::tuning`].
 pub async fn send_request(paths: &RuntimePaths, request: Request) -> Result<Response> {
+    if matches!(
+        &request,
+        Request::Down { .. }
+            | Request::ForceDown
+            | Request::Start { .. }
+            | Request::Stop { .. }
+            | Request::Restart { .. }
+            | Request::Kill { .. }
+            | Request::Reload { .. }
+            | Request::RemoveOrphans { .. }
+    ) {
+        let ping = tokio::time::timeout(
+            crate::tuning::ipc_timeout(),
+            send_request_inner(paths, Request::Ping),
+        )
+        .await??;
+        if !matches!(ping, Response::Pong { capabilities, .. } if capabilities.iter().any(|c| c == "structured_operations_v1"))
+        {
+            return Err(crate::diagnostic::Diagnostic::error(
+                "ipc_protocol_incompatible",
+                "daemon lacks structured operation support; restart the daemon before retrying",
+            )
+            .into());
+        }
+    }
     tokio::time::timeout(
         crate::tuning::ipc_timeout(),
         send_request_inner(paths, request),
     )
     .await
-    .context("IPC request timed out — daemon may be unresponsive")?
+    .context("ipc request timed out; daemon may be unresponsive")?
 }
 
 async fn send_request_inner(paths: &RuntimePaths, request: Request) -> Result<Response> {
@@ -140,10 +206,20 @@ async fn send_request_inner(paths: &RuntimePaths, request: Request) -> Result<Re
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
-        bail!("daemon closed the connection");
+        return Err(crate::diagnostic::Diagnostic::error(
+            "ipc_connection_closed",
+            "daemon closed the connection",
+        )
+        .into());
     }
 
-    let response: Response = serde_json::from_str(line.trim())?;
+    let response: Response = serde_json::from_str(line.trim()).map_err(|error| {
+        let mut diagnostic = crate::diagnostic::Diagnostic::from_error(
+            &anyhow::Error::new(error).context("invalid response from daemon"),
+        );
+        diagnostic.code = "ipc_invalid_response".into();
+        diagnostic
+    })?;
     Ok(response)
 }
 
@@ -227,5 +303,94 @@ mod tests {
             }
             other => panic!("wrong variant round-tripped: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn remote_diagnostics_preserve_sources_and_legacy_errors_are_not_guessed() {
+        let error =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(2)).context("failed to spawn api");
+        let encoded = serde_json::to_vec(&Response::failure(error)).unwrap();
+        let Response::Error {
+            message,
+            diagnostic,
+        } = serde_json::from_slice(&encoded).unwrap()
+        else {
+            panic!("error response");
+        };
+        let error = Response::into_error(message, diagnostic);
+        let diagnostic = crate::diagnostic::Diagnostic::from_error(&error);
+        assert_eq!(diagnostic.causes[0].os_code, Some(2));
+        assert_eq!(diagnostic.summary, "failed to spawn api");
+        let Response::Error {
+            message,
+            diagnostic,
+        } = serde_json::from_str(r#"{"type":"error","message":"Connection timed out"}"#).unwrap()
+        else {
+            panic!("legacy error");
+        };
+        let error = Response::into_error(message, diagnostic);
+        assert_eq!(
+            crate::diagnostic::Diagnostic::from_error(&error).code,
+            "remote_error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_peer_is_probed_before_any_mutating_request() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::Builder::new()
+            .prefix("dcp")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let paths = RuntimePaths {
+            socket: dir.path().join("s"),
+            pid: dir.path().join("p"),
+            daemon_log: dir.path().join("l"),
+            lock: dir.path().join("k"),
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut request)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Ping
+            ));
+            writeln!(
+                stream,
+                "{{\"type\":\"pong\",\"pid\":1,\"instance\":\"legacy\"}}"
+            )
+            .unwrap();
+            finished.recv().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let error = send_request(
+            &paths,
+            Request::Start {
+                services: vec!["api".into()],
+            },
+        )
+        .await
+        .unwrap_err();
+        done.send(()).unwrap();
+        peer.join().unwrap();
+        assert_eq!(
+            crate::diagnostic::Diagnostic::from_error(&error).code,
+            "ipc_protocol_incompatible"
+        );
     }
 }
