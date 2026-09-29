@@ -24,7 +24,7 @@ pub struct Cli {
     #[command(flatten)]
     pub output: OutputArgs,
     /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
-    #[arg(long = "file", global = true)]
+    #[arg(short = 'f', long = "file", global = true)]
     pub config_files: Vec<PathBuf>,
     /// Session/project name override for instance identity.
     #[arg(
@@ -198,6 +198,11 @@ pub struct ServiceArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct LogsArgs {
+    // Shadow the inherited argument so `logs -f` remains follow, while the
+    // root command accepts `-f FILE` and `logs --file FILE` still works.
+    /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
+    #[arg(long = "file", global = true)]
+    pub config_files: Vec<PathBuf>,
     /// Follow log output.
     #[arg(short = 'f', long = "follow")]
     pub follow: bool,
@@ -320,6 +325,7 @@ mod output_tests {
     fn diagnostic_bootstrap_observes_values_and_trailing_argv() {
         for (argv, json) in [
             (vec!["decompose", "--file", "--json", "ps"], false),
+            (vec!["decompose", "-f", "--json", "ps"], false),
             (vec!["decompose", "run", "api", "echo", "--json"], false),
             (
                 vec!["decompose", "--json", "run", "api", "echo", "--table"],
@@ -338,6 +344,43 @@ mod output_tests {
                 json,
                 "{args:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_flag_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_short_file_flags_preserve_overlay_order() {
+        let cli = Cli::try_parse_from([
+            "decompose",
+            "-f",
+            "base.yml",
+            "-f",
+            "override.yml",
+            "config",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.config_files,
+            [PathBuf::from("base.yml"), PathBuf::from("override.yml")]
+        );
+    }
+
+    #[test]
+    fn short_file_flag_coexists_with_logs_follow() {
+        for argv in [
+            vec!["decompose", "-f", "base.yml", "logs", "-f"],
+            vec!["decompose", "logs", "--file", "base.yml", "-f"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.config_files, [PathBuf::from("base.yml")]);
+            let Commands::Logs(args) = cli.command else {
+                panic!("expected logs");
+            };
+            assert!(args.follow);
         }
     }
 }
