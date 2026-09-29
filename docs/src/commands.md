@@ -103,8 +103,9 @@ when guarded work should run again.
 
 ### `decompose ps`
 
-List the current process state — name, base, pid, state glyph (running /
-ready / failed / stopped) and replica index where applicable.
+List process names, state glyphs and labels, PIDs, and failure details. Replicated
+services include a suffix such as `worker[1]` in their names. JSON output also
+includes separate `base` and `replica` fields.
 
 ### `decompose logs [FLAGS] [SERVICE...]`
 

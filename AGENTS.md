@@ -41,6 +41,15 @@ cargo doc --locked --no-deps
 
 Use `nix develop` to get a toolchain-pinned shell if you prefer.
 
+For book changes, run `mdbook build docs/` (CI uses mdBook 0.5.4), then
+`python3 scripts/check-docs.py` after building the binary. The checker validates
+local HTML links and anchors, then runs the quickstart and migration examples
+extracted from `docs/src`, plus the documented multiple-file invocation. It needs
+Python 3, a POSIX shell, and permission to bind local sockets. It uses temporary
+HOME/XDG directories and unused ports, and shuts down its daemons on failure.
+Keep these selected examples runnable; the checker deliberately does not execute
+arbitrary shell blocks elsewhere in the book.
+
 After changing `Cargo.lock` (including a package version bump), `Cargo.toml`,
 `flake.lock`, or the vendoring derivation, verify the Nix vendor hash:
 

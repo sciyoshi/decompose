@@ -50,6 +50,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --locked --no-deps
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4
+      - run: mdbook build docs/
+      - run: cargo build --locked --bin decompose
+      - name: Check book links and runnable examples
+        run: python3 scripts/check-docs.py
 
   publish-dry-run:
     name: cargo publish --dry-run
