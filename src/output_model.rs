@@ -26,9 +26,10 @@ pub struct StatusResult<'a> {
 }
 
 impl StatusResult<'_> {
-    pub fn summary(&self) -> &'static str {
+    /// Ordinary running environments need only the process table.
+    pub fn summary(&self) -> Option<&'static str> {
         use DaemonState::*;
-        match self.daemon.state {
+        let summary = match self.daemon.state {
             NotRunning => "daemon not running",
             Stopping => "daemon stopping",
             Unreachable => "daemon not responding",
@@ -44,7 +45,7 @@ impl StatusResult<'_> {
             {
                 "daemon running; no processes started"
             }
-            Running if self.processes.iter().any(|p| p.state == "running") => "daemon running",
+            Running if self.processes.iter().any(|p| p.state == "running") => return None,
             Running
                 if self.processes.iter().any(|p| {
                     matches!(p.state.as_str(), "pending" | "initializing" | "restarting")
@@ -53,7 +54,8 @@ impl StatusResult<'_> {
                 "daemon running; processes starting"
             }
             Running => "daemon running; no processes running",
-        }
+        };
+        Some(summary)
     }
 }
 

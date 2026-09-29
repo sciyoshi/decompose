@@ -298,7 +298,7 @@ fn cli_supports_json_and_table_modes() {
     let ps_table = env.run(&["ps", "--table"]);
     assert_success(&ps_table, "ps --table");
     let ps_table_text = String::from_utf8_lossy(&ps_table.stdout);
-    assert!(ps_table_text.contains("name"));
+    assert!(ps_table_text.starts_with("name"));
     assert!(ps_table_text.contains("sleeper"));
 
     let down = env.down_json();
@@ -349,7 +349,7 @@ fn default_output_mode_is_text_with_or_without_ci_and_llm() {
         &["CI", "LLM"],
     );
     assert_success(&ps_default_json, "default json ps");
-    assert!(String::from_utf8_lossy(&ps_default_json.stdout).contains("daemon running"));
+    assert!(String::from_utf8_lossy(&ps_default_json.stdout).starts_with("name"));
 
     let down = run_cmd(
         &project,

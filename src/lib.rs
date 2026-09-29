@@ -1830,7 +1830,9 @@ fn emit_ps(
             print_json(&result)?;
         }
         OutputMode::Table => {
-            crate::output::write_line(format_args!("{}", result.summary()))?;
+            if let Some(summary) = result.summary() {
+                crate::output::write_line(format_args!("{summary}"))?;
+            }
             if processes.is_empty() {
                 return Ok(());
             }

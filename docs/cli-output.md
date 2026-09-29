@@ -21,7 +21,9 @@ Consumers should ignore unfamiliar fields and event types.
 - `ps` returns `daemon: {state, pid, instance}` and `processes`. Daemon absence
   is `not_running`, with a null PID and an empty array. Failed IPC is an error,
   not evidence that the daemon stopped. Process states distinguish
-  `failed_to_start` from a nonzero exit (`failed`).
+  `failed_to_start` from a nonzero exit (`failed`). Text output starts directly
+  with the process table when processes are running; summaries appear for
+  other states, such as daemon absence or no processes started.
 - `ls` returns `environments`, each with `instance`, `daemon`, and an optional
   diagnostic for an unreachable environment.
 - Operations return `operation`, `outcome`, `daemon`, and per-instance
