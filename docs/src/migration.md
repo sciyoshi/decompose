@@ -1,43 +1,120 @@
 # Migrating from Docker Compose
 
-`decompose` is designed to feel familiar to Docker Compose users. If you already have a Docker Compose workflow, transitioning to `decompose` is straightforward for local development scenarios where you don't need containerization.
+Decompose runs native processes; it does not build images or emulate a container
+runtime. Translate the services you need for local development into host commands,
+then make their networking, storage, and readiness explicit. A Compose file is
+not a drop-in decompose configuration.
 
-## Key differences
+## Plan the conversion
 
-- **No containers** — `decompose` runs native processes directly on your host machine. There are no images to build or pull.
-- **No networking abstraction** — Services communicate over localhost. There is no bridge network or DNS-based service discovery.
-- **Shell commands** — The `command` field runs a shell command directly, rather than specifying a container entrypoint.
-- **No volumes or bind mounts** — Processes access the filesystem directly. Use `working_dir` to control the working directory.
+| Compose concept | Native equivalent |
+|-----------------|-------------------|
+| `image`, `build`, and entrypoint | Install the required binaries and dependencies on the host; write the full shell `command`. |
+| Container service names and `ports` | Connect to `127.0.0.1` and the port the process actually binds. There is no service DNS or port mapping; choose unused ports. |
+| Volumes and bind mounts | Use host paths and `working_dir`. Create required directories and manage permissions yourself. `down` does not remove application data. |
+| `healthcheck` | Define a `readiness_probe` and gate dependents with `process_healthy`. Merely starting a PID does not mean it accepts requests. |
+| Container environment | Declare child variables explicitly. Interpolation and child environments are separate; see [Environment and interpolation](environment.md). |
+| `docker compose exec` | `decompose exec` starts a new host command using locally resolved service configuration, after checking that the service is running. It does not enter a process or retrieve its live environment. |
 
-## Translating your Compose file
+Host processes share the host's filesystem, network, and OS user. Install databases
+and other tools yourself, using your usual package manager or development shell.
+Database connection URLs that previously named `db` must point at the database's
+actual host address and listening port.
 
-A Docker Compose service like:
+## A runnable conversion
+
+This example needs decompose, Python 3 available as `python3`, and a POSIX shell.
+Docker is not required to run the converted project. Start in a new directory:
+
+```sh
+mkdir native-demo
+cd native-demo
+mkdir public
+printf 'hello from the host\n' > public/index.html
+printf 'DEMO_PORT=8765\n' > .env
+cat > check.py <<'PYTHON'
+import os
+import urllib.request
+
+url = f"http://127.0.0.1:{os.environ['DEMO_PORT']}/"
+print(urllib.request.urlopen(url, timeout=5).read().decode())
+PYTHON
+```
+
+Choose another unused port in `.env` if 8765 is occupied. A small Compose project
+might serve this directory and run a check after it becomes healthy:
 
 ```yaml
 services:
-  api:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      DATABASE_URL: postgres://localhost/mydb
+  web:
+    image: python:3.12-alpine
+    working_dir: /site
+    volumes: ["./public:/site:ro"]
+    command: python3 -m http.server 8000
+    ports: ["127.0.0.1:${DEMO_PORT}:8000"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+  check:
+    image: python:3.12-alpine
+    command: python3 -c "import urllib.request; print(urllib.request.urlopen('http://web:8000/').read().decode())"
     depends_on:
-      db:
+      web:
         condition: service_healthy
 ```
 
-Becomes:
+Save this native replacement as `decompose.yml`:
 
 ```yaml
 processes:
-  api:
-    command: "cargo run --release"
-    environment:
-      DATABASE_URL: postgres://localhost/mydb
+  web:
+    command: "python3 -u -m http.server ${DEMO_PORT} --bind 127.0.0.1 --directory public"
+    readiness_probe:
+      exec:
+        command: >-
+          python3 -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:${DEMO_PORT}/')"
+      period_seconds: 3
+      timeout_seconds: 2
+  check:
+    command: "python3 check.py"
     depends_on:
-      db:
+      web:
         condition: process_healthy
 ```
+
+The native server binds the chosen host port directly and reads `public` from the
+project directory. The check connects through localhost instead of Compose DNS.
+Both services now use the installed Python, so pin its version in your development
+environment if reproducibility matters.
+
+Validate the configuration, start just the server, and wait for its HTTP probe:
+
+```sh
+decompose config
+decompose up -d --wait web
+decompose ps
+decompose run --env "PATH=$PATH" check python3 check.py
+decompose logs --tail 20 web
+decompose down
+```
+
+`run` prints `hello from the host` and returns the check command's exit
+status. The explicit `PATH` keeps Python installed by a development shell
+available to the one-off command. It runs without starting dependencies or running
+lifecycle hooks; the preceding `up --wait web` ensures the server is ready.
+Alternatively, `decompose up -d` starts both configured services, running `check`
+only after `web` is healthy. The daemon stays running after the check exits.
+If startup waiting fails, inspect `ps` and `logs`, then use `down` to clean up.
+
+For config changes and daemon ownership, see
+[Managing a running project](managing-projects.md). In particular, an existing
+daemon keeps its original shell environment even when a later CLI command has
+new variables. For automation and exit codes, see
+[Output and scripting](output.md); for failures, see
+[Troubleshooting](troubleshooting.md).
 
 ## Condition mapping
 
@@ -47,7 +124,8 @@ processes:
 | `service_completed_successfully` | `process_completed_successfully` |
 | `service_healthy` | `process_healthy` |
 
-Full documentation coming soon.
+These conditions express startup ordering. Configure the corresponding native
+probe or successful one-shot command; renaming a condition alone is insufficient.
 
 ## Lifecycle initialization
 
