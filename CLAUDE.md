@@ -194,8 +194,8 @@ Quick reference: `feat(cli):`, `fix(daemon):`, `refactor(config):`,
 
 ## Flox releases
 
-The release workflow publishes `sciyoshi/decompose` and `fellowapp/decompose`
-for Apple Silicon macOS and ARM64 and x64 Linux, then verifies installation from each
+The release workflow publishes `sciyoshi/decompose`
+for Apple Silicon macOS and ARM64 and x64 Linux, then verifies installation from the
 catalog on each platform. It uses the
 `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub `flox` environment.
 The package version comes from `Cargo.toml`; commit and push all build inputs

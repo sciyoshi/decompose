@@ -135,7 +135,7 @@ chore(deps): bump tokio to 1.44
    - Create a GitHub Release
    - Build and attach binaries for `{x86_64,aarch64}-linux-gnu` and `aarch64-apple-darwin`
    - Publish to crates.io
-   - Publish `sciyoshi/decompose` and `fellowapp/decompose` to Flox for Apple Silicon
+   - Publish `sciyoshi/decompose` to Flox for Apple Silicon
      macOS and ARM64 and x64 Linux
 
 ## Secrets required

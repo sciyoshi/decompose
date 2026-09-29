@@ -70,14 +70,14 @@ The flake also exposes a `devShell` for contributors — `nix develop` drops you
 
 ### With Flox
 
-Members of the `fellowapp` FloxHub organization can install the published
+The owner of the personal `sciyoshi` FloxHub catalog can install the published
 package into a Flox environment:
 
 ```bash
-flox install fellowapp/decompose
+flox install sciyoshi/decompose
 ```
 
-Releases publish to both `fellowapp/decompose` and `sciyoshi/decompose` for
+Releases publish to `sciyoshi/decompose` for
 Apple Silicon macOS and ARM64 and x64 Linux. The personal `sciyoshi` catalog is
 only accessible to its owner.
 
@@ -87,15 +87,14 @@ To build and publish a new version from this repository:
 flox build decompose
 # Commit and push all build inputs before publishing.
 flox publish --org sciyoshi decompose
-flox publish --org fellowapp decompose
 ```
 
 Flox reads the package version from `Cargo.toml` and publishes for the host
-platform. The release workflow runs for both catalogs on all four platforms
+platform. The release workflow runs on all three platforms
 when a version tag is pushed, then installs each published package to verify it.
 CI authenticates with the `FLOX_FLOXHUB_TOKEN` environment secret in the GitHub
 `flox` environment.
-The token must have publishing access to both catalogs.
+The token must have publishing access to the `sciyoshi` catalog.
 The workflow can also be dispatched manually with an existing release tag.
 For packaging-only corrections after a release, its optional `flox-source-ref`
 input selects a pushed source revision for Flox; its package version must still

@@ -86,7 +86,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-flox:
-    name: Publish Flox (${{ matrix.org }}, ${{ matrix.system }})
+    name: Publish Flox (${{ matrix.system }})
     needs: create-release
     environment: flox
     permissions:
@@ -94,7 +94,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        org: [sciyoshi, fellowapp]
         system: [aarch64-darwin, aarch64-linux, x86_64-linux]
         include:
           - system: aarch64-darwin
@@ -105,7 +104,7 @@ jobs:
             os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     env:
-      FLOX_ORG: ${{ matrix.org }}
+      FLOX_ORG: sciyoshi
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
