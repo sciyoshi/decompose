@@ -44,7 +44,11 @@ Stop every running service and shut the daemon down.
 
 | Flag | Description |
 |------|-------------|
-| `-t`, `--timeout SECONDS` | Override the per-service shutdown timeout before SIGKILL. |
+| `-t`, `--timeout SECONDS` | Override each service's grace period, including its shutdown command, before SIGKILL. |
+
+Services stop in dependency order (dependents first). Ctrl-C while waiting
+requests forced shutdown. See [Shutdown configuration](configuration.md#shutdown-configuration)
+for the sequence and timeout behavior.
 
 ### `decompose start [SERVICE...]`
 

@@ -429,8 +429,9 @@ readiness_probe:
 
 ## Shutdown configuration
 
-Control how processes are stopped when `decompose down`, `stop`, or `kill`
-is called.
+Control graceful shutdown for `decompose down`, `stop`, and `restart`, and
+when `up` recreates a service. `decompose kill` sends a signal directly and
+bypasses this sequence.
 
 ```yaml
 processes:
@@ -445,15 +446,32 @@ processes:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `shutdown.command` | string | `null` | Optional command to run before sending the stop signal. Useful for graceful cleanup scripts. |
-| `shutdown.signal` | integer | `15` | Signal number to send to the process. Common values: `15` (SIGTERM), `2` (SIGINT), `9` (SIGKILL). |
-| `shutdown.timeout_seconds` | integer | `10` | Seconds to wait after sending the signal before forcefully killing the process with SIGKILL. |
+| `shutdown.signal` | integer | `15` | Signal number to send to the process group. Common values: `15` (SIGTERM), `2` (SIGINT), `9` (SIGKILL). |
+| `shutdown.timeout_seconds` | integer | `10` | Total grace period in seconds for the shutdown command and process-group exit, before SIGKILL. |
 
 The shutdown sequence is:
 
-1. Run `shutdown.command` (if set) and wait for it to complete.
-2. Send the configured signal to the process.
-3. Wait up to `timeout_seconds` for the process to exit.
-4. If the process has not exited, send SIGKILL.
+1. Start the per-service `timeout_seconds` deadline.
+2. Run `shutdown.command` (if set). If it reaches the deadline, kill the
+   command's process group and continue cleanup.
+3. Send the configured signal to the service's process group.
+4. Wait for the group to exit using only the time remaining before the
+   deadline, then send SIGKILL if needed.
+
+The timeout includes the shutdown command: a command that takes 20 seconds
+with a 30-second timeout leaves about 10 seconds for the service to exit.
+Cleanup also covers descendants that remain in the process group after its
+main process exits. After SIGKILL, decompose allows up to five additional
+seconds to confirm the group has exited before reporting a cleanup failure.
+
+Among services included in the same stop operation, dependents stop before
+their dependencies. Stopping one named service does not automatically stop
+its dependents. `down --timeout SECONDS` overrides each service's grace
+period; it is not a deadline for the entire environment.
+
+Pressing Ctrl-C while `down` waits requests forced shutdown: remaining
+shutdown commands and grace periods are skipped or interrupted, and
+dependency ordering no longer delays stopping services.
 
 ---
 
