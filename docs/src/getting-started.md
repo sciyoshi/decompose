@@ -18,169 +18,128 @@ additional installation methods including Nix and building from source.
 
 ## Your first compose file
 
-Create a file called `decompose.yaml` in your project directory. This example
-defines a simple web server and a background worker:
+This walkthrough requires Python 3 (`python3 --version`) and an unused local
+port 8000. In a new directory, create `decompose.yaml` with this content:
 
 ```yaml
 processes:
   web:
-    command: "python -m http.server 8000"
-    description: "Local HTTP file server"
+    command: "python3 -u -m http.server 8000 --bind 127.0.0.1"
+    readiness_probe:
+      http_get:
+        host: "127.0.0.1"
+        port: 8000
+        path: /
+      period_seconds: 2
 
   worker:
-    command: "echo 'worker started' && sleep infinity"
-    description: "Background task runner"
-
-  logger:
-    command: "while true; do echo 'heartbeat'; sleep 5; done"
-    description: "Periodic heartbeat logger"
+    command: "while true; do echo 'worker heartbeat'; sleep 5; done"
+    depends_on:
+      web:
+        condition: process_healthy
 ```
 
-Each entry under `processes` defines a service with at least a `command` field.
-The `description` is optional but helps when reviewing `decompose ps` output.
+Each service has a shell `command`. The web service serves the current directory
+on localhost; `-u` makes Python print logs without buffering. If port 8000 is
+already occupied, change it in both the command and the probe.
+
+The HTTP readiness probe checks that the server responds. The worker waits for
+that probe to pass before it starts. See [dependency conditions](configuration.md#dependencies)
+for other ways to order services.
 
 ## Starting services
 
-Start all services in the background with the `-d` (detach) flag:
+Start the services in the background and wait until they are ready:
 
 ```bash
-decompose up -d
+decompose up -d --wait
 ```
 
-This spawns a daemon that manages the processes. Your terminal returns
-immediately so you can continue working.
+`-d` leaves the daemon running after the command returns. `--wait` keeps this
+command open until the web server is healthy and the worker is running. A
+successful result looks like this:
 
-Without `-d`, output from all services streams to your terminal. If this
-command starts a new daemon, it owns that environment: Ctrl-C shuts down the
-services and the daemon. If a daemon is already running (for example, after
-`decompose up -d`), foreground `decompose up` attaches as a viewer; Ctrl-C
-only detaches that viewer and leaves the environment running.
-
-To start only specific services, pass their names:
-
-```bash
-decompose up -d web worker
+```text
+all requested services are ready
 ```
+
+Without `--wait`, detached startup acknowledges the operation before services
+are necessarily ready. Without `-d`, output streams to your terminal. If that
+foreground command starts a new daemon, Ctrl-C shuts down its services and
+daemon. If it attaches to an existing daemon, Ctrl-C only detaches the viewer.
+
+Open <http://127.0.0.1:8000/> to see the directory listing. Use your chosen port
+if you changed the configuration.
 
 ## Checking status
-
-Use `decompose ps` to see what is running:
 
 ```bash
 decompose ps
 ```
 
-This prints a table showing each process, its PID, status, and uptime. You can
-also get machine-readable output with `--json`:
+The table shows service names, states, PIDs, and any failure details. For
+this example, a healthy result looks like the following; PIDs vary:
 
-```bash
-decompose ps --json
+```text
+name    state        pid
+web     ● healthy    71966
+worker  ● healthy    72020
 ```
+
+A running service without a readiness probe (the worker here) also displays
+`healthy`; this does not mean it passed a health check. Optional service
+`description` fields are metadata and do not appear in this table.
+
+For machine-readable status, use `decompose ps --json`. Text is the default,
+including when piping output. See [Output and scripting](output.md).
 
 ## Viewing logs
 
-Stream logs from all services in real time:
+Show the worker's recent output:
+
+```bash
+decompose logs -n 5 worker
+```
+
+For example, after one heartbeat (the PID varies):
+
+```text
+started (pid 72020)
+worker heartbeat
+```
+
+Without `-n`, `logs` prints all retained history. To follow new output from all
+services, run:
 
 ```bash
 decompose logs -f
 ```
 
-To view logs for a specific service:
+Ctrl-C stops the log viewer and leaves the services running.
+
+## Stopping and cleaning up
+
+Stop and start just the worker while keeping the environment available:
 
 ```bash
-decompose logs -f web
+decompose stop worker
+decompose start worker
 ```
 
-Use `-n` to control how many historical lines to show (default is 10):
-
-```bash
-decompose logs -n 50 worker
-```
-
-## Stopping services
-
-Shut down all services and terminate the daemon:
+When finished, stop all services and terminate the daemon:
 
 ```bash
 decompose down
 ```
 
-To stop individual services without tearing down the entire environment, use
-`decompose stop`:
-
-```bash
-decompose stop worker
-```
-
-Stopped services can be restarted later with `decompose start worker`.
-
-## Adding dependencies
-
-In most projects, services need to start in a specific order. Use `depends_on`
-to declare dependencies between processes.
-
-Here is an updated compose file where the worker waits for the web server to
-start, and the logger waits for the worker to be ready:
-
-```yaml
-processes:
-  web:
-    command: "python -m http.server 8000"
-    ready_log_line: "Serving HTTP"
-
-  worker:
-    command: "echo 'worker started' && sleep infinity"
-    depends_on:
-      web:
-        condition: process_log_ready
-
-  logger:
-    command: "while true; do echo 'heartbeat'; sleep 5; done"
-    depends_on:
-      worker:
-        condition: process_started
-```
-
-The `ready_log_line` field accepts a regex pattern. When the web server prints
-a line matching `"Serving HTTP"`, it is marked as log-ready, and the worker is
-allowed to start.
-
-Available dependency conditions:
-
-| Condition | Meaning |
-|-----------|---------|
-| `process_started` | The dependency has been started |
-| `process_completed` | The dependency has exited (any exit code) |
-| `process_completed_successfully` | The dependency exited with code 0 |
-| `process_healthy` | The dependency's readiness probe is passing |
-| `process_log_ready` | The dependency matched its `ready_log_line` pattern |
-
-## Environment variables
-
-You can set environment variables globally or per-process:
-
-```yaml
-environment:
-  SHARED_SECRET: "abc123"
-
-processes:
-  web:
-    command: "python -m http.server ${PORT}"
-    environment:
-      PORT: "8000"
-```
-
-A `.env` file in the project directory is loaded automatically. Variable
-interpolation with `${VAR}` and `${VAR:-default}` works in commands,
-descriptions, and environment values. See the
-[Configuration](configuration.md) page for the full precedence rules.
-
 ## Next steps
 
-- [Managing a running project](managing-projects.md) -- choose lifecycle
+- [Managing a running project](managing-projects.md) — choose lifecycle
   commands, target an environment, and apply configuration changes.
-- [Configuration](configuration.md) -- full YAML schema reference, environment
-  variable precedence, and interpolation rules.
-- [Commands](commands.md) -- complete list of CLI commands and flags.
-- [Migrating from Docker Compose](migration.md) -- differences and how to
-  convert an existing `docker-compose.yml`.
+- [Environment and interpolation](environment.md) — configure child
+  environments and understand when shell and file changes take effect.
+- [Configuration](configuration.md) — full YAML schema reference.
+- [Commands](commands.md) — complete list of CLI commands and flags.
+- [Troubleshooting](troubleshooting.md) — diagnose services that fail to start
+  or become ready.
+- [Migrating from Docker Compose](migration.md) — convert an existing project.

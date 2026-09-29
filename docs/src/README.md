@@ -8,7 +8,7 @@ No image builds. No container cold starts. No bridge-network translation overhea
 
 ## Features
 
-- **Familiar CLI** — Commands like `up`, `down`, `ps`, `logs`, `restart` work just like Docker Compose.
+- **Familiar CLI** — Commands like `up`, `down`, `ps`, `logs`, `restart` follow familiar Docker Compose workflows.
 - **Native processes** — No containers, no overhead. Processes run directly on your machine.
 - **Daemon architecture** — A background daemon per project manages process lifecycles and communicates via local socket IPC.
 - **Dependency management** — Define startup order with `depends_on` conditions including health checks and log readiness.

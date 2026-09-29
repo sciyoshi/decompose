@@ -146,7 +146,7 @@ processes:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `command` | string | **required after merging** | Shell command to run. Executed via the system shell (`sh -c`). Must not be empty. |
-| `description` | string | `null` | Optional human-readable description shown in `ps` output. |
+| `description` | string | `null` | Optional human-readable service description (metadata; not shown in `ps`). |
 | `working_dir` | string | project directory | Working directory for the process. Relative paths resolve from the first root config directory, including in fragments. |
 | `environment` | map or list | `{}` | Per-process environment variables. Same format as the global `environment` field. Merged on top of global vars. |
 | `env_file` | list of strings | `[]` | Additional `.env` files to load for this process. Relative paths use the project directory; `${DECOMPOSE_FILE_DIR}` addresses fragment assets. |
