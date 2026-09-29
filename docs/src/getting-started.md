@@ -48,9 +48,13 @@ decompose up -d
 ```
 
 This spawns a daemon that manages the processes. Your terminal returns
-immediately so you can continue working. Without `-d`, the output from all
-services streams to your terminal and Ctrl-C detaches (the daemon keeps
-running).
+immediately so you can continue working.
+
+Without `-d`, output from all services streams to your terminal. If this
+command starts a new daemon, it owns that environment: Ctrl-C shuts down the
+services and the daemon. If a daemon is already running (for example, after
+`decompose up -d`), foreground `decompose up` attaches as a viewer; Ctrl-C
+only detaches that viewer and leaves the environment running.
 
 To start only specific services, pass their names:
 
