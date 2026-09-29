@@ -14,7 +14,10 @@ These appear *before* the subcommand, matching `docker compose -f FILE <cmd>`.
 | `--session NAME` | Override the project/session name (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
 | `-e`, `--env-file FILE` | Extra `.env` file(s) to load on top of the auto-discovered `.env`. |
 | `--disable-dotenv` | Don't auto-load `.env` from the config directory. |
-| `--json` / `--table` | Force output format. Without either flag, JSON is used in non-TTY/CI/LLM contexts and a table is used at an interactive terminal. |
+| `--json` / `--table` | Select JSON or text output explicitly. Text is always the default, including in pipes and CI; the flags conflict. |
+
+See [Output and scripting](output.md) for JSON results, log streams, diagnostics,
+and automation examples.
 
 ## Process lifecycle
 
