@@ -8,5 +8,6 @@
 - [Commands](commands.md)
 - [Output and scripting](output.md)
 - [Terminal UI](tui.md)
+- [Troubleshooting](troubleshooting.md)
 - [Shell completion](completion.md)
 - [Migrating from Docker Compose](migration.md)

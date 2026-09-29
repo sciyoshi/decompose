@@ -108,17 +108,21 @@ ready / failed / stopped) and replica index where applicable.
 
 ### `decompose logs [FLAGS] [SERVICE...]`
 
-Print the daemon log, optionally filtered to a subset of services.
+Print retained service output, hook output, and lifecycle records, optionally
+filtered to services. Without a service filter, daemon output is included too.
+The command requires a running, reachable daemon.
 
 | Flag | Description |
 |------|-------------|
 | `-f`, `--follow` | Stream new lines as they arrive (Ctrl-C to exit). |
-| `-n`, `--tail N` | Show only the last `N` lines of backlog. `-n 0` means start streaming from now (useful with `-f`). |
+| `-n`, `--tail N` | Limit the combined backlog to the last `N` records, across selected services. Without it, read all retained backlog. `-n 0` skips backlog (useful with `-f`). |
 | `--no-pager` | Don't pipe the one-shot output through `$PAGER` / `less -R`. |
 
 When a single `SERVICE` is given, the `[name] ` prefix is stripped from each
 line. Pager honors `DECOMPOSE_PAGER`, then `PAGER`, defaulting to `less -R`.
 An empty pager env var disables paging (matches git's convention).
+See [troubleshooting](troubleshooting.md#where-logs-live-and-how-long-they-last)
+for log locations and retention.
 
 ### `decompose attach`
 
