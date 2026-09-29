@@ -99,7 +99,7 @@ using a session name, which can target the same daemon from different paths.
 
 Shell variables inherited by the daemon also take precedence during
 interpolation, so a stale shell value can mask an edited dotenv value. See
-[Environment variables](configuration.md#environment-variables) for
+[Environment and interpolation](environment.md) for
 precedence and interpolation syntax. `config`, `run`, and `exec` resolve files
 in the current CLI process and can therefore see different shell values.
 

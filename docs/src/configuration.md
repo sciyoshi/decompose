@@ -477,80 +477,11 @@ dependency ordering no longer delays stopping services.
 
 ## Environment variables
 
-### Precedence
-
-Environment variables are merged in the following order. Later sources
-override earlier ones:
-
-| Priority | Source | Notes |
-|---|---|---|
-| 1 (lowest) | `.env` file | Auto-loaded from the config directory unless `--disable-dotenv` is passed. |
-| 2 | `-e` CLI flag | Explicit env files passed on the command line. |
-| 3 | Global `environment` block | Top-level `environment` in the YAML config. |
-| 4 | Per-process `env_file` entries | Files listed in each process's `env_file` array. |
-| 5 (highest) | Per-process `environment` block | Inline environment variables on the process definition. |
-
-### Variable interpolation
-
-String fields support `${VAR}` substitution after merging. For interpolation,
-root dotenv values are overridden by the shell environment, then global
-`environment`, then per-process `environment`; reserved anchors take precedence.
-Per-process `env_file` values are loaded into children, not used for interpolation.
-Global environment values are expanded in key order. Process environment values
-use a frozen snapshot of their unexpanded values, preserving non-recursive
-substitution semantics.
-
-| Syntax | Description |
-|---|---|
-| `${VAR}` | Substitute the value of `VAR`. Empty string if unset. |
-| `$VAR` | Same as `${VAR}`. |
-| `${VAR:-default}` | Use the value of `VAR` if set; otherwise use `default`. |
-| `$$` | Literal `$` character (escape). |
-
-Interpolation is applied to these fields:
-
-- `command`
-- `description`
-- `working_dir`
-- `env_file`
-- Probe exec commands and HTTP host, scheme, and path
-- `ready_log_line`
-- `shutdown.command`
-- All environment variable values (both global and per-process)
-
-Disable interpolation globally by setting `disable_env_expansion: true` at the
-top level of the config file.
-
-### Environment format
-
-Both map and list formats are accepted anywhere environment variables are
-defined:
-
-```yaml
-# Map format
-environment:
-  PORT: "3000"
-  DEBUG: "true"
-
-# List format
-environment:
-  - PORT=3000
-  - DEBUG=true
-```
-
-### .env file format
-
-The `.env` file uses simple `KEY=VALUE` lines. Blank lines and lines starting
-with `#` are ignored:
-
-```bash
-# Database settings
-DATABASE_URL=postgres://localhost/mydb
-REDIS_URL=redis://localhost:6379
-
-# Feature flags
-ENABLE_CACHE=true
-```
+See [Environment and interpolation](environment.md) for variable precedence,
+`${VAR}` versus `$${VAR}`, env file formats, and the difference between a
+supervised service and a one-off command. The guide also explains when env
+file edits take effect and why changing your shell environment requires
+restarting the daemon.
 
 ---
 

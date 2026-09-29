@@ -3,6 +3,7 @@
 - [Introduction](README.md)
 - [Getting Started](getting-started.md)
 - [Managing a running project](managing-projects.md)
+- [Environment and interpolation](environment.md)
 - [Configuration](configuration.md)
 - [Commands](commands.md)
 - [Output and scripting](output.md)
