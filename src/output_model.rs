@@ -63,6 +63,9 @@ impl StatusResult<'_> {
 pub struct Environment {
     pub instance: String,
     pub daemon: Daemon,
+    pub project_dir: Option<std::path::PathBuf>,
+    pub config_files: Option<Vec<std::path::PathBuf>>,
+    pub process_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<crate::diagnostic::Diagnostic>,
 }

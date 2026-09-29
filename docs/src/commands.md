@@ -11,7 +11,7 @@ These appear *before* the subcommand, matching `docker compose -f FILE <cmd>`.
 | Flag | Description |
 |------|-------------|
 | `-f`, `--file FILE` | Config file path. Repeatable; later files overlay earlier ones. |
-| `--session NAME` | Override the project/session name (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
+| `--session NAME` | Use a project/session name or a full instance ID from `ls` (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
 | `-e`, `--env-file FILE` | Extra `.env` file(s) to load on top of the auto-discovered `.env`. |
 | `--disable-dotenv` | Don't auto-load `.env` from the config directory. |
 | `--json` / `--table` | Select JSON or text output explicitly. Text is always the default, including in pipes and CI; the flags conflict. |
@@ -146,7 +146,12 @@ without starting anything.
 ### `decompose ls`
 
 List decompose environments discovered in the runtime socket directory,
-showing each instance ID and whether it responds to IPC.
+showing each instance ID, daemon state, total process count (including stopped
+processes and replicas), project directory, and config files. Config files are
+shown relative to the project directory where possible. `--json` includes
+`project_dir`, `config_files` (full paths), and `process_count` on each environment.
+Older daemons do not report these details: the table shows `-` and JSON uses
+`null` until the environment is restarted with the updated binary.
 
 ## Ad-hoc commands
 

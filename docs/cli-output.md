@@ -24,7 +24,8 @@ Consumers should ignore unfamiliar fields and event types.
   `failed_to_start` from a nonzero exit (`failed`). Text output starts directly
   with the process table when processes are running; summaries appear for
   other states, such as daemon absence or no processes started.
-- `ls` returns `environments`, each with `instance`, `daemon`, and an optional
+- `ls` returns `environments`, each with `instance`, `daemon`, `project_dir`,
+  `config_files`, `process_count`, and an optional
   diagnostic for an unreachable environment.
 - Operations return `operation`, `outcome`, `daemon`, and per-instance
   `services: [{name, outcome}]`. Overall outcomes are `accepted`, `completed`,

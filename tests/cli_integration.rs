@@ -805,63 +805,77 @@ fn ls_lists_running_environments() {
     let (_root, project, runtime, state, config) = setup_project();
     let home = project.parent().expect("parent").join("home");
     let cfg = config.to_string_lossy().to_string();
+    let overlay = project.join("local.yaml");
+    fs::write(&overlay, "processes: {}\n").unwrap();
+    let overlay_arg = overlay.to_string_lossy().to_string();
 
     let up = run_cmd(
         &project,
         &runtime,
         &state,
         &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
+        &[
+            "--file",
+            &cfg,
+            "--file",
+            &overlay_arg,
+            "up",
+            "--detach",
+            "--json",
+        ],
         &[],
         &[],
     );
     assert_success(&up, "up");
 
-    let ls = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["ls", "--json"],
-        &[],
-        &[],
-    );
-    assert_success(&ls, "ls --json");
-    let parsed: Value = serde_json::from_slice(&ls.stdout).expect("ls json");
-    let envs = parsed
-        .get("environments")
-        .and_then(Value::as_array)
-        .expect("environments array");
-    assert!(!envs.is_empty(), "should have at least one environment");
-    assert_eq!(
-        envs[0]["daemon"].get("state").and_then(Value::as_str),
-        Some("running")
-    );
+    let checks = std::panic::catch_unwind(|| {
+        let ls = run_cmd(&home, &runtime, &state, &home, &["ls", "--json"], &[], &[]);
+        assert_success(&ls, "ls --json");
+        let parsed: Value = serde_json::from_slice(&ls.stdout).expect("ls json");
+        let envs = parsed
+            .get("environments")
+            .and_then(Value::as_array)
+            .expect("environments array");
+        assert!(!envs.is_empty(), "should have at least one environment");
+        assert_eq!(
+            envs[0]["daemon"].get("state").and_then(Value::as_str),
+            Some("running")
+        );
 
-    let ls_table = run_cmd(
-        &project,
-        &runtime,
-        &state,
-        &home,
-        &["ls", "--table"],
-        &[],
-        &[],
-    );
-    assert_success(&ls_table, "ls --table");
-    let table_text = String::from_utf8_lossy(&ls_table.stdout);
-    assert!(table_text.contains("instance"));
-    assert!(table_text.contains("running"));
+        assert_eq!(
+            envs[0]["project_dir"],
+            project.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            envs[0]["config_files"],
+            serde_json::json!([
+                config.canonicalize().unwrap(),
+                overlay.canonicalize().unwrap()
+            ])
+        );
+        assert_eq!(envs[0]["process_count"], 1);
+
+        let ls_table = run_cmd(&home, &runtime, &state, &home, &["ls", "--table"], &[], &[]);
+        assert_success(&ls_table, "ls --table");
+        let table_text = String::from_utf8_lossy(&ls_table.stdout);
+        assert!(table_text.contains("instance"));
+        assert!(table_text.contains("running"));
+        assert!(table_text.contains(project.canonicalize().unwrap().to_string_lossy().as_ref()));
+        assert!(table_text.contains("decompose.yaml, local.yaml"));
+        assert!(table_text.contains("processes"));
+    });
 
     let down = run_cmd(
         &project,
         &runtime,
         &state,
         &home,
-        &["--file", &cfg, "down", "--json"],
+        &["--file", &cfg, "--file", &overlay_arg, "down", "--json"],
         &[],
         &[],
     );
     assert_success(&down, "down");
+    checks.unwrap();
 }
 
 #[test]
@@ -1554,6 +1568,65 @@ processes:
         elapsed
     );
 }
+#[test]
+fn session_accepts_instance_ids_from_ls() {
+    let (root, project, runtime, state, _) = setup_project();
+    let home = root.path().join("home");
+    let run = |cwd: &Path, args: &[&str]| {
+        run_cmd(
+            cwd,
+            &runtime,
+            &state,
+            &home,
+            args,
+            &[],
+            &["DECOMPOSE_SESSION"],
+        )
+    };
+
+    for session in [None, Some("named-session")] {
+        let mut args = vec![];
+        if let Some(name) = session {
+            args.extend(["--session", name]);
+        }
+        let mut up = args.clone();
+        up.extend(["up", "-d"]);
+        assert_success(&run(&project, &up), "up");
+
+        let checks = std::panic::catch_unwind(|| {
+            let listed = run(&home, &["ls", "--json"]);
+            assert_success(&listed, "ls");
+            let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+            let environments = listed["environments"].as_array().unwrap();
+            assert_eq!(environments.len(), 1);
+            let id = environments[0]["instance"].as_str().unwrap();
+
+            // A different directory with no config must still reach the daemon.
+            let ps = run(&home, &["--session", id, "ps", "--json"]);
+            assert_success(&ps, "ps by instance ID");
+            let ps: Value = serde_json::from_slice(&ps.stdout).unwrap();
+            assert_eq!(ps["daemon"]["instance"], id);
+            assert_eq!(ps["daemon"]["state"], "running");
+            assert_eq!(ps["processes"].as_array().unwrap().len(), 1);
+            assert_eq!(ps["processes"][0]["name"], "sleeper");
+
+            assert_success(&run(&home, &["--session", id, "down"]), "down by ID");
+            let ps = run(&project, &{
+                let mut ps_args = args.clone();
+                ps_args.extend(["ps", "--json"]);
+                ps_args
+            });
+            assert_success(&ps, "ps after down by ID");
+            let ps: Value = serde_json::from_slice(&ps.stdout).unwrap();
+            assert_eq!(ps["daemon"]["state"], "not_running");
+        });
+
+        args.push("down");
+        assert_success(&run(&project, &args), "cleanup");
+        checks.unwrap();
+    }
+}
+
 #[test]
 fn two_sessions_coexist_independently() {
     let (_root, project, runtime, state, _config) = setup_project();

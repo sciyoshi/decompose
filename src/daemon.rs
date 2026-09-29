@@ -1851,6 +1851,9 @@ async fn handle_client(stream: Stream, state: SharedState) -> Result<()> {
                 instance: guard.instance.clone(),
                 shutting_down: guard.shutdown_requested,
                 capabilities: vec!["structured_operations_v1".into()],
+                project_dir: Some(guard.cwd.clone()),
+                config_files: Some(guard.config_files.clone()),
+                process_count: Some(guard.processes.len()),
             }
         }
         Request::ShutdownBudget { timeout_seconds } => {

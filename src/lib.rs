@@ -394,7 +394,7 @@ async fn run_run(global: GlobalConfig, args: RunArgs) -> Result<()> {
 async fn run_exec(global: GlobalConfig, args: ExecArgs) -> Result<()> {
     // `exec` requires a running service. Preflight against the daemon before
     // doing any local work so users get a clear "service not running" error.
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
 
     let response = match send_request(
         &paths,
@@ -953,7 +953,7 @@ async fn run_down(
     output_mode: OutputMode,
     timeout: Option<u64>,
 ) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
 
     let mut acknowledgment = Acknowledgment {
         outcome: Outcome::Completed,
@@ -1081,7 +1081,7 @@ pub(crate) async fn stop_environment(
 }
 
 async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
     let response = match send_request(&paths, Request::Ps).await {
         Ok(response) => response,
         Err(err) if is_no_daemon_error(&err, &paths) => {
@@ -1136,7 +1136,7 @@ async fn run_ps(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
 }
 
 async fn run_tui(global: GlobalConfig) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
         _ => bail!(
@@ -1147,7 +1147,7 @@ async fn run_tui(global: GlobalConfig) -> Result<()> {
 }
 
 async fn run_attach(global: GlobalConfig, output_mode: OutputMode) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
@@ -1176,7 +1176,7 @@ async fn run_attach(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
 }
 
 async fn run_logs(global: GlobalConfig, args: LogsArgs, mode: OutputMode) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
 
     match send_request(&paths, Request::Ping).await {
         Ok(Response::Pong { .. }) => {}
@@ -1322,7 +1322,7 @@ fn spawn_pager() -> Option<std::process::Child> {
 }
 
 async fn run_service_command(global: GlobalConfig, args: ServiceArgs, op: ServiceOp) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
     let output_mode = args.output.resolve();
 
     let daemon = query_daemon(&paths).await?;
@@ -1467,7 +1467,7 @@ async fn run_config(global: GlobalConfig, output_mode: OutputMode) -> Result<()>
 }
 
 async fn run_kill(global: GlobalConfig, args: KillArgs) -> Result<()> {
-    let (_, _, paths) = runtime_context(&global.config_files, global.session.as_deref()).await?;
+    let paths = resolve_runtime_paths(&global.config_files, global.session.as_deref())?;
     let output_mode = args.output.resolve();
 
     let signal = parse_signal(&args.signal)?;
@@ -1570,18 +1570,31 @@ async fn run_ls(output_mode: OutputMode) -> Result<()> {
                 .unwrap_or("unknown")
                 .to_string();
             let paths = runtime_paths_for(&instance)?;
+            let mut project_dir = None;
+            let mut config_files = None;
+            let mut process_count = None;
             let (state, pid, diagnostic) = match send_request(&paths, Request::Ping).await {
                 Ok(Response::Pong {
-                    pid, shutting_down, ..
-                }) => (
-                    if shutting_down {
-                        DaemonState::Stopping
-                    } else {
-                        DaemonState::Running
-                    },
-                    Some(pid),
-                    None,
-                ),
+                    pid,
+                    shutting_down,
+                    project_dir: dir,
+                    config_files: files,
+                    process_count: count,
+                    ..
+                }) => {
+                    project_dir = dir;
+                    config_files = files;
+                    process_count = count;
+                    (
+                        if shutting_down {
+                            DaemonState::Stopping
+                        } else {
+                            DaemonState::Running
+                        },
+                        Some(pid),
+                        None,
+                    )
+                }
                 Err(error) if is_no_daemon_error(&error, &paths) => continue,
                 Err(error) => (
                     DaemonState::Unreachable,
@@ -1605,6 +1618,9 @@ async fn run_ls(output_mode: OutputMode) -> Result<()> {
                 },
                 instance,
                 diagnostic,
+                project_dir,
+                config_files,
+                process_count,
             });
         }
     }
@@ -1619,15 +1635,46 @@ async fn run_ls(output_mode: OutputMode) -> Result<()> {
             if result.environments.is_empty() {
                 crate::output::write_line(format_args!("no running environments"))?;
             } else {
-                crate::output::write_line(format_args!("instance                         state"))?;
+                crate::output::write_line(format_args!(
+                    "{:<16} {:<14} {:<9} {:<40} config files",
+                    "instance", "state", "processes", "project"
+                ))?;
                 for environment in result.environments {
                     let state = match environment.daemon.state {
                         DaemonState::Running => "running",
                         DaemonState::Stopping => "stopping",
                         _ => "not responding",
                     };
+                    let project = environment
+                        .project_dir
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "-".into());
+                    let files = environment
+                        .config_files
+                        .as_ref()
+                        .map(|files| {
+                            files
+                                .iter()
+                                .map(|path| {
+                                    environment
+                                        .project_dir
+                                        .as_ref()
+                                        .and_then(|dir| path.strip_prefix(dir).ok())
+                                        .unwrap_or(path)
+                                        .display()
+                                        .to_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_else(|| "-".into());
+                    let count = environment
+                        .process_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "-".into());
                     crate::output::write_line(format_args!(
-                        "{:<32} {state}",
+                        "{:<16} {state:<14} {count:<9} {project:<40} {files}",
                         environment.instance
                     ))?;
                 }
@@ -1637,20 +1684,21 @@ async fn run_ls(output_mode: OutputMode) -> Result<()> {
     Ok(())
 }
 
-async fn runtime_context(
+fn resolve_runtime_paths(
     config_files_arg: &[PathBuf],
     session: Option<&str>,
-) -> Result<(
-    std::path::PathBuf,
-    Vec<std::path::PathBuf>,
-    crate::model::RuntimePaths,
-)> {
-    let cwd = env::current_dir().context("failed to read current directory")?;
-    let config_files = resolve_config_paths(config_files_arg, &cwd)?;
-    let config_dir = config_files[0].parent().unwrap_or(&cwd).to_path_buf();
-    let instance = build_instance_id(session, &config_dir, &config_files);
-    let paths = runtime_paths_for(&instance)?;
-    Ok((cwd, config_files, paths))
+) -> Result<crate::model::RuntimePaths> {
+    // Explicit sessions do not depend on local configuration. This also lets
+    // IDs from `ls` target daemons from a directory without a compose file.
+    let instance = if session.is_some() {
+        build_instance_id(session, std::path::Path::new(""), &[])
+    } else {
+        let cwd = env::current_dir().context("failed to read current directory")?;
+        let config_files = resolve_config_paths(config_files_arg, &cwd)?;
+        let config_dir = config_files[0].parent().unwrap_or(&cwd);
+        build_instance_id(None, config_dir, &config_files)
+    };
+    runtime_paths_for(&instance)
 }
 
 fn filter_log_lines<'a>(lines: &[&'a str], processes: &[String]) -> Vec<&'a str> {

@@ -26,7 +26,7 @@ pub struct Cli {
     /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
     #[arg(short = 'f', long = "file", global = true)]
     pub config_files: Vec<PathBuf>,
-    /// Session/project name override for instance identity.
+    /// Session/project name or full instance ID from `decompose ls`.
     #[arg(
         long = "session",
         alias = "project-name",

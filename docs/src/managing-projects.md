@@ -41,10 +41,14 @@ decompose -f /path/to/project/decompose.yaml --session demo up -d
 decompose -f /path/to/project/decompose.yaml --session demo logs -f
 ```
 
-Still supply the configuration path when outside the project: commands
-resolve a configuration path even with a session name. Keep the same runtime
-directory settings across terminals so both commands find the same socket.
-`decompose ls` lists discovered environments.
+You can also use a full instance ID printed by `decompose ls`, for example
+`decompose --session 0123456789abcdef ps`. Session values consisting of exactly
+16 lowercase hex digits are interpreted as instance IDs, not names.
+Inspection and control commands such as `ps`, `logs`, `attach`, and `down`
+can target a session from any directory without `--file`. Commands that load
+configuration, such as `up`, still need the correct configuration path.
+Keep the same runtime directory settings across terminals so commands find
+the same socket.
 
 ## Choosing a command
 

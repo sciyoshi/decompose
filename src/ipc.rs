@@ -94,6 +94,12 @@ pub enum Response {
         shutting_down: bool,
         #[serde(default)]
         capabilities: Vec<String>,
+        #[serde(default)]
+        project_dir: Option<std::path::PathBuf>,
+        #[serde(default)]
+        config_files: Option<Vec<std::path::PathBuf>>,
+        #[serde(default)]
+        process_count: Option<usize>,
     },
     Ps {
         #[serde(default)]
@@ -235,6 +241,22 @@ pub fn to_socket_name(path: &Path) -> Result<interprocess::local_socket::Name<'s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_pong_has_unknown_environment_metadata() {
+        let response: Response =
+            serde_json::from_str(r#"{"type":"pong","pid":123,"instance":"0123456789abcdef"}"#)
+                .unwrap();
+        assert!(matches!(
+            response,
+            Response::Pong {
+                project_dir: None,
+                config_files: None,
+                process_count: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn request_rejects_plain_garbage() {

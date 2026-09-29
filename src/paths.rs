@@ -75,7 +75,9 @@ pub fn create_dir_secure(path: &Path) -> Result<()> {
 
 /// Build an instance identity string.
 ///
-/// If `session` is provided, the identity is based solely on the session name.
+/// A session matching a full instance ID (16 lowercase hex digits) is used
+/// directly, so IDs printed by `ls` can target the same environment.
+/// Otherwise, if `session` is provided, identity is based solely on its name.
 /// Otherwise, it is based on the config directory and the set of config files
 /// (sorted for order-independence).
 pub fn build_instance_id(
@@ -83,6 +85,15 @@ pub fn build_instance_id(
     config_dir: &Path,
     config_files: &[PathBuf],
 ) -> String {
+    if let Some(id) = session
+        && id.len() == 16
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return id.to_owned();
+    }
+
     let mut hasher = Sha256::new();
 
     if let Some(name) = session {
@@ -247,6 +258,29 @@ mod tests {
         // Session override ignores config_dir and files
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 16);
+    }
+
+    #[test]
+    fn instance_id_can_be_used_as_session() {
+        let files = vec![PathBuf::from("/a/decompose.yaml")];
+        for session in [None, Some("my-project")] {
+            let id = build_instance_id(session, Path::new("/a"), &files);
+            assert_eq!(build_instance_id(Some(&id), Path::new("/b"), &[]), id);
+        }
+    }
+
+    #[test]
+    fn session_names_that_are_not_full_ids_are_hashed() {
+        for name in [
+            "abc123",
+            "0123456789abcdef0",
+            "0123456789abcdeg",
+            "../some/session",
+        ] {
+            let id = build_instance_id(Some(name), Path::new("/a"), &[]);
+            assert_ne!(id, name);
+            assert_eq!(id.len(), 16);
+        }
     }
 
     #[test]
