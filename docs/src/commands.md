@@ -117,23 +117,40 @@ showing each instance ID and whether it responds to IPC.
 
 ### `decompose run [FLAGS] SERVICE COMMAND...`
 
-Run a one-off command using the named service's environment (working dir,
-`environment`, `env_file`). Does **not** require a running daemon, does not
-attach to a running replica, and is not added to the supervised process
-list — fire-and-forget.
+Run a one-off command using the named service's configured working directory
+and environment. No running daemon is required. The command runs locally,
+outside the supervised process list, and does not execute startup hooks.
+Decompose connects it to your terminal, waits for it to finish, and returns
+its exit code (128 + signal if terminated by a signal on Unix).
+
+Configuration and env files are resolved by this CLI invocation. Interpolation
+therefore sees your current shell environment, which may differ from the
+environment inherited by an already-running daemon. The child receives only
+the resolved service environment and explicit `--env` overrides; it does not
+inherit unrelated shell variables.
 
 | Flag | Description |
 |------|-------------|
 | `-w`, `--workdir DIR` | Override the service's working directory for this command. |
 | `--env KEY=VALUE` | Extra environment variable. Repeatable; overrides values from the service environment. |
 
-Example: `decompose run web bundle exec rails console`.
+Put decompose flags before `SERVICE`: everything after the service name is
+the command and its arguments. Decompose executes them directly, without
+adding a shell. For pipes or expansion inside the child, invoke a shell
+explicitly:
+
+```sh
+decompose run web bundle exec rails console
+decompose run --env MESSAGE=hello web sh -c 'printf "%s\\n" "$MESSAGE"'
+```
 
 ### `decompose exec [FLAGS] SERVICE COMMAND...`
 
 Like `run`, but requires the daemon to be up *and* at least one replica of
-`SERVICE` to be in the `running` state. Useful when you want a one-off
-command to see the same env mutations the supervisor applied.
+`SERVICE` to be in the `running` state. This is a precondition check: the
+command still runs locally with freshly resolved configuration, waits for
+completion, and returns the child's exit code. It does not enter a running
+replica, retrieve that replica's environment, or execute startup hooks.
 
 | Flag | Description |
 |------|-------------|
