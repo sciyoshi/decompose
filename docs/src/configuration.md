@@ -227,9 +227,18 @@ These are top-level keys in the YAML file, alongside `processes`.
 
 | Value | Behavior |
 |---|---|
-| `wait_all` | Keep the daemon running until all processes finish or `decompose down` is called. This is the default. |
-| `exit_on_failure` | Stop all processes and shut down the daemon if any process exits with a non-zero exit code. |
-| `exit_on_end` | Stop all processes and shut down the daemon when any process exits, regardless of exit code. |
+| `wait_all` | Keep the daemon running, even after all processes finish. This is the default. |
+| `exit_on_failure` | Stop all processes and shut down the daemon when a process reaches a failed terminal state (non-zero exit, signal termination, or failure to start), or a startup hook fails. |
+| `exit_on_end` | Stop all processes and shut down the daemon when a service's main process reaches an exited state, regardless of exit code. Hook completion or failure alone does not trigger shutdown. |
+
+With `wait_all`, completed services remain visible in `decompose ps`, and the
+daemon stays available for commands such as `decompose start`. Run
+`decompose down` when you are finished with the environment.
+
+Automatic restart policies are applied before a main-process exit becomes a
+terminal state: while a service is restarting, that exit does not trigger
+`exit_on_failure` or `exit_on_end`. An intentional `decompose stop` marks a
+service as stopped rather than exited, so it does not trigger these exit modes.
 
 ---
 
