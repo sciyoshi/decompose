@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "decompose"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "ansi-to-tui",
  "anstyle",
