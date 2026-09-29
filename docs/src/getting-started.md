@@ -177,6 +177,8 @@ descriptions, and environment values. See the
 
 ## Next steps
 
+- [Managing a running project](managing-projects.md) -- choose lifecycle
+  commands, target an environment, and apply configuration changes.
 - [Configuration](configuration.md) -- full YAML schema reference, environment
   variable precedence, and interpolation rules.
 - [Commands](commands.md) -- complete list of CLI commands and flags.

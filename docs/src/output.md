@@ -65,7 +65,10 @@ confirms signal delivery, not process death.
 
 `up -d --wait` waits for initialization hooks and the selected services'
 started/healthy criteria before returning. Dependencies are included unless
-`--no-deps` is used. Readiness is a point-in-time check, not a continuing
+`--no-deps` is used for the wait selection. On an existing daemon, that flag
+does not prevent the start request from launching dependencies; see
+[service selection](managing-projects.md#service-selection-and-disabled-services).
+Readiness is a point-in-time check, not a continuing
 health guarantee. With no eligible services, the wait succeeds immediately.
 The flag requires `-d` and conflicts with `--no-start`.
 

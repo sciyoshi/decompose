@@ -29,14 +29,18 @@ Start services and (by default) attach to streaming logs until Ctrl-C.
 |------|-------------|
 | `-d`, `--detach` | Start the daemon and return immediately. |
 | `--wait` | With `-d`, wait until every selected service is initialized and started/healthy before returning. Requires `-d`/`--detach`. |
-| `--no-deps` | Don't auto-start dependencies of the named services. |
+| `--no-deps` | Omit dependency expansion when launching a new daemon; see the existing-daemon limitation below. |
 | `--remove-orphans` | Stop and drop services that exist in the daemon but not in the current config. |
 | `--force-recreate` | Recreate every service regardless of whether its config hash changed. Conflicts with `--no-recreate`. |
 | `--no-recreate` | Keep existing services even if their config hash differs. |
 | `--no-start` | Register new/changed services but leave them in `not_started`. |
 | `--tui` | Start services and immediately open the TUI. Implies `-d` (services keep running after the TUI exits). |
 
-If no `SERVICE` is given, all services are started.
+If no `SERVICE` is given, all eligible services are started; disabled services
+remain parked. On an existing daemon, `up` reloads the whole project even
+when service names are supplied, and `--no-deps` does not suppress dependency
+expansion by the subsequent start request. See [Managing a running project](managing-projects.md)
+for service selection, reloads, and environment ownership.
 
 ### `decompose down [FLAGS]`
 
@@ -52,8 +56,9 @@ for the sequence and timeout behavior.
 
 ### `decompose start [SERVICE...]`
 
-Start services that are currently in `not_started` or `stopped`. With no
-arguments, starts everything.
+Start services that have not started, stopped, exited, or failed to start,
+using their stored configuration and also starting dependencies. With no arguments, starts all eligible services; name
+a disabled service explicitly to enable it. This command does not reload files.
 
 ### `decompose stop [SERVICE...]`
 
@@ -72,6 +77,27 @@ Send a signal directly to running services (skips the configured
 | Flag | Description |
 |------|-------------|
 | `-s`, `--signal SIGNAL` | Signal name (`SIGTERM`, `TERM`, `USR1`) or number (`9`, `15`). Defaults to `SIGKILL`. |
+
+### Startup initialization and waiting
+
+`up` and `start` run pre-start and post-start hooks for new/stopped replicas;
+`restart` reevaluates both phases. Repeated `up`/`start` on an unchanged running
+replica does not rerun hooks. Scale-up runs them only for new replicas; scale-down
+and recreation cancel and clean up affected hook processes.
+
+`up -d` acknowledges launch asynchronously. `up -d --wait` also requires hook
+success before applying its usual started/healthy criterion. Hook failures fail
+waiting promptly with the service, phase, hook, and cause. Successfully exited
+one-shot jobs use the latest attempt's historical initialization result. A job
+that exits before post-start completes has not initialized successfully.
+
+The overall CLI wait deadline is controlled by
+`DECOMPOSE_DAEMON_READY_TIMEOUT_MS` (default five minutes). On expiry it reports
+the active hook or readiness condition; it does not cancel detached work.
+Individual hook deadlines remain independent. `run` and `exec` never execute
+startup hooks for their one-off commands. There is no skip-hooks or cache-reset
+command: restart to retry, and intentionally change a guard or its owned data
+when guarded work should run again.
 
 ## Inspection
 
@@ -168,24 +194,3 @@ replica, retrieve that replica's environment, or execute startup hooks.
 Emit a shell completion script for the given shell to stdout. Supported
 shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`. See
 [Shell completion](completion.md) for installation snippets.
-
-### Startup initialization and waiting
-
-`up` and `start` run pre-start and post-start hooks for new/stopped replicas;
-`restart` reevaluates both phases. Repeated `up`/`start` on an unchanged running
-replica does not rerun hooks. Scale-up runs them only for new replicas; scale-down
-and recreation cancel and clean up affected hook processes.
-
-`up -d` acknowledges launch asynchronously. `up -d --wait` also requires hook
-success before applying its usual started/healthy criterion. Hook failures fail
-waiting promptly with the service, phase, hook, and cause. Successfully exited
-one-shot jobs use the latest attempt's historical initialization result. A job
-that exits before post-start completes has not initialized successfully.
-
-The overall CLI wait deadline is controlled by
-`DECOMPOSE_DAEMON_READY_TIMEOUT_MS` (default five minutes). On expiry it reports
-the active hook or readiness condition; it does not cancel detached work.
-Individual hook deadlines remain independent. `run` and `exec` never execute
-startup hooks for their one-off commands. There is no skip-hooks or cache-reset
-command: restart to retry, and intentionally change a guard or its owned data
-when guarded work should run again.
