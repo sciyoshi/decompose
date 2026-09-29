@@ -410,11 +410,20 @@ processes:
 |---|---|---|---|
 | `http_get.host` | string | `127.0.0.1` | Host to connect to. |
 | `http_get.port` | integer | **required** | Port number. |
-| `http_get.scheme` | string | `http` | URL scheme. Must be `http` or `https`. |
+| `http_get.scheme` | string | `http` | Use `http`; the built-in probe only supports plain HTTP. |
 | `http_get.path` | string | `/` | Request path. |
 
-An HTTP check is considered healthy if the response status code is in the
-2xx range.
+An HTTP check succeeds when the response status code is 200–399. Redirect
+responses count as success; the probe does not follow redirects.
+
+Although configuration parsing accepts `scheme: https`, the built-in probe
+does not establish TLS. For an HTTPS endpoint, use an `exec` probe instead:
+
+```yaml
+readiness_probe:
+  exec:
+    command: "curl --fail --silent --show-error https://localhost:8443/health"
+```
 
 ---
 
