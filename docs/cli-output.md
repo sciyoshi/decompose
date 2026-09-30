@@ -36,6 +36,24 @@ Consumers should ignore unfamiliar fields and event types.
   `renamed`, and `scaled`. `up -d --wait` emits its result only after readiness;
   failure details describe the environment left running. `--wait` conflicts
   with `--no-start`.
+  In text mode, `up -d --wait` also prints lifecycle progress on stdout while
+  waiting: process starts/exits, pre/post-start hook starts and outcomes, and
+  changes in process state, initialization stage, and readiness. Only selected
+  services (including dependencies unless `--no-deps`) are shown; previous
+  lifecycle events and application/hook command output are omitted. Use
+  `logs -f` to see command output. JSON mode retains one final result, with
+  failures and warnings on stderr.
+  On a TTY, progress updates in place: each service/replica has a spinner,
+  ready checkmark, or failure marker, with its current state and hook progress.
+  State columns align, and markers and states share the `ps` color palette
+  (respecting `NO_COLOR`). Ready rows show only `ready`; completed hook counts
+  disappear, including while a service is still waiting for readiness.
+  The overall bar counts ready services, not elapsed time. The display uses
+  only its own lines, leaves the final state visible, and does not clear the
+  screen or enter an alternate screen. Long rows are truncated; short terminals
+  prioritize failures and pending services. A resize starts a fresh block to
+  preserve earlier terminal output. Redirected output and `TERM=dumb` use
+  line-by-line lifecycle messages.
 - `logs`, `logs -f`, `attach`, and attached `up` emit JSON Lines. Application
   stderr remains stdout data with `stream: "stderr"`. Log records retain
   service, process, replica, timestamp, message, partial-record, and hook

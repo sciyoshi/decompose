@@ -553,3 +553,186 @@ fn default_pager_launches_directly_without_shell_on_path() {
             .contains("pager-output")
     );
 }
+
+fn drain_terminal(master: &mut fs::File, bytes: &mut Vec<u8>) {
+    use std::io::Read;
+    let mut buffer = [0; 8192];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
+                break;
+            }
+            Err(error) => panic!("PTY read: {error}"),
+        }
+    }
+}
+
+#[test]
+fn wait_tty_updates_in_place_and_finishes_on_success_failure_interrupt_and_timeout() {
+    use std::os::fd::AsRawFd;
+    let sgr = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    for outcome in ["success", "failure", "interrupt", "timeout"] {
+        let mut env = Env::new(&format!(
+            r#"
+processes:
+  app:
+    command: 'exec sleep 120'
+    post_start:
+      - name: setup
+        command: 'while ! test -f release; do sleep 0.05; done; exit {}'
+"#,
+            if outcome == "failure" { 1 } else { 0 }
+        ));
+        env.up();
+        let (mut master, slave) = terminal_pair();
+        // SAFETY: master is a live owned fd; F_SETFL only updates its file flags.
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let mut child = env
+            .command(&["up", "-d", "--wait"])
+            .env("TERM", "xterm-256color")
+            .env("NO_COLOR", "")
+            .env(
+                "DECOMPOSE_DAEMON_READY_TIMEOUT_MS",
+                if outcome == "timeout" {
+                    "1500"
+                } else {
+                    "15000"
+                },
+            )
+            .stdout(slave.try_clone().unwrap())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut bytes = Vec::new();
+        wait(|| {
+            drain_terminal(&mut master, &mut bytes);
+            let text = String::from_utf8_lossy(&bytes);
+            text.contains("post_start:setup") && text.contains("⠙")
+        });
+        assert!(child.try_wait().unwrap().is_none());
+        if outcome == "interrupt" {
+            signal(child.id(), Signal::SIGINT);
+        } else if outcome != "timeout" {
+            fs::write(env.path("release"), "").unwrap();
+        }
+        wait(|| {
+            drain_terminal(&mut master, &mut bytes);
+            child.try_wait().unwrap().is_some()
+        });
+        let output = child.wait_with_output().unwrap();
+        drain_terminal(&mut master, &mut bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        let yellow = decompose::output::style_for_status("initializing", true)
+            .render()
+            .to_string();
+        assert!(text.contains(&yellow), "{text}");
+        if outcome == "failure" {
+            let red = decompose::output::style_for_status("failed", true)
+                .render()
+                .to_string();
+            assert!(text.contains(&red), "{text}");
+        }
+        let text = sgr.replace_all(&text, "");
+        assert!(text.contains("\x1b[2A"), "{text}");
+        assert!(!text.contains("\x1b[2J"), "{text}");
+        assert!(!text.contains("\x1b[?"), "{text}");
+        assert!(text.contains("hooks 0/1"), "{text}");
+        match outcome {
+            "success" => {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(text.contains("Ready [============] 1/1 ready"), "{text}");
+                assert!(text.contains("✓ app"), "{text}");
+                assert!(!text.contains("hooks 1/1"), "{text}");
+                assert!(text.contains("✓ app  ready"), "{text}");
+            }
+            "failure" => {
+                assert_eq!(output.status.code(), Some(1));
+                assert!(text.contains("✗ app"), "{text}");
+                assert!(text.contains("Startup failed"), "{text}");
+            }
+            "interrupt" => {
+                assert_eq!(output.status.code(), Some(130));
+                assert!(text.contains("Wait ended"), "{text}");
+                assert!(text.contains("- app"), "{text}");
+                assert!(alive(env.daemon.unwrap()));
+            }
+            _ => {
+                assert_eq!(output.status.code(), Some(1));
+                assert!(text.contains("Wait ended"), "{text}");
+                assert!(String::from_utf8_lossy(&output.stderr).contains("timed out"));
+                assert!(alive(env.daemon.unwrap()));
+            }
+        }
+    }
+}
+
+#[test]
+fn wait_tty_shares_ps_colors_aligns_states_and_honors_plain_output() {
+    use std::os::fd::AsRawFd;
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").unwrap();
+    let mut env = Env::new(
+        "processes:\n  app:\n    command: exec sleep 120\n    pre_start: [{name: setup, command: 'true'}]\n  database:\n    command: exec sleep 120\n",
+    );
+    env.up();
+    for mode in ["dumb", "json", "color", "no_color"] {
+        let (mut master, slave) = terminal_pair();
+        // SAFETY: master is a live owned fd; F_SETFL only updates its file flags.
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let args = if mode == "json" {
+            vec!["up", "-d", "--wait", "--json"]
+        } else {
+            vec!["up", "-d", "--wait"]
+        };
+        let output = env
+            .command(&args)
+            .env(
+                "TERM",
+                if mode == "dumb" {
+                    "dumb"
+                } else {
+                    "xterm-256color"
+                },
+            )
+            .env("NO_COLOR", if mode == "no_color" { "1" } else { "" })
+            .stdout(slave.try_clone().unwrap())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut bytes = Vec::new();
+        drain_terminal(&mut master, &mut bytes);
+        if mode == "json" {
+            assert!(!bytes.contains(&0x1b));
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["readiness"], "satisfied");
+        } else if mode == "dumb" {
+            assert!(!bytes.contains(&0x1b));
+            assert!(String::from_utf8_lossy(&bytes).contains("[app] running; ready"));
+        } else {
+            let text = String::from_utf8_lossy(&bytes);
+            let green = decompose::output::style_for_status("healthy", true)
+                .render()
+                .to_string();
+            assert_eq!(text.contains(&green), mode == "color", "{text}");
+            let plain = ansi.replace_all(&text, "");
+            assert!(plain.contains("✓ app       ready"), "{plain}");
+            assert!(plain.contains("✓ database  ready"), "{plain}");
+            assert!(!plain.contains("running"), "{plain}");
+            assert!(!plain.contains("hooks"), "{plain}");
+        }
+    }
+}

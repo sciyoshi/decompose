@@ -49,6 +49,7 @@ mod process_table;
 mod shutdown;
 pub mod tui;
 pub mod tuning;
+mod wait_progress;
 
 use std::env;
 use std::io::Write as _;
@@ -70,6 +71,7 @@ use crate::output_model::{
     Readiness, ServiceOutcome, ServiceResult,
 };
 use crate::paths::{build_instance_id, runtime_dir, runtime_paths_for};
+use crate::wait_progress::WaitProgress;
 
 /// A one-off child's status, returned to library callers without terminating
 /// their process. The binary preserves this status without a CLI diagnostic.
@@ -494,6 +496,14 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     } else {
         None
     };
+    // Establish the cursor before starting/reloading services so fast startup
+    // events are retained, while previous attempts on a live daemon stay hidden.
+    let mut progress = if args.wait && output_mode == OutputMode::Table {
+        let progress = WaitProgress::new(&paths).await?;
+        Some(progress)
+    } else {
+        None
+    };
     let (pid, state, got_ctrl_c, reload_summary) = ensure_daemon_running(
         &global,
         &args,
@@ -514,7 +524,11 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     // Request::RemoveOrphans variant is still used by other code paths.
 
     if let Some(selected) = &wait_set {
-        wait_for_services_ready(&paths, selected).await?;
+        let result = wait_for_services_ready(&paths, selected, progress.as_mut()).await;
+        if let Some(progress) = progress.as_mut() {
+            progress.finish(result.is_ok())?;
+        }
+        result?;
     }
     let mut acknowledgment = if let Some(result) = reload_summary {
         result
@@ -2010,13 +2024,12 @@ fn cleanup_stale_files(paths: &crate::model::RuntimePaths) {
     let _ = std::fs::remove_file(&paths.lock);
 }
 
-/// Poll the daemon until all non-disabled processes are started (or healthy,
-/// if a readiness probe is configured). Times out after
-/// [`tuning::daemon_ready_timeout`] (5 minutes by default; override with
-/// `DECOMPOSE_DAEMON_READY_TIMEOUT_MS`).
+/// Poll until selected services are initialized and started/healthy, bounded by
+/// [`tuning::daemon_ready_timeout`] (5 minutes by default).
 async fn wait_for_services_ready(
     paths: &crate::model::RuntimePaths,
     selected: &std::collections::HashSet<String>,
+    mut progress: Option<&mut WaitProgress>,
 ) -> Result<()> {
     let mut signals = shutdown::Signals::new()?;
     let deadline = tokio::time::Instant::now() + crate::tuning::daemon_ready_timeout();
@@ -2037,6 +2050,10 @@ async fn wait_for_services_ready(
             )
             .into());
         };
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.begin();
+            progress.events(paths, selected).await?;
+        }
         let eligible = processes.into_iter().filter(|p| {
             selected.contains(&p.base) && p.state != "disabled" && p.state != "not_started"
         });
@@ -2046,6 +2063,9 @@ async fn wait_for_services_ready(
             if (process.state != "pending" && process.initialization.failure().is_some())
                 || matches!(process.state.as_str(), "failed" | "failed_to_start")
             {
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.state(&process, false)?;
+                }
                 failures.push(process);
             } else {
                 let initialized = process.initialization.hooks.is_empty()
@@ -2055,12 +2075,18 @@ async fn wait_for_services_ready(
                 } else {
                     matches!(process.state.as_str(), "running" | "exited")
                 };
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.state(&process, initialized && ready)?;
+                }
                 if !initialized && process.state == "exited" {
                     failures.push(process);
                 } else if !initialized || !ready {
                     pending.push(process);
                 }
             }
+        }
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.render()?;
         }
         let failed = !failures.is_empty();
         if failed || (tokio::time::Instant::now() >= deadline && !pending.is_empty()) {
@@ -2119,9 +2145,19 @@ async fn wait_for_services_ready(
         if pending.is_empty() {
             return Ok(());
         }
-        tokio::select! {
-            _ = signals.recv() => return Err(diagnostic::Diagnostic::error("interrupted", "interrupted while waiting for service readiness; environment remains running").into()),
-            _ = sleep(crate::tuning::daemon_ready_poll()) => {}
+        let poll = sleep(crate::tuning::daemon_ready_poll());
+        tokio::pin!(poll);
+        loop {
+            let animated = progress.as_deref().is_some_and(WaitProgress::is_inline);
+            tokio::select! {
+                _ = signals.recv() => return Err(diagnostic::Diagnostic::error("interrupted", "interrupted while waiting for service readiness; environment remains running").into()),
+                _ = &mut poll => break,
+                _ = sleep(Duration::from_millis(100)), if animated => {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.render()?;
+                    }
+                }
+            }
         }
     }
 }

@@ -8190,3 +8190,118 @@ fn json_logs_preserve_streams_and_validation_warnings_are_diagnostics() {
     assert_eq!(warning["severity"], "warning");
     assert_eq!(warning["code"], "probe_timing_no_slack");
 }
+
+#[test]
+fn wait_progress_streams_hooks_and_readiness_without_replaying_history() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  db:
+    command: 'sleep 100'
+  svc:
+    command: 'echo application-output; sleep 100'
+    depends_on: {db: {condition: process_started}}
+    pre_start:
+      - {name: prepare, command: 'echo hook-output'}
+    post_start:
+      - name: setup
+        command: 'while ! test -f release; do sleep 0.05; done; touch ready'
+    readiness_probe:
+      exec: {command: 'test -f ready'}
+      period_seconds: 2
+  other:
+    command: 'sleep 100'
+"#,
+    );
+    let progress_path = env.project.join("progress");
+    let progress_file = fs::File::create(&progress_path).unwrap();
+    env.up_started = true;
+    let mut child = Command::new(bin_path())
+        .current_dir(&env.project)
+        .env("XDG_RUNTIME_DIR", &env.runtime)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("HOME", &env.home)
+        .args(["up", "-d", "--wait", "svc"])
+        .stdout(progress_file)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = fs::read_to_string(&progress_path).unwrap();
+        if text.contains("[post_start:setup] hook started") {
+            assert!(child.try_wait().unwrap().is_none());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "missing live progress: {text}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(env.project.join("release"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_success(&out, "wait with live progress");
+    let text = fs::read_to_string(&progress_path).unwrap();
+    assert!(text.contains("[pre_start:prepare] hook started"), "{text}");
+    assert!(
+        text.contains("[pre_start:prepare] hook succeeded"),
+        "{text}"
+    );
+    assert!(text.contains("[post_start:setup] hook succeeded"), "{text}");
+    assert!(text.contains("[svc] started (pid "), "{text}");
+    assert!(text.contains("[svc] running; ready"), "{text}");
+    assert!(text.contains("[db] running; ready"), "{text}");
+    assert!(text.contains("all requested services are ready"), "{text}");
+    assert!(!text.contains("application-output"), "{text}");
+    assert!(!text.contains("hook-output"), "{text}");
+    assert!(!text.contains("[other]"), "{text}");
+
+    let again = env.run(&["up", "-d", "--wait", "svc"]);
+    assert_success(&again, "wait on ready service");
+    let text = String::from_utf8_lossy(&again.stdout);
+    assert!(text.contains("[svc] running; ready"), "{text}");
+    assert!(!text.contains("hook started"), "{text}");
+    assert!(!text.contains("started (pid"), "{text}");
+
+    let no_deps = env.run(&["up", "-d", "--wait", "--no-deps", "svc"]);
+    assert_success(&no_deps, "wait without dependencies");
+    assert!(!String::from_utf8_lossy(&no_deps.stdout).contains("[db]"));
+
+    let json = env.run(&["up", "-d", "--wait", "svc", "--json"]);
+    assert_success(&json, "JSON wait");
+    let result: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(result["readiness"], "satisfied");
+    assert!(
+        json.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    env.down_json();
+}
+
+#[test]
+fn wait_progress_reports_hook_failure_before_terminal_diagnostic() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: 'sleep 100'
+    pre_start:
+      - {name: broken, command: 'exit 1'}
+"#,
+    );
+    env.up_started = true;
+    let out = env.run(&["up", "-d", "--wait"]);
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("[pre_start:broken] hook started"), "{text}");
+    assert!(text.contains("hook failed"), "{text}");
+    assert!(text.contains("failed_to_start"), "{text}");
+    assert!(!text.contains("all requested services are ready"));
+    assert!(!out.stderr.is_empty());
+    // The daemon retains initialization failures and reports them on shutdown.
+    let _ = env.run(&["down", "--json"]);
+}
