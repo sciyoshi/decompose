@@ -736,3 +736,45 @@ fn wait_tty_shares_ps_colors_aligns_states_and_honors_plain_output() {
         }
     }
 }
+
+#[test]
+fn reload_after_stop_waits_for_changed_service_cleanup() {
+    let config = r#"
+processes:
+  app:
+    command: 'exec sleep 120'
+    shutdown:
+      command: 'sleep 2; touch cleaned'
+      timeout_seconds: 5
+  target:
+    command: 'exec sleep 120'
+"#;
+    let mut env = Env::new(config);
+    env.up();
+    env.run(&["up", "-d", "--wait"]);
+    env.run(&["stop", "target"]);
+    // The simple stop/up sequence must work without recreating other services.
+    let before: Value = serde_json::from_slice(&env.run(&["ps", "--json"]).stdout).unwrap();
+    env.run(&["up", "-d", "--wait", "target"]);
+    let after: Value = serde_json::from_slice(&env.run(&["ps", "--json"]).stdout).unwrap();
+    assert_eq!(before["processes"][0]["pid"], after["processes"][0]["pid"]);
+    assert!(!env.path("cleaned").exists());
+    env.run(&["stop", "target"]);
+    fs::write(
+        env.path("decompose.yaml"),
+        config.replace("  app:\n", "  app:\n    description: updated\n"),
+    )
+    .unwrap();
+    let output = env
+        .command(&["up", "-d", "--wait", "target"])
+        .env("DECOMPOSE_IPC_TIMEOUT_MS", "500")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(env.path("cleaned").exists());
+    assert!(alive(env.daemon.unwrap()));
+}

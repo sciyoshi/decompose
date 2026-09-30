@@ -158,11 +158,11 @@ impl Response {
     }
 }
 
-/// Default timeout for a single IPC round-trip. Local sockets are fast; if
-/// the daemon hasn't responded in a few seconds it's almost certainly hung.
-/// Override via `DECOMPOSE_IPC_TIMEOUT_MS` (default 5000ms) — see
-/// [`crate::tuning`].
+/// Bound IPC round-trips with `DECOMPOSE_IPC_TIMEOUT_MS` (default 5000ms).
+/// Reload also allows the daemon's shutdown budget: its response waits for
+/// changed generations to finish cleanup before replacing them.
 pub async fn send_request(paths: &RuntimePaths, request: Request) -> Result<Response> {
+    let is_reload = matches!(&request, Request::Reload { .. });
     if matches!(
         &request,
         Request::Down { .. }
@@ -188,12 +188,48 @@ pub async fn send_request(paths: &RuntimePaths, request: Request) -> Result<Resp
             .into());
         }
     }
-    tokio::time::timeout(
-        crate::tuning::ipc_timeout(),
-        send_request_inner(paths, request),
-    )
-    .await
-    .context("ipc request timed out; daemon may be unresponsive")?
+    let ipc_timeout = crate::tuning::ipc_timeout();
+    let timeout = if is_reload {
+        // Unlike Stop/Restart, Reload acknowledges only after cleanup. Query
+        // the budget under the ordinary short deadline so an unresponsive
+        // daemon still fails promptly before we submit the mutation.
+        let response = tokio::time::timeout(
+            ipc_timeout,
+            send_request_inner(
+                paths,
+                Request::ShutdownBudget {
+                    timeout_seconds: None,
+                },
+            ),
+        )
+        .await
+        .context("timed out querying config reload shutdown budget")??;
+        match response {
+            Response::ShutdownBudget { seconds } => {
+                std::time::Duration::from_secs(seconds).saturating_add(ipc_timeout)
+            }
+            Response::Error {
+                message,
+                diagnostic,
+            } => return Err(Response::into_error(message, diagnostic)),
+            _ => {
+                return Err(crate::diagnostic::Diagnostic::error(
+                    "ipc_unexpected_response",
+                    "unexpected response to reload shutdown budget query",
+                )
+                .into());
+            }
+        }
+    } else {
+        ipc_timeout
+    };
+    tokio::time::timeout(timeout, send_request_inner(paths, request))
+        .await
+        .context(if is_reload {
+            "timed out waiting for config reload; daemon may still be applying changes"
+        } else {
+            "ipc request timed out; daemon may be unresponsive"
+        })?
 }
 
 async fn send_request_inner(paths: &RuntimePaths, request: Request) -> Result<Response> {

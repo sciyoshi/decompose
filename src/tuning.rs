@@ -7,6 +7,8 @@
 //! These are not part of the YAML schema; they're controlled by process
 //! environment variables so they can be set once per shell without churning
 //! per-project config files.
+//! Reload adds the daemon's shutdown budget to the IPC timeout because it
+//! waits for changed services to finish cleanup before replying.
 //!
 //! Precedence and fallback: each getter reads a single env var, parses it as
 //! `u64` milliseconds, and falls back to the documented default. Malformed

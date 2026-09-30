@@ -36,6 +36,9 @@ Consumers should ignore unfamiliar fields and event types.
   `renamed`, and `scaled`. `up -d --wait` emits its result only after readiness;
   failure details describe the environment left running. `--wait` conflicts
   with `--no-start`.
+  Reloading changed services waits for their shutdown cleanup before replacement;
+  its IPC deadline includes the daemon's shutdown budget in addition to the
+  ordinary `DECOMPOSE_IPC_TIMEOUT_MS` request timeout.
   In text mode, `up -d --wait` also prints lifecycle progress on stdout while
   waiting: process starts/exits, pre/post-start hook starts and outcomes, and
   changes in process state, initialization stage, and readiness. Only selected
