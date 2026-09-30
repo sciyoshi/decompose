@@ -190,6 +190,7 @@ decompose completion elvish > ~/.config/elvish/lib/decompose.elv
 - `Ctrl-C` or TERM stops an environment launched by foreground `up` and waits for cleanup. When `up` attaches to an existing environment, Ctrl-C only detaches.
 - `up -d` and `up --tui` start environments that outlive their client. Leaving `attach`, `logs -f`, or the TUI does not stop services.
 - `decompose up -d` starts and returns immediately.
+- `decompose up -d --wait` waits for initialization and readiness, with an inline progress display on terminals and lifecycle messages when redirected. Use `--json` for one final machine-readable result.
 - `decompose ps` reports empty state instead of error when nothing is running.
 - Use `decompose down` from any tab/agent to stop the environment.
 

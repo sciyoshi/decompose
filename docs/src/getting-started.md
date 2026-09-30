@@ -56,12 +56,20 @@ decompose up -d --wait
 ```
 
 `-d` leaves the daemon running after the command returns. `--wait` keeps this
-command open until the web server is healthy and the worker is running. A
-successful result looks like this:
+command open until the web server is healthy and the worker is running. On a
+terminal, service rows update in place with spinners while waiting and green
+checkmarks when ready. The completed display looks like this:
 
 ```text
+Ready [============] 2/2 ready
+  ✓ web     ready
+  ✓ worker  ready
 all requested services are ready
 ```
+
+Redirected output prints lifecycle messages instead of updating in place.
+Use `--json` for one final result without progress output. See
+[wait progress](output.md#wait-progress) for output and terminal behavior.
 
 Without `--wait`, detached startup acknowledges the operation before services
 are necessarily ready. Without `-d`, output streams to your terminal. If that

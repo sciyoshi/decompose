@@ -11,6 +11,38 @@ other conditions, such as `daemon not running` or
 `daemon running; no processes started`. Do not parse these human-readable
 messages to decide whether a command succeeded: use its exit status and JSON.
 
+## Wait progress
+
+`decompose up -d --wait` updates a compact display in place on terminals:
+
+```text
+Starting [========----] 2/3 ready
+  ✓ db      ready
+  ⠙ web     initializing post_start:migrate; executing; hooks 0/1
+  ✓ worker  ready
+```
+
+The bar counts ready service instances, including replicas; it does not estimate
+time remaining. Markers and states use the same colors as `ps`: green for ready,
+yellow for pending work, and red for failures. Ready rows show just `ready`, and
+completed hook counts disappear even if a service is still waiting for its probe.
+`NO_COLOR` disables colors.
+
+The display updates only its own lines, preserves earlier terminal output, and
+leaves the final state visible. It does not clear the screen or use an alternate
+screen. Long rows are truncated, short terminals prioritize failures and pending
+services, and resizing starts a fresh block to avoid overwriting earlier output.
+
+When stdout is redirected or `TERM=dumb`, progress becomes line-by-line lifecycle
+messages and state changes on stdout. Previous events are not replayed. Progress
+covers the services being waited on and excludes application and hook command
+output; use `decompose logs -f` in another terminal for that output.
+
+`--json` suppresses progress and keeps the single final result described below.
+Errors and warnings go to stderr. Ctrl-C ends the readiness wait with exit code
+130 and leaves the environment running; timeout and startup failures also leave
+detached work running for inspection.
+
 ## Results
 
 Finite queries and lifecycle commands produce one JSON document on stdout

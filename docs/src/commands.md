@@ -91,7 +91,13 @@ waiting promptly with the service, phase, hook, and cause. Successfully exited
 one-shot jobs use the latest attempt's historical initialization result. A job
 that exits before post-start completes has not initialized successfully.
 
-The overall CLI wait deadline is controlled by
+On terminals, `up -d --wait` shows an in-place service display with spinners,
+hook activity, readiness, and failures. Redirected output prints lifecycle
+messages; `--json` emits only the final result. See
+[wait progress](output.md#wait-progress). Ctrl-C ends the wait and leaves the
+environment running.
+
+The readiness wait deadline is controlled by
 `DECOMPOSE_DAEMON_READY_TIMEOUT_MS` (default five minutes). On expiry it reports
 the active hook or readiness condition; it does not cancel detached work.
 Individual hook deadlines remain independent. `run` and `exec` never execute

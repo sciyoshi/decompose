@@ -78,6 +78,23 @@ to choose between `up` and a full `down` followed by `up`.
 
 ## The CLI cannot reach the daemon
 
+### A config reload times out
+
+On an existing daemon, `up` reloads the whole project even when you name one
+service. Changes to other services can require their shutdown commands and
+process cleanup to finish before reload replies. Current clients add the
+daemon's shutdown budget to the ordinary `DECOMPOSE_IPC_TIMEOUT_MS` deadline
+(five seconds by default); readiness waiting starts after reload completes.
+
+Older clients applied only the short IPC timeout to reload, so legitimate
+cleanup could produce `failed to reload daemon config` followed by
+`ipc request timed out; daemon may be unresponsive`. Update the client if you
+encounter this behavior. A timeout does not roll back the request: the daemon
+may still be applying changes. Inspect `ps` and logs before retrying. To start a
+stopped service without reloading configuration, use `decompose start SERVICE`.
+
+### Check discovery and connection settings
+
 Use `decompose ps` for the targeted project and `decompose --json ls` to
 inspect discovered instances. `daemon not running` means no live daemon was
 found for that identity; `up -d` starts one. A connection error or an
