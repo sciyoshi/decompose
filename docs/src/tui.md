@@ -9,9 +9,10 @@ decompose tui
 Use the same `--file` or `--session` options you used to start the environment.
 You can also start it and open the UI with `decompose up --tui`.
 
-The upper pane lists process state; the lower pane shows combined logs from
-all services. Selecting a process chooses the target for service actions;
-it does not filter the logs. Press Tab to switch pane focus.
+The upper pane lists process state; the lower pane shows logs for the selected
+process (only that replica when a service has multiple replicas). Selecting a
+process loads its recent logs and resumes following new output. Search and
+copying use this filtered buffer. Press Tab to switch pane focus.
 
 ## Leaving and stopping
 

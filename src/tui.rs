@@ -1,6 +1,6 @@
 //! Preliminary TUI for `decompose up --tui`.
 //!
-//! Two-pane layout: process list on top, interleaved log stream on bottom.
+//! Two-pane layout: process list on top, selected process logs on bottom.
 //! Polls the daemon for process snapshots via IPC and tails service log
 //! files directly (same reader `decompose logs` uses). Mouse capture is
 //! intentionally off so native terminal drag-select still works.
@@ -118,6 +118,7 @@ struct App {
     focus: Focus,
     logs: VecDeque<LogLine>,
     log_reader: crate::logs::Reader,
+    log_filter: Option<String>,
     /// When true, the log view snaps to the bottom on each new line. Flipped
     /// off when the user scrolls up, back on when they hit End.
     follow: bool,
@@ -144,6 +145,7 @@ impl App {
             focus: Focus::List,
             logs: VecDeque::with_capacity(BUFFER_CAP),
             log_reader: crate::logs::Reader::default(),
+            log_filter: None,
             follow: true,
             log_scrollback: 0,
             status_message: None,
@@ -329,10 +331,9 @@ fn restore_terminal(term: &mut Term) -> Result<()> {
 async fn run_app(term: &mut Term, paths: RuntimePaths) -> Result<()> {
     let mut app = App::new(paths);
 
-    preload_log_tail(&mut app).await;
-
     // Prime the process list so the first render isn't empty.
     refresh_processes(&mut app).await;
+    poll_log(&mut app).await;
 
     let mut events = EventStream::new();
     let mut ps_tick = interval(PS_POLL_INTERVAL);
@@ -375,25 +376,14 @@ async fn run_app(term: &mut Term, paths: RuntimePaths) -> Result<()> {
                 Err(e) => app.set_status(format!("shutdown task failed: {e}")),
             }
         }
+        // Selection can change through keyboard input or a refreshed process list.
+        // Load its history before drawing so the pane never shows another process.
+        if app.selected_service().map(|p| &p.name) != app.log_filter.as_ref() {
+            poll_log(&mut app).await;
+        }
         term.draw(|f| draw(f, &mut app))?;
     }
     Ok(())
-}
-
-/// Open with recent context, retaining reader positions for the live tail.
-async fn preload_log_tail(app: &mut App) {
-    match app
-        .log_reader
-        .poll(&app.paths.daemon_log, &[], Some(500))
-        .await
-    {
-        Ok(lines) => {
-            for line in lines {
-                app.push_log_line(&line);
-            }
-        }
-        Err(error) => app.set_status(format!("failed to read logs: {error}")),
-    }
 }
 
 async fn refresh_processes(app: &mut App) {
@@ -423,9 +413,23 @@ async fn refresh_processes(app: &mut App) {
 }
 
 async fn poll_log(app: &mut App) {
+    let filter = app.selected_service().map(|p| p.name.clone());
+    let changed = filter != app.log_filter;
+    if changed {
+        app.log_filter = filter;
+        app.log_reader = crate::logs::Reader::default();
+        app.logs.clear();
+        app.log_scrollback = 0;
+        app.follow = true;
+    }
+    let filters: Vec<String> = app.log_filter.iter().cloned().collect();
     match app
         .log_reader
-        .poll(&app.paths.daemon_log, &[], Some(BUFFER_CAP))
+        .poll(
+            &app.paths.daemon_log,
+            &filters,
+            Some(if changed { 500 } else { BUFFER_CAP }),
+        )
         .await
     {
         Ok(lines) => {
@@ -833,7 +837,8 @@ fn draw_log_pane(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Logs;
     let indicator = if app.follow { "●" } else { "❚❚" };
     let title = format!(
-        " logs  {}  {} lines  (tab:switch  p:pause  End:follow) ",
+        " logs: {}  {}  {} lines  (tab:switch  p:pause  End:follow) ",
+        app.log_filter.as_deref().unwrap_or("all"),
         indicator,
         app.logs.len()
     );
@@ -1209,6 +1214,86 @@ mod tests {
         assert_eq!(app.list_state.selected(), Some(2));
         move_selection(&mut app, -99); // clamps at 0
         assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn selected_process_filters_history_live_logs_and_switching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut paths = sample_paths();
+        paths.daemon_log = tmp.path().join("instance.log");
+        let store = crate::logs::Store::new(&paths.daemon_log).unwrap();
+        let first = store.writer("api", 1).unwrap();
+        let second = store.writer("api", 2).unwrap();
+        first
+            .lock()
+            .unwrap()
+            .write("api[1]", "stdout", "first", false)
+            .unwrap();
+        second
+            .lock()
+            .unwrap()
+            .write("api[2]", "stderr", "second error", false)
+            .unwrap();
+        let mut app = App::new(paths);
+        app.processes = vec![sample_snapshot("api[1]"), sample_snapshot("api[2]")];
+        app.list_state.select(Some(0));
+        app.log_viewport_height = 10;
+
+        poll_log(&mut app).await;
+        assert_eq!(app.visible_log_lines().collect::<Vec<_>>(), ["first"]);
+        first
+            .lock()
+            .unwrap()
+            .write("api[1]", "stdout", "live", false)
+            .unwrap();
+        poll_log(&mut app).await;
+        assert_eq!(
+            app.visible_log_lines().collect::<Vec<_>>(),
+            ["first", "live"]
+        );
+        app.search.input = "error".into();
+        app.search.recompile();
+        jump_to_match(&mut app, 1);
+        assert!(app.follow, "other replicas must not produce search matches");
+
+        scroll_logs(&mut app, 10);
+        handle_key(&mut app, KeyCode::Char('G'), KeyModifiers::NONE).await;
+        poll_log(&mut app).await;
+        assert!(app.follow);
+        assert_eq!(app.log_scrollback, 0);
+        assert_eq!(
+            app.visible_log_lines().collect::<Vec<_>>(),
+            ["second error"]
+        );
+        first
+            .lock()
+            .unwrap()
+            .write("api[1]", "stdout", "while away", false)
+            .unwrap();
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        poll_log(&mut app).await;
+        poll_log(&mut app).await;
+        assert_eq!(
+            app.visible_log_lines().collect::<Vec<_>>(),
+            ["first", "live", "while away"]
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_process_filters_legacy_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut paths = sample_paths();
+        paths.daemon_log = tmp.path().join("instance.log");
+        std::fs::write(&paths.daemon_log, "[api] hello\n[db] other\n").unwrap();
+        let mut app = App::new(paths);
+        app.processes = vec![sample_snapshot("api"), sample_snapshot("db")];
+        app.list_state.select(Some(0));
+        app.log_viewport_height = 10;
+        poll_log(&mut app).await;
+        assert_eq!(app.visible_log_lines().collect::<Vec<_>>(), ["hello"]);
+        move_selection(&mut app, 1);
+        poll_log(&mut app).await;
+        assert_eq!(app.visible_log_lines().collect::<Vec<_>>(), ["other"]);
     }
 
     fn sample_paths() -> RuntimePaths {
