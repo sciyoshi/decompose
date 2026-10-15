@@ -11,11 +11,12 @@ use crate::output::OutputArgs;
     about,
     after_help = "\
 Quick start:
-  decompose up          Start all services and attach
-  decompose up -d       Start detached
-  decompose ps          Show running processes
-  decompose logs -f     Follow logs
-  decompose down        Stop everything
+  decompose up                Start in background and wait until ready
+  decompose up -d             Start in background without waiting
+  decompose up --foreground   Start and stream logs
+  decompose ps                Show running processes
+  decompose logs -f           Follow logs
+  decompose down              Stop everything
 
 Config files: decompose.yml, decompose.yaml, compose.yml, compose.yaml
 Docs: https://github.com/sciyoshi/decompose"
@@ -47,7 +48,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Start the environment.
+    /// Start the environment in the background and wait until ready.
     Up(UpArgs),
     /// Stop the environment daemon and its managed processes.
     Down(DownArgs),
@@ -159,12 +160,15 @@ pub struct DownArgs {
 pub struct UpArgs {
     #[arg(skip)]
     pub output: OutputArgs,
-    /// Start and return immediately.
+    /// Start in the background without waiting for readiness (unless --wait).
     #[arg(short = 'd', long = "detach")]
     pub detach: bool,
-    /// Wait until all services are initialized and healthy/started (requires -d).
-    #[arg(long = "wait", requires = "detach", conflicts_with = "no_start")]
+    /// Wait until all services are initialized and healthy/started (the default).
+    #[arg(long = "wait", conflicts_with = "no_start")]
     pub wait: bool,
+    /// Stream logs in the foreground; Ctrl-C stops an environment started here.
+    #[arg(long, conflicts_with_all = ["detach", "wait", "tui"])]
+    pub foreground: bool,
     /// Do not start dependency processes automatically.
     #[arg(long = "no-deps")]
     pub no_deps: bool,
@@ -177,16 +181,22 @@ pub struct UpArgs {
     /// Keep existing processes even if their config hash differs.
     #[arg(long = "no-recreate")]
     pub no_recreate: bool,
-    /// Create/register new/changed processes but don't start them.
+    /// Create/register new/changed processes without starting or waiting for them.
     #[arg(long = "no-start")]
     pub no_start: bool,
     /// Start only these processes (and their dependencies, unless --no-deps).
     pub processes: Vec<String>,
-    /// Start services, then open the interactive TUI. Implies `--detach`:
-    /// the daemon keeps running after the TUI exits. Same as
-    /// `decompose up -d` followed by `decompose tui`.
+    /// Start services and immediately open the interactive TUI (unless --wait).
+    /// The daemon keeps running after the TUI exits.
     #[arg(long = "tui")]
     pub tui: bool,
+}
+
+impl UpArgs {
+    /// Resolve the implicit wait after accounting for explicit startup modes.
+    pub(crate) fn wait_for_readiness(&self) -> bool {
+        self.wait || !(self.detach || self.foreground || self.tui || self.no_start)
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -345,6 +355,49 @@ mod output_tests {
                 json,
                 "{args:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod up_tests {
+    use super::*;
+
+    #[test]
+    fn startup_modes_resolve_defaults_and_explicit_overrides() {
+        for (flags, foreground, wait) in [
+            (vec![], false, true),
+            (vec!["--wait"], false, true),
+            (vec!["-d"], false, false),
+            (vec!["--detach", "--wait"], false, true),
+            (vec!["--foreground"], true, false),
+            (vec!["--tui"], false, false),
+            (vec!["--tui", "--wait"], false, true),
+            (vec!["-d", "--tui"], false, false),
+            (vec!["--no-start"], false, false),
+            (vec!["-d", "--no-start"], false, false),
+            (vec!["--foreground", "--no-start"], true, false),
+        ] {
+            let cli = Cli::try_parse_from(["decompose", "up"].into_iter().chain(flags)).unwrap();
+            let Commands::Up(args) = cli.command else {
+                panic!("expected up");
+            };
+            assert_eq!(args.foreground, foreground, "{args:?}");
+            assert_eq!(args.wait_for_readiness(), wait, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn incompatible_startup_flags_are_rejected() {
+        for flags in [
+            ["--foreground", "-d"],
+            ["--foreground", "--wait"],
+            ["--foreground", "--tui"],
+            ["--wait", "--no-start"],
+        ] {
+            let error =
+                Cli::try_parse_from(["decompose", "up"].into_iter().chain(flags)).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
 }

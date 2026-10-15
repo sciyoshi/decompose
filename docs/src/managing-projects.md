@@ -5,12 +5,14 @@ commands in other terminals talk to it over a local socket.
 
 ## Ownership and attaching
 
-`decompose up` starts a daemon and streams logs. If it creates the daemon,
-that foreground command owns the environment: Ctrl-C shuts everything down.
-If the daemon already exists, foreground `up` reloads configuration and
+`decompose up` starts in the background, waits for readiness, and returns.
+`decompose up --foreground` starts a daemon and streams logs. If it creates the
+daemon, that foreground command owns the environment: Ctrl-C shuts everything down.
+If the daemon already exists, `up --foreground` reloads configuration and
 attaches as a viewer; Ctrl-C only detaches that viewer.
 
-Use `decompose up -d` to keep services running independently of your terminal.
+Background startup keeps services running independently of your terminal.
+Use `decompose up -d` to skip the default readiness wait.
 Later, `decompose attach` or `decompose logs -f` streams their logs without
 reloading configuration. Ctrl-C leaves the daemon running. The TUI also
 leaves it running on `q` or Ctrl-C; uppercase `Q` shuts the environment down.

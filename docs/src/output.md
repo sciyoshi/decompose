@@ -13,7 +13,8 @@ messages to decide whether a command succeeded: use its exit status and JSON.
 
 ## Wait progress
 
-`decompose up -d --wait` updates a compact display in place on terminals:
+`decompose up` (equivalent to `up -d --wait`) updates a compact display
+in place on terminals:
 
 ```text
 Starting [========----] 2/3 ready
@@ -95,16 +96,18 @@ start or restart means the daemon accepted the request; it does not guarantee
 that the service is ready or will stay running. Similarly, a completed `kill`
 confirms signal delivery, not process death.
 
-`up -d --wait` waits for initialization hooks and the selected services'
+`up` waits for initialization hooks and the selected services'
 started/healthy criteria before returning. Dependencies are included unless
 `--no-deps` is used for the wait selection. On an existing daemon, that flag
 does not prevent the start request from launching dependencies; see
 [service selection](managing-projects.md#service-selection-and-disabled-services).
 Readiness is a point-in-time check, not a continuing
 health guarantee. With no eligible services, the wait succeeds immediately.
-The flag requires `-d` and conflicts with `--no-start`.
+Explicit `--wait` does not require `-d`; it conflicts with `--foreground` and
+`--no-start`.
 
-Without `--wait`, detached `up` reports `readiness: "not_requested"`.
+`up -d`, `up --tui`, and `up --no-start` skip the default readiness wait and
+report `readiness: "not_requested"`. Add `--wait` to `-d` or `--tui` to wait.
 If waiting fails or times out, the environment remains running; diagnostics
 include the affected process snapshots. Inspect it with `ps` and `logs`.
 The wait deadline defaults to five minutes and can be set with
@@ -112,7 +115,7 @@ The wait deadline defaults to five minutes and can be set with
 
 ## Log and session streams
 
-`logs` (including without `-f`), `attach`, and attached `up` emit JSON Lines:
+`logs` (including without `-f`), `attach`, and `up --foreground` emit JSON Lines:
 one JSON object per line, rather than one array or result document. Empty
 log selections emit nothing. Streams include application output and lifecycle
 events; attached commands also include session events such as `attached` and

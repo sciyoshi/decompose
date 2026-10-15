@@ -25,7 +25,7 @@ should feel familiar to Docker Compose users.
 ```
 decompose [--file FILE...] [--session NAME] [-e ENV_FILE...] [--disable-dotenv] <command>
 
-decompose up [-d] [--no-deps] [SERVICE...]
+decompose up [-d] [--wait] [--foreground] [--no-deps] [SERVICE...]
 decompose down
 decompose ps
 decompose logs [-f] [-n N] [SERVICE...]
@@ -36,6 +36,12 @@ decompose kill [SERVICE...]
 decompose config
 decompose ls
 ```
+
+`up` defaults to background startup with initialization/readiness waiting.
+Explicit `-d` skips the readiness wait unless combined with `--wait`.
+`--foreground` streams logs and owns a newly launched environment; it conflicts
+with `-d`, `--wait`, and `--tui`. `--tui` opens immediately unless `--wait`
+is explicit. `--no-start` skips the default wait and conflicts with `--wait`.
 
 Global flags (`--file`, `--session`, `-e/--env-file`, `--disable-dotenv`)
 appear before the subcommand, matching `docker compose -f FILE <cmd>` shape.

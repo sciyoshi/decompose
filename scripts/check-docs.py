@@ -108,7 +108,7 @@ def check_examples(source, binary):
                 if line == "decompose ps":
                     assert output.startswith("name"), output
                     assert "web" in output and "worker" in output, output
-                if line == "decompose up -d --wait":
+                if line == "decompose up":
                     assert "all requested services are ready" in output, output
                 if line == "decompose logs -n 5 worker":
                     deadline = time.monotonic() + 10

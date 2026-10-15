@@ -464,12 +464,11 @@ enum ServiceOp {
 
 async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     let output_mode = args.output.resolve();
-    // `--tui` means "start services, then hand off to the TUI". Like `-d`,
-    // the caller is no longer tethered to the daemon while the TUI runs,
-    // so we treat it as detached for daemon-lifetime purposes (no
-    // parent_pid → daemon outlives the TUI process) and skip the log
-    // stream. The TUI handles its own Ctrl-C.
-    let attached = !args.detach && !args.tui;
+    // Only explicit foreground mode owns a newly launched environment.
+    // Background startup (including the readiness wait and TUI) leaves the
+    // daemon independent of the client, with no parent_pid.
+    let attached = args.foreground;
+    let wait = args.wait_for_readiness();
     let ctrl_c_task = if attached {
         let mut signals = shutdown::Signals::new()?;
         Some(tokio::spawn(async move {
@@ -486,7 +485,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         paths,
     } = resolve_up_context(&global)?;
 
-    let wait_set = if args.wait {
+    let wait_set = if wait {
         let loaded = load_project(&config_files, &global.env_files, global.disable_dotenv)?;
         Some(if args.processes.is_empty() {
             loaded.config.processes.keys().cloned().collect()
@@ -498,7 +497,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     };
     // Establish the cursor before starting/reloading services so fast startup
     // events are retained, while previous attempts on a live daemon stay hidden.
-    let mut progress = if args.wait && output_mode == OutputMode::Table {
+    let mut progress = if wait && output_mode == OutputMode::Table {
         let progress = WaitProgress::new(&paths).await?;
         Some(progress)
     } else {
@@ -567,7 +566,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
             }),
         }
     };
-    if args.wait {
+    if wait {
         acknowledgment.outcome = Outcome::Completed;
         for service in &mut acknowledgment.services {
             service.outcome = ServiceOutcome::Ready;
@@ -588,7 +587,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         } else {
             DaemonAction::Reused
         }),
-        readiness: Some(if args.wait {
+        readiness: Some(if wait {
             Readiness::Satisfied
         } else {
             Readiness::NotRequested
@@ -712,10 +711,10 @@ async fn ensure_daemon_running(
         // new daemon can bind the socket without interference.
         cleanup_stale_files(paths);
         preflight_validate_config(global, config_files, &args.processes)?;
-        // Attached `up` stays tethered to its daemon: if the user Ctrl-C's
+        // `up --foreground` stays tethered to its daemon: if the user Ctrl-C's
         // out or the terminal is closed, the daemon should auto-exit rather
-        // than leak. Detached `up -d` explicitly opts into a daemon that
-        // outlives its launcher, so we pass `None` there.
+        // than leak. Background startup outlives its launcher, so we pass
+        // `None` there, including when waiting for readiness.
         let parent_pid = if attached {
             Some(std::process::id())
         } else {

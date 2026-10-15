@@ -74,7 +74,7 @@ impl Env {
     }
     fn foreground(&mut self) -> Child {
         let child = self
-            .command(&["up", "--json"])
+            .command(&["up", "--foreground", "--json"])
             .process_group(0)
             .stdout(fs::File::create(self.path("client.stdout")).unwrap())
             .stderr(fs::File::create(self.path("client.stderr")).unwrap())
@@ -382,7 +382,7 @@ fn interrupting_up_on_existing_environment_only_detaches() {
     env.up();
     let leader = env.pidfile("leader.pid");
     let mut client = env
-        .command(&["up"])
+        .command(&["up", "--foreground"])
         .process_group(0)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -596,7 +596,7 @@ processes:
             0
         );
         let mut child = env
-            .command(&["up", "-d", "--wait"])
+            .command(&["up"])
             .env("TERM", "xterm-256color")
             .env("NO_COLOR", "")
             .env(

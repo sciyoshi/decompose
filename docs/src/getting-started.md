@@ -52,13 +52,13 @@ for other ways to order services.
 Start the services in the background and wait until they are ready:
 
 ```bash
-decompose up -d --wait
+decompose up
 ```
 
-`-d` leaves the daemon running after the command returns. `--wait` keeps this
-command open until the web server is healthy and the worker is running. On a
-terminal, service rows update in place with spinners while waiting and green
-checkmarks when ready. The completed display looks like this:
+`up` starts in the background and waits until the web server is healthy and the
+worker is running, then returns with the daemon still running. This is equivalent
+to `up -d --wait`. On a terminal, service rows update in place with spinners
+while waiting and green checkmarks when ready. The completed display looks like this:
 
 ```text
 Ready [============] 2/2 ready
@@ -71,10 +71,11 @@ Redirected output prints lifecycle messages instead of updating in place.
 Use `--json` for one final result without progress output. See
 [wait progress](output.md#wait-progress) for output and terminal behavior.
 
-Without `--wait`, detached startup acknowledges the operation before services
-are necessarily ready. Without `-d`, output streams to your terminal. If that
-foreground command starts a new daemon, Ctrl-C shuts down its services and
-daemon. If it attaches to an existing daemon, Ctrl-C only detaches the viewer.
+Use `up -d` to return before services are necessarily ready. Use `up --foreground`
+to stream logs to your terminal. If that foreground command starts a new daemon,
+Ctrl-C shuts down its services and daemon. If it attaches to an existing daemon,
+Ctrl-C only detaches the viewer. Ctrl-C during the default readiness wait ends
+the wait and leaves the environment running.
 
 Open <http://127.0.0.1:8000/> to see the directory listing. Use your chosen port
 if you changed the configuration.

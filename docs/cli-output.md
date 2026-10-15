@@ -33,13 +33,15 @@ Consumers should ignore unfamiliar fields and event types.
   guarantees. A completed `kill` confirms signal delivery, not process death.
 - `up` also reports `daemon_action`, `changes`, and `readiness`.
   Changes contain arrays for `added`, `changed`, `removed`, `orphans`,
-  `renamed`, and `scaled`. `up -d --wait` emits its result only after readiness;
+  `renamed`, and `scaled`. Plain `up` (equivalent to `up -d --wait`) emits its
+  result only after readiness;
   failure details describe the environment left running. `--wait` conflicts
-  with `--no-start`.
+  with `--no-start` and `--foreground`. Explicit `-d` skips the default wait
+  unless combined with `--wait`.
   Reloading changed services waits for their shutdown cleanup before replacement;
   its IPC deadline includes the daemon's shutdown budget in addition to the
   ordinary `DECOMPOSE_IPC_TIMEOUT_MS` request timeout.
-  In text mode, `up -d --wait` also prints lifecycle progress on stdout while
+  In text mode, `up` also prints lifecycle progress on stdout while
   waiting: process starts/exits, pre/post-start hook starts and outcomes, and
   changes in process state, initialization stage, and readiness. Only selected
   services (including dependencies unless `--no-deps`) are shown; previous
@@ -57,7 +59,7 @@ Consumers should ignore unfamiliar fields and event types.
   prioritize failures and pending services. A resize starts a fresh block to
   preserve earlier terminal output. Redirected output and `TERM=dumb` use
   line-by-line lifecycle messages.
-- `logs`, `logs -f`, `attach`, and attached `up` emit JSON Lines. Application
+- `logs`, `logs -f`, `attach`, and `up --foreground` emit JSON Lines. Application
   stderr remains stdout data with `stream: "stderr"`. Log records retain
   service, process, replica, timestamp, message, partial-record, and hook
   attribution. Lifecycle records have their own `type`. Legacy daemon log

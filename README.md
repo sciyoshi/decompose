@@ -186,11 +186,12 @@ decompose completion elvish > ~/.config/elvish/lib/decompose.elv
 
 ## Built for humans and agents
 
-- `decompose up` starts and attaches.
-- `Ctrl-C` or TERM stops an environment launched by foreground `up` and waits for cleanup. When `up` attaches to an existing environment, Ctrl-C only detaches.
-- `up -d` and `up --tui` start environments that outlive their client. Leaving `attach`, `logs -f`, or the TUI does not stop services.
+- `decompose up` starts in the background and waits for initialization and readiness.
+- `Ctrl-C` or TERM stops an environment launched by `up --foreground` and waits for cleanup. When `up --foreground` attaches to an existing environment, Ctrl-C only detaches.
+- `up`, `up -d`, and `up --tui` start environments that outlive their client. Leaving `attach`, `logs -f`, or the TUI does not stop services.
 - `decompose up -d` starts and returns immediately.
-- `decompose up -d --wait` waits for initialization and readiness, with an inline progress display on terminals and lifecycle messages when redirected. Use `--json` for one final machine-readable result.
+- `decompose up --foreground` starts and streams logs.
+- `decompose up` (also `up --wait` or `up -d --wait`) waits for initialization and readiness, with an inline progress display on terminals and lifecycle messages when redirected. Use `--json` for one final machine-readable result.
 - `decompose ps` reports empty state instead of error when nothing is running.
 - Use `decompose down` from any tab/agent to stop the environment.
 
@@ -208,7 +209,7 @@ Nix pins the toolchain and dependencies; `decompose` orchestrates native process
 ## Commands
 
 ```
-decompose up [-d|--detach] [--no-deps] [SERVICE...]
+decompose up [-d|--detach] [--wait] [--foreground] [--no-deps] [SERVICE...]
 decompose down
 decompose ps
 decompose attach
@@ -648,10 +649,10 @@ Cleanup failures are reported as errors, rather than inferred successful from
 a missing socket. After an unresolved cleanup failure, inspect the daemon log
 and surviving processes before starting another environment.
 
-An environment launched by foreground `up` belongs to that client. If the client
+An environment launched by `up --foreground` belongs to that client. If the client
 disappears without requesting shutdown, the daemon stops after
 `DECOMPOSE_ORPHAN_TIMEOUT` seconds (default 30); IPC polling does not extend its
-lifetime. Use `up -d` or `up --tui` for persistent environments. TUI `q`/Ctrl-C
+lifetime. Use plain `up`, `up -d`, or `up --tui` for persistent environments. TUI `q`/Ctrl-C
 detaches; `Q` stops the environment and waits for cleanup.
 
 On Unix, ownership covers descendants that remain in the service process group.
@@ -764,7 +765,7 @@ You can keep your file named `compose.yml` and decompose will find it, or rename
 
 | Command | Notes |
 |---|---|
-| `up [-d] [SERVICE...]` | Starts services; `-d` detaches |
+| `up [SERVICE...]` | Starts in the background and waits for readiness; `-d` skips the wait; `--foreground` streams logs |
 | `down` | Stops the environment |
 | `ps` | Shows process status |
 | `logs [-f] [-n N] [SERVICE...]` | View/follow logs |
@@ -886,8 +887,8 @@ work is verified afterward. Guards are reevaluated on every restart without a
 persistent success cache.
 
 Depend on `process_initialized` to wait for every running replica's hooks.
-`up -d --wait` includes initialization, and `ps`, the TUI, and service logs expose
-hook progress and failures. Pre-start failure prevents spawn; post-start failure
+`up` (or explicitly `up -d --wait`) includes initialization, and `ps`, the TUI,
+and service logs expose hook progress and failures. Pre-start failure prevents spawn; post-start failure
 leaves a running service available for inspection under `wait_all`. Hook failures
 do not invoke restart policy. `run`/`exec` do not execute lifecycle hooks.
 

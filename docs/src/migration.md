@@ -94,7 +94,7 @@ Validate the configuration, start just the server, and wait for its HTTP probe:
 
 ```sh
 decompose config
-decompose up -d --wait web
+decompose up web
 decompose ps
 decompose run --env "PATH=$PATH" check python3 check.py
 decompose logs --tail 20 web

@@ -23,18 +23,26 @@ and automation examples.
 
 ### `decompose up [FLAGS] [SERVICE...]`
 
-Start services and (by default) attach to streaming logs until Ctrl-C.
+Start services in the background and wait for initialization and readiness before
+returning. This is equivalent to `up -d --wait`. Use `--foreground` for streaming
+logs and foreground ownership, or `-d` to return without waiting for readiness.
 
 | Flag | Description |
 |------|-------------|
-| `-d`, `--detach` | Start the daemon and return immediately. |
-| `--wait` | With `-d`, wait until every selected service is initialized and started/healthy before returning. Requires `-d`/`--detach`. |
+| `-d`, `--detach` | Start in the background and return without waiting for readiness, unless `--wait` is also given. |
+| `--wait` | Wait until every selected service is initialized and started/healthy before returning (the default). Also enables waiting with `-d` or `--tui`. Conflicts with `--foreground` and `--no-start`. |
+| `--foreground` | Stream logs until Ctrl-C. Stops an environment launched by this client; only detaches from an existing environment. Conflicts with `-d`, `--wait`, and `--tui`. |
 | `--no-deps` | Omit dependency expansion when launching a new daemon; see the existing-daemon limitation below. |
 | `--remove-orphans` | Stop and drop services that exist in the daemon but not in the current config. |
 | `--force-recreate` | Recreate every service regardless of whether its config hash changed. Conflicts with `--no-recreate`. |
 | `--no-recreate` | Keep existing services even if their config hash differs. |
-| `--no-start` | Register new/changed services but leave them in `not_started`. |
-| `--tui` | Start services and immediately open the TUI. Implies `-d` (services keep running after the TUI exits). |
+| `--no-start` | Register new/changed services but leave them in `not_started`, without waiting for readiness. |
+| `--tui` | Start services and immediately open the TUI; add `--wait` to wait for readiness first. Services keep running after the TUI exits. |
+
+**Changed default:** earlier versions attached to logs on plain `up`. Use
+`up --foreground` to retain that behavior, including JSON Lines output and
+shutdown ownership. Plain `up --json` now returns one final readiness result.
+Existing `up -d` and `up -d --wait` invocations keep their behavior.
 
 If no `SERVICE` is given, all eligible services are started; disabled services
 remain parked. On an existing daemon, `up` reloads the whole project even
@@ -85,13 +93,13 @@ Send a signal directly to running services (skips the configured
 replica does not rerun hooks. Scale-up runs them only for new replicas; scale-down
 and recreation cancel and clean up affected hook processes.
 
-`up -d` acknowledges launch asynchronously. `up -d --wait` also requires hook
-success before applying its usual started/healthy criterion. Hook failures fail
+`up -d` acknowledges launch asynchronously. Plain `up` (or `up -d --wait`) requires
+hook success before applying its usual started/healthy criterion. Hook failures fail
 waiting promptly with the service, phase, hook, and cause. Successfully exited
 one-shot jobs use the latest attempt's historical initialization result. A job
 that exits before post-start completes has not initialized successfully.
 
-On terminals, `up -d --wait` shows an in-place service display with spinners,
+On terminals, `up` shows an in-place service display with spinners,
 hook activity, readiness, and failures. Redirected output prints lifecycle
 messages; `--json` emits only the final result. See
 [wait progress](output.md#wait-progress). Ctrl-C ends the wait and leaves the

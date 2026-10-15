@@ -377,6 +377,7 @@ fn ctrl_c_stops_owned_environment() {
         .arg("--file")
         .arg(&cfg)
         .arg("up")
+        .arg("--foreground")
         .arg("--table")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1418,51 +1419,74 @@ processes:
 }
 
 #[test]
-fn up_detach_wait_returns_when_services_running() {
-    let mut env = TestEnv::new();
-
-    let up = env.run(&["up", "-d", "--wait", "--json"]);
-    assert_success(&up, "up -d --wait");
-    env.up_started = true;
-
-    env.down_json();
+fn up_wait_modes_return_one_ready_result() {
+    for args in [
+        vec!["up", "--json"],
+        vec!["up", "--wait", "--json"],
+        vec!["up", "-d", "--wait", "--json"],
+    ] {
+        let mut env = TestEnv::new();
+        env.up_started = true;
+        let up = env.run(&args);
+        assert_success(&up, "up with readiness wait");
+        let result: Value = serde_json::from_slice(&up.stdout).expect("one final result");
+        assert_eq!(result["outcome"], "completed");
+        assert_eq!(result["readiness"], "satisfied");
+        assert_eq!(result["services"][0]["outcome"], "ready");
+        assert!(up.stderr.is_empty());
+        assert_eq!(env.ps_json_value()["processes"][0]["state"], "running");
+        env.down_json();
+    }
 }
 
 #[test]
-fn up_detach_wait_fails_when_service_fails() {
-    let mut env = TestEnv::new();
-    env.with_config(
-        r#"
+fn up_wait_modes_fail_when_service_fails() {
+    for args in [vec!["up", "--json"], vec!["up", "-d", "--wait", "--json"]] {
+        let mut env = TestEnv::new();
+        env.with_config(
+            r#"
 processes:
   failer:
     command: "sh -c 'exit 1'"
 "#,
-    );
-
-    let up = env.run(&["up", "-d", "--wait", "--json"]);
-    env.up_started = true;
-    assert!(!up.status.success(), "up -d --wait should fail");
-
-    assert!(up.stdout.is_empty());
-    let diagnostic: Value = serde_json::from_slice(&up.stderr).expect("one diagnostic");
-    assert_eq!(diagnostic["code"], "readiness_failed");
-    assert_eq!(diagnostic["details"]["daemon"]["state"], "running");
-
-    env.down_json();
+        );
+        env.up_started = true;
+        let up = env.run(&args);
+        assert!(!up.status.success(), "up should fail");
+        assert!(up.stdout.is_empty());
+        let diagnostic: Value = serde_json::from_slice(&up.stderr).expect("one diagnostic");
+        assert_eq!(diagnostic["code"], "readiness_failed");
+        assert_eq!(diagnostic["details"]["daemon"]["state"], "running");
+        env.down_json();
+    }
 }
 
 #[test]
-fn up_wait_requires_detach() {
-    let env = TestEnv::new();
-
-    let up = env.run(&["up", "--wait", "--json"]);
-    assert!(!up.status.success(), "up --wait without -d should fail");
-
-    let stderr = String::from_utf8_lossy(&up.stderr);
-    assert!(
-        stderr.contains("--detach") || stderr.contains("-d"),
-        "stderr should mention detach requirement, got: {stderr}"
+fn up_detach_returns_before_initialization_and_readiness() {
+    let mut env = TestEnv::new();
+    env.with_config(
+        r#"
+processes:
+  svc:
+    command: 'sleep 100'
+    post_start:
+      - name: setup
+        command: 'while ! test -f release; do sleep 0.05; done'
+    readiness_probe:
+      exec: {command: 'test -f release'}
+      period_seconds: 1
+"#,
     );
+    env.up_started = true;
+    let up = env.run(&["up", "-d", "--json"]);
+    assert_success(&up, "up -d without waiting");
+    let result: Value = serde_json::from_slice(&up.stdout).unwrap();
+    assert_eq!(result["outcome"], "accepted");
+    assert_eq!(result["readiness"], "not_requested");
+    assert!(!env.project.join("release").exists());
+    fs::write(env.project.join("release"), "").unwrap();
+    assert_success(&env.run(&["up"]), "wait for released service");
+    env.down_json();
 }
 
 #[test]
@@ -5817,8 +5841,8 @@ fn wait_for_daemon_exit_no_ipc(state: &Path, deadline: Duration) -> bool {
 }
 
 #[test]
-fn detached_up_daemon_survives_without_parent_pid() {
-    // `up -d` should not set up orphan-watchdog — the daemon is meant to
+fn default_up_daemon_survives_without_parent_pid() {
+    // `up` should not set up orphan-watchdog — the daemon is meant to
     // outlive the launching process. We verify that even with an
     // aggressively-short DECOMPOSE_ORPHAN_TIMEOUT, the daemon sticks around
     // after the `up` invocation that started it has already exited.
@@ -5831,11 +5855,11 @@ fn detached_up_daemon_survives_without_parent_pid() {
         &runtime,
         &state,
         &home,
-        &["--file", &cfg, "up", "--detach", "--json"],
+        &["--file", &cfg, "up", "--json"],
         &[("DECOMPOSE_ORPHAN_TIMEOUT", "2")],
         &[],
     );
-    assert_success(&up, "up --detach");
+    assert_success(&up, "up");
 
     // Wait well past the grace period. A misconfigured detached daemon
     // would auto-exit here.
@@ -5860,7 +5884,7 @@ fn detached_up_daemon_survives_without_parent_pid() {
 
 #[test]
 fn attached_up_killed_triggers_daemon_auto_exit() {
-    // Attached `up` (no --detach) launches the daemon with --parent-pid.
+    // `up --foreground` launches the daemon with --parent-pid.
     // If we SIGKILL the `up` parent (so it can't call down), the daemon
     // should observe the orphaned state and self-exit after the grace
     // period elapses with no IPC activity.
@@ -5877,6 +5901,7 @@ fn attached_up_killed_triggers_daemon_auto_exit() {
         .arg("--file")
         .arg(&cfg)
         .arg("up")
+        .arg("--foreground")
         .arg("--table")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -5931,6 +5956,7 @@ fn client_activity_does_not_extend_owner_lifetime() {
         .arg("--file")
         .arg(&cfg)
         .arg("up")
+        .arg("--foreground")
         .arg("--table")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -6011,6 +6037,7 @@ fn completion_subcommand_emits_shell_scripts() {
         bash_out.contains("__decompose_sessions"),
         "bash completion should include the dynamic session helper",
     );
+    assert!(bash_out.contains("--foreground"));
     for cmd in [
         "up",
         "down",
@@ -7525,7 +7552,7 @@ fn startup_hooks_exit_modes_retain_failure_and_ignore_hook_success() {
         let mut env = TestEnv::new();
         env.with_config(&format!("exit_mode: exit_on_failure\nprocesses:\n  svc:\n    command: 'sleep 100'\n    {phase}: [{{name: broken, command: 'exit 9'}}]\n"));
         env.up_started = true;
-        let out = env.run(&["up", "--json"]);
+        let out = env.run(&["up", "--foreground", "--json"]);
         assert!(!out.status.success());
         let text = format!(
             "{}{}",
@@ -8128,6 +8155,9 @@ fn output_flags_are_global_and_parse_errors_respect_child_boundaries() {
         vec!["--json", "up", "-d", "--wait", "--no-start"],
         vec!["tui", "--json"],
         vec!["--json", "up", "--tui"],
+        vec!["up", "--foreground", "-d", "--json"],
+        vec!["up", "--foreground", "--wait", "--json"],
+        vec!["up", "--foreground", "--tui", "--json"],
     ] {
         let output = env.run(&args);
         assert_eq!(output.status.code(), Some(2));
@@ -8155,17 +8185,18 @@ fn output_flags_are_global_and_parse_errors_respect_child_boundaries() {
 #[test]
 fn fresh_no_start_and_empty_wait_have_truthful_results() {
     let mut env = TestEnv::new();
-    let up = env.run(&["up", "-d", "--no-start", "--json"]);
+    let up = env.run(&["up", "--no-start", "--json"]);
     assert_success(&up, "fresh no-start");
     env.up_started = true;
     let result: Value = serde_json::from_slice(&up.stdout).unwrap();
     assert_eq!(result["services"][0]["outcome"], "registered");
+    assert_eq!(result["readiness"], "not_requested");
     assert_eq!(env.ps_json_value()["processes"][0]["state"], "not_started");
     let text = env.run(&["ps"]);
     assert!(String::from_utf8_lossy(&text.stdout).contains("daemon running; no processes started"));
     env.down_json();
     env.with_config("processes:\n  disabled:\n    command: sleep 300\n    disabled: true\n");
-    let up = env.run(&["up", "-d", "--wait", "--json"]);
+    let up = env.run(&["up", "--json"]);
     assert_success(&up, "empty eligible wait");
     env.up_started = true;
     let result: Value = serde_json::from_slice(&up.stdout).unwrap();
@@ -8245,7 +8276,7 @@ processes:
         .env("XDG_RUNTIME_DIR", &env.runtime)
         .env("XDG_STATE_HOME", &env.state)
         .env("HOME", &env.home)
-        .args(["up", "-d", "--wait", "svc"])
+        .args(["up", "svc"])
         .stdout(progress_file)
         .stderr(Stdio::piped())
         .spawn()
@@ -8281,18 +8312,18 @@ processes:
     assert!(!text.contains("hook-output"), "{text}");
     assert!(!text.contains("[other]"), "{text}");
 
-    let again = env.run(&["up", "-d", "--wait", "svc"]);
+    let again = env.run(&["up", "svc"]);
     assert_success(&again, "wait on ready service");
     let text = String::from_utf8_lossy(&again.stdout);
     assert!(text.contains("[svc] running; ready"), "{text}");
     assert!(!text.contains("hook started"), "{text}");
     assert!(!text.contains("started (pid"), "{text}");
 
-    let no_deps = env.run(&["up", "-d", "--wait", "--no-deps", "svc"]);
+    let no_deps = env.run(&["up", "--no-deps", "svc"]);
     assert_success(&no_deps, "wait without dependencies");
     assert!(!String::from_utf8_lossy(&no_deps.stdout).contains("[db]"));
 
-    let json = env.run(&["up", "-d", "--wait", "svc", "--json"]);
+    let json = env.run(&["up", "svc", "--json"]);
     assert_success(&json, "JSON wait");
     let result: Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(result["readiness"], "satisfied");
