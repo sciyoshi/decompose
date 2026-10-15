@@ -73,46 +73,59 @@ pub fn create_dir_secure(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Maximum length of an explicit `--session` name.
+pub const SESSION_NAME_MAX: usize = 64;
+
+/// Validate an explicit session name, which is used verbatim as the instance
+/// ID and therefore as a file-name stem for the socket, pid, lock and log
+/// files. Names must start with an ASCII letter or digit and contain only
+/// ASCII letters, digits, `-` and `_`. Dots are rejected so one session's
+/// files (`NAME.log`) can never collide with another's log directory.
+pub fn validate_session_name(name: &str) -> Result<String> {
+    let valid = !name.is_empty()
+        && name.len() <= SESSION_NAME_MAX
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid {
+        Ok(name.to_owned())
+    } else {
+        Err(anyhow!(
+            "invalid session name {name:?}: use 1-{SESSION_NAME_MAX} ASCII letters, digits, '-' or '_', starting with a letter or digit"
+        ))
+    }
+}
+
 /// Build an instance identity string.
 ///
-/// A session matching a full instance ID (16 lowercase hex digits) is used
-/// directly, so IDs printed by `ls` can target the same environment.
-/// Otherwise, if `session` is provided, identity is based solely on its name.
-/// Otherwise, it is based on the config directory and the set of config files
-/// (sorted for order-independence).
+/// An explicit `session` (validated by [`validate_session_name`]) is used
+/// directly as the instance ID, so IDs printed by `ls` always round-trip.
+/// Otherwise, the ID is a hash of the config directory and the set of config
+/// files (sorted for order-independence).
 pub fn build_instance_id(
     session: Option<&str>,
     config_dir: &Path,
     config_files: &[PathBuf],
 ) -> String {
-    if let Some(id) = session
-        && id.len() == 16
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return id.to_owned();
+    if let Some(name) = session {
+        return name.to_owned();
     }
 
     let mut hasher = Sha256::new();
 
-    if let Some(name) = session {
-        hasher.update(b"session:");
-        hasher.update(name.as_bytes());
-    } else {
-        let dir_display = canonical_or_original(config_dir);
-        hasher.update(dir_display.as_bytes());
+    let dir_display = canonical_or_original(config_dir);
+    hasher.update(dir_display.as_bytes());
 
-        let mut sorted: Vec<String> = config_files
-            .iter()
-            .map(|p| canonical_or_original(p))
-            .collect();
-        sorted.sort();
+    let mut sorted: Vec<String> = config_files
+        .iter()
+        .map(|p| canonical_or_original(p))
+        .collect();
+    sorted.sort();
 
-        for file in &sorted {
-            hasher.update([0]);
-            hasher.update(file.as_bytes());
-        }
+    for file in &sorted {
+        hasher.update([0]);
+        hasher.update(file.as_bytes());
     }
 
     let digest = hasher.finalize();
@@ -257,7 +270,7 @@ mod tests {
         let id2 = build_instance_id(Some("my-project"), Path::new("/b"), &files);
         // Session override ignores config_dir and files
         assert_eq!(id1, id2);
-        assert_eq!(id1.len(), 16);
+        assert_eq!(id1, "my-project");
     }
 
     #[test]
@@ -270,16 +283,21 @@ mod tests {
     }
 
     #[test]
-    fn session_names_that_are_not_full_ids_are_hashed() {
+    fn session_names_are_validated() {
+        for name in ["dev", "My_Project-2", "0123456789abcdef", &"a".repeat(64)] {
+            assert_eq!(validate_session_name(name).unwrap(), name);
+        }
         for name in [
-            "abc123",
-            "0123456789abcdef0",
-            "0123456789abcdeg",
+            "",
+            "-dev",
+            "_dev",
+            "a.b",
             "../some/session",
+            "has space",
+            "caf\u{e9}",
+            &"a".repeat(65),
         ] {
-            let id = build_instance_id(Some(name), Path::new("/a"), &[]);
-            assert_ne!(id, name);
-            assert_eq!(id.len(), 16);
+            assert!(validate_session_name(name).is_err(), "{name:?}");
         }
     }
 

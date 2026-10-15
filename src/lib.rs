@@ -1649,8 +1649,15 @@ async fn run_ls(output_mode: OutputMode) -> Result<()> {
             if result.environments.is_empty() {
                 crate::output::write_line(format_args!("no running environments"))?;
             } else {
+                let width = result
+                    .environments
+                    .iter()
+                    .map(|e| e.instance.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(16);
                 crate::output::write_line(format_args!(
-                    "{:<16} {:<14} {:<9} {:<40} config files",
+                    "{:<width$} {:<14} {:<9} {:<40} config files",
                     "instance", "state", "processes", "project"
                 ))?;
                 for environment in result.environments {
@@ -1688,7 +1695,7 @@ async fn run_ls(output_mode: OutputMode) -> Result<()> {
                         .map(|count| count.to_string())
                         .unwrap_or_else(|| "-".into());
                     crate::output::write_line(format_args!(
-                        "{:<16} {state:<14} {count:<9} {project:<40} {files}",
+                        "{:<width$} {state:<14} {count:<9} {project:<40} {files}",
                         environment.instance
                     ))?;
                 }

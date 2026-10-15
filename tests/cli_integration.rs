@@ -1600,6 +1600,9 @@ fn session_accepts_instance_ids_from_ls() {
             let environments = listed["environments"].as_array().unwrap();
             assert_eq!(environments.len(), 1);
             let id = environments[0]["instance"].as_str().unwrap();
+            if let Some(name) = session {
+                assert_eq!(id, name, "session names are used as instance IDs");
+            }
 
             // A different directory with no config must still reach the daemon.
             let ps = run(&home, &["--session", id, "ps", "--json"]);
@@ -1624,6 +1627,26 @@ fn session_accepts_instance_ids_from_ls() {
         args.push("down");
         assert_success(&run(&project, &args), "cleanup");
         checks.unwrap();
+    }
+}
+
+#[test]
+fn session_rejects_invalid_names() {
+    let (root, project, runtime, state, _) = setup_project();
+    let home = root.path().join("home");
+    for name in ["../escape", "a.b", "_dev", "has space"] {
+        let out = run_cmd(
+            &project,
+            &runtime,
+            &state,
+            &home,
+            &["--session", name, "ps"],
+            &[],
+            &["DECOMPOSE_SESSION"],
+        );
+        assert!(!out.status.success(), "{name:?} should be rejected");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("invalid session name"), "{stderr}");
     }
 }
 

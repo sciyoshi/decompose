@@ -11,7 +11,8 @@ containers.
   socket IPC (using the `interprocess` crate). The CLI is a thin client that
   sends JSON requests over the socket.
 - **Instance identity**: Each environment is identified by a SHA-256 hash of
-  the config directory + file set, or by an explicit `--session` name. This
+  the config directory + file set, or by an explicit `--session` name (used
+  verbatim as the ID; `[A-Za-z0-9_-]`, max 64 chars). This
   allows multiple isolated environments and cross-tab targeting.
 - **XDG paths**: Sockets go to `$XDG_RUNTIME_DIR/decompose/`, state (pid, log)
   goes to `$XDG_STATE_HOME/decompose/`, with sensible fallbacks.

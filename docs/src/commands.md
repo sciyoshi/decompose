@@ -11,7 +11,7 @@ These appear *before* the subcommand, matching `docker compose -f FILE <cmd>`.
 | Flag | Description |
 |------|-------------|
 | `-f`, `--file FILE` | Config file path. Repeatable; later files overlay earlier ones. |
-| `--session NAME` | Use a project/session name or a full instance ID from `ls` (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
+| `--session NAME` | Use a project/session name (used verbatim as the instance ID) or an instance ID from `ls` (otherwise derived from the config dir). Also reads `DECOMPOSE_SESSION`. Alias: `--project-name`. |
 | `-e`, `--env-file FILE` | Extra `.env` file(s) to load on top of the auto-discovered `.env`. |
 | `--disable-dotenv` | Don't auto-load `.env` from the config directory. |
 | `--json` / `--table` | Select JSON or text output explicitly. Text is always the default, including in pipes and CI; the flags conflict. |

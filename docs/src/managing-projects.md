@@ -32,7 +32,10 @@ decompose -f decompose.yaml -f local.yaml up -d
 decompose -f /path/to/project/decompose.yaml -f /path/to/project/local.yaml ps
 ```
 
-An explicit `--session NAME` makes identity depend only on that name.
+An explicit `--session NAME` makes identity depend only on that name, which
+becomes the instance ID shown by `decompose ls`. Names may contain ASCII
+letters, digits, `-` and `_` (up to 64 characters) and must start with a letter
+or digit.
 `DECOMPOSE_SESSION` supplies the same setting through the environment. Use
 distinct names for environments you want to keep separate:
 
@@ -41,9 +44,9 @@ decompose -f /path/to/project/decompose.yaml --session demo up -d
 decompose -f /path/to/project/decompose.yaml --session demo logs -f
 ```
 
-You can also use a full instance ID printed by `decompose ls`, for example
-`decompose --session 0123456789abcdef ps`. Session values consisting of exactly
-16 lowercase hex digits are interpreted as instance IDs, not names.
+You can also use any instance ID printed by `decompose ls`, for example
+`decompose --session 0123456789abcdef ps` for an environment started without a
+session name.
 Inspection and control commands such as `ps`, `logs`, `attach`, and `down`
 can target a session from any directory without `--file`. Commands that load
 configuration, such as `up`, still need the correct configuration path.

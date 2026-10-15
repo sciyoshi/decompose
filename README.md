@@ -370,10 +370,12 @@ decompose --session staging down
 
 ### Attaching to a running environment
 
-Use a full instance ID from `decompose ls` to target an environment from any
+Use an instance ID from `decompose ls` to target an environment from any
 directory, for example `decompose --session 0123456789abcdef ps` or
-`decompose --session 0123456789abcdef attach`. Session values consisting of
-exactly 16 lowercase hex digits are interpreted as instance IDs, not names.
+`decompose --session staging attach`. A named session's instance ID is the
+name itself; other environments use a 16-character hash of their config paths.
+Session names may contain ASCII letters, digits, `-` and `_` (up to 64
+characters) and must start with a letter or digit.
 
 ```bash
 # Start detached, then reattach from another terminal

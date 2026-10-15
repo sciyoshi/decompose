@@ -26,12 +26,13 @@ pub struct Cli {
     /// Config file path(s). If omitted, auto-discovery is used. Can be repeated.
     #[arg(short = 'f', long = "file", global = true)]
     pub config_files: Vec<PathBuf>,
-    /// Session/project name or full instance ID from `decompose ls`.
+    /// Session/project name or instance ID from `decompose ls`.
     #[arg(
         long = "session",
         alias = "project-name",
         env = "DECOMPOSE_SESSION",
-        global = true
+        global = true,
+        value_parser = crate::paths::validate_session_name
     )]
     pub session: Option<String>,
     /// Additional .env files to load.

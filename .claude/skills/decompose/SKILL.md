@@ -26,7 +26,7 @@ decompose attach                   # Reattach to daemon log stream
 # How decompose works
 
 - `decompose up` spawns a **background daemon** that manages all processes. The CLI is a thin client that talks to the daemon over a local Unix socket.
-- Each environment is identified by a hash of the config directory + files, or by `--session NAME`.
+- Each environment is identified by a hash of the config directory + files, or by `--session NAME` (the name is used as the ID).
 - Config is discovered automatically: `decompose.yml` > `decompose.yaml` > `compose.yml` > `compose.yaml`. Use `-f FILE` to override (can be repeated for overlay merging).
 - Output modes: `--json` (machine), `--table` (human), or auto-detect (TTY/CI/LLM -> table, pipe -> JSON).
 
