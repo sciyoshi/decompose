@@ -55,7 +55,9 @@ IPC acknowledgments retain typed outcomes and legacy messages. See
 ## Configuration
 
 Config files are discovered in order: `decompose.yml`, `decompose.yaml`,
-`compose.yml`, `compose.yaml`. Multiple `-f` flags merge with overlay
+`compose.yml`, `compose.yaml`. Automatic discovery appends
+`decompose.override.yaml` when present; explicit `-f` skips this default override.
+Multiple `-f` flags merge with overlay
 semantics (later files override earlier ones). Parsing preserves field presence:
 `command` and dependency completeness are validated only after merging. Explicit
 false/default values and empty lists override; environment and dependency maps

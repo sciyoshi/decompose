@@ -535,6 +535,31 @@ fn ps_when_not_running_is_empty_not_error() {
 }
 
 #[test]
+fn config_automatically_layers_default_override() {
+    let (root, project, runtime, state, _) = setup_project();
+    let home = root.path().join("home");
+    fs::write(
+        project.join("decompose.override.yaml"),
+        "processes: {sleeper: {command: 'echo override', description: local}}",
+    )
+    .unwrap();
+    let run = |args: &[&str]| run_cmd(&project, &runtime, &state, &home, args, &[], &[]);
+    let output = run(&["config"]);
+    assert_success(&output, "config with default override");
+    let config: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&output.stdout).unwrap();
+    assert_eq!(config["processes"]["sleeper"]["command"], "echo override");
+    assert_eq!(config["processes"]["sleeper"]["description"], "local");
+
+    let output = run(&["-f", "decompose.yaml", "config"]);
+    assert_success(&output, "explicit base config");
+    let config: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&output.stdout).unwrap();
+    assert_eq!(config["processes"]["sleeper"]["command"], "sleep 30");
+
+    fs::write(project.join("decompose.override.yaml"), "processes: [").unwrap();
+    assert!(!run(&["config"]).status.success());
+}
+
+#[test]
 fn config_prints_resolved_json() {
     let root = tempdir().expect("tempdir");
     let project = root.path().join("project");

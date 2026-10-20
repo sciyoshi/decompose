@@ -428,6 +428,10 @@ current directory:
 3. `compose.yml`
 4. `compose.yaml`
 
+When using automatic discovery, `decompose.override.yaml` in the current
+directory is loaded on top of the discovered file if it exists. Explicit `-f`
+flags disable this automatic override; include it with another `-f` if needed.
+
 Multiple `-f` flags merge with overlay semantics -- later files override
 earlier ones.
 
@@ -756,6 +760,10 @@ decompose auto-discovers config files in this order:
 2. `decompose.yaml`
 3. `compose.yml` (same filename Docker Compose uses)
 4. `compose.yaml`
+
+When using automatic discovery, `decompose.override.yaml` in the current
+directory is loaded on top of the discovered file if it exists. Explicit `-f`
+flags disable this automatic override; include it with another `-f` if needed.
 
 You can keep your file named `compose.yml` and decompose will find it, or rename to `decompose.yml` to avoid ambiguity.
 

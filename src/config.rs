@@ -709,14 +709,12 @@ pub fn filter_process_subset(
 pub fn resolve_config_paths(user_supplied: &[PathBuf], cwd: &Path) -> Result<Vec<PathBuf>> {
     if user_supplied.is_empty() {
         let discovered = discover_config(cwd)?;
-        let resolved = if discovered.exists() {
-            discovered
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", discovered.display()))?
-        } else {
-            discovered
-        };
-        return Ok(vec![resolved]);
+        let mut files = vec![discovered];
+        let override_path = cwd.join("decompose.override.yaml");
+        if override_path.exists() {
+            files.push(override_path);
+        }
+        return resolve_config_paths(&files, cwd);
     }
 
     let mut resolved = Vec::with_capacity(user_supplied.len());
@@ -2673,6 +2671,31 @@ processes:
         let paths = resolve_config_paths(&[], dir.path()).unwrap();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("decompose.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_paths_layers_default_override() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("decompose.yaml");
+        let overlay = dir.path().join("decompose.override.yaml");
+        fs::write(&base, "processes: {a: {command: 'echo base'}}").unwrap();
+        fs::write(&overlay, "processes: {a: {command: 'echo override'}}").unwrap();
+
+        let paths = resolve_config_paths(&[], dir.path()).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                base.canonicalize().unwrap(),
+                overlay.canonicalize().unwrap()
+            ]
+        );
+        let loaded = load_project(&paths, &[], true).unwrap();
+        assert_eq!(loaded.config.processes["a"].command, "echo override");
+
+        let explicit = resolve_config_paths(&[base], dir.path()).unwrap();
+        assert_eq!(explicit.len(), 1);
+        let loaded = load_project(&explicit, &[], true).unwrap();
+        assert_eq!(loaded.config.processes["a"].command, "echo base");
     }
 
     #[test]

@@ -36,6 +36,9 @@
           "aarch64-darwin"
         ]
       },
+      "mdbook": {
+        "pkg-path": "mdbook"
+      },
       "pkg-config": {
         "pkg-path": "pkg-config"
       },
@@ -602,6 +605,93 @@
         "doc": "/nix/store/rf1fpdx7xg9wzvi7fkw9qwnk565n5yci-rustc-wrapper-1.98.1-doc",
         "man": "/nix/store/0y1vday672aw7dp36ms72bcdpdsxdwri-rustc-wrapper-1.98.1-man",
         "out": "/nix/store/hr3npzrq9l029s5hf948by203m6qz3lw-rustc-wrapper-1.98.1"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "mdbook",
+      "broken": false,
+      "derivation": "/nix/store/ha1w6x83bj1fis14ydlbdiiybmh323na-mdbook-0.5.4.drv",
+      "description": "Create books from MarkDown",
+      "install_id": "mdbook",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+      "name": "mdbook-0.5.4",
+      "pname": "mdbook",
+      "rev": "55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+      "rev_count": 1092090,
+      "rev_date": "2026-10-14T05:35:54Z",
+      "scrape_date": "2026-10-17T04:01:53.239962Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.5.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/vq61xgg8inwz9xkxg5z18ql2r68d08xz-mdbook-0.5.4"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "mdbook",
+      "broken": false,
+      "derivation": "/nix/store/kp4spvw11179p139k1b8rgg86q4gmi3h-mdbook-0.5.4.drv",
+      "description": "Create books from MarkDown",
+      "install_id": "mdbook",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+      "name": "mdbook-0.5.4",
+      "pname": "mdbook",
+      "rev": "55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+      "rev_count": 1092090,
+      "rev_date": "2026-10-14T05:35:54Z",
+      "scrape_date": "2026-10-17T04:31:09.375619Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.5.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/c9jmr5gziq5aqw6pgpr18ak9rz7p35dw-mdbook-0.5.4"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "mdbook",
+      "broken": false,
+      "derivation": "/nix/store/cwmlj141fv9gj1rd6d2jalb4rafc97qj-mdbook-0.5.4.drv",
+      "description": "Create books from MarkDown",
+      "install_id": "mdbook",
+      "license": "MPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+      "name": "mdbook-0.5.4",
+      "pname": "mdbook",
+      "rev": "55bfb4d7437bd4e09ab7cba58a43bd68eb310044",
+      "rev_count": 1092090,
+      "rev_date": "2026-10-14T05:35:54Z",
+      "scrape_date": "2026-10-17T05:06:05.296731Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.5.4",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/9n8n27hbvaw1zfwxc6bhcgv5cf9iln18-mdbook-0.5.4"
       },
       "system": "x86_64-linux",
       "group": "toplevel",

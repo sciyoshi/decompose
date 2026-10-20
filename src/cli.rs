@@ -19,6 +19,7 @@ Quick start:
   decompose down              Stop everything
 
 Config files: decompose.yml, decompose.yaml, compose.yml, compose.yaml
+Automatically layers decompose.override.yaml when present (without -f).
 Docs: https://github.com/sciyoshi/decompose"
 )]
 pub struct Cli {

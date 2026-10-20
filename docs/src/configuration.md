@@ -18,6 +18,15 @@ directory for the first file that exists, in this order:
 3. `compose.yml`
 4. `compose.yaml`
 
+When using automatic discovery, `decompose.override.yaml` in the current
+directory is loaded on top of the discovered file if it exists. Explicit `-f`
+flags disable this automatic override; include it with another `-f` if needed.
+
+For example, keep shared process commands in `decompose.yaml` and put local
+environment values in `decompose.override.yaml`. Running `decompose config` or
+`decompose up` merges both files using the rules below. The override is optional
+and may contain partial process definitions; the base file is still required.
+
 You can pass one or more `-f` flags to specify config files explicitly.
 Multiple files are merged with **overlay semantics** -- fields in later files
 override the same fields in earlier files:
@@ -375,8 +384,9 @@ selection, path anchors, provenance, and packaging fragments with Nix.
 
 ## Configuration merging
 
-When multiple config files are provided via `-f` flags, they are merged in
-order. The merge rules are:
+Config files are merged in order, whether supplied explicitly via `-f` flags
+or loaded through automatic discovery with `decompose.override.yaml` last.
+The merge rules are:
 
 - **Scalar fields** (`exit_mode`, `disable_env_expansion`): the later file's
   value replaces the earlier one.
