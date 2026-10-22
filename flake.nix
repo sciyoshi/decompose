@@ -3,7 +3,7 @@
 
   inputs = {
     # Match the latest Flox base catalog revision.
-    nixpkgs.url = "github:flox/nixpkgs/09063bd1f2b36fd9fd793c36dfade7bd40a93dfc";
+    nixpkgs.url = "github:flox/nixpkgs/02c087f3fe673c9e317f206a627cb6b910336dbe";
   };
 
   outputs = { self, nixpkgs }:
