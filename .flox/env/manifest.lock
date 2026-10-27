@@ -73,17 +73,17 @@
     {
       "attr_path": "cargo",
       "broken": false,
-      "derivation": "/nix/store/17p2wlnyfw5hcp1m9xw27sxca87sgd8j-cargo-1.99.0.drv",
+      "derivation": "/nix/store/qf2g6qvckqqgh0fgp1ng8dzz2sin91wz-cargo-1.99.0.drv",
       "description": "Downloads your Rust project's dependencies and builds your project",
       "install_id": "cargo",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "cargo-1.99.0",
       "pname": "cargo",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T05:50:28.784052Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T05:51:32.488930Z",
       "stabilities": [
         "unstable"
       ],
@@ -93,7 +93,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/8wx8ik9zkw9yhgaa3b2nzb0vbm82wxj5-cargo-1.99.0"
+        "out": "/nix/store/yyhrcj8z06lw33h4kln41zsgxp5kd14g-cargo-1.99.0"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -102,17 +102,17 @@
     {
       "attr_path": "cargo",
       "broken": false,
-      "derivation": "/nix/store/xf6xlk6a3srh7admlsfddsr54r0bmwbf-cargo-1.99.0.drv",
+      "derivation": "/nix/store/1qwr7aghnf9vc9vpmiw8y7489b4kzzdg-cargo-1.99.0.drv",
       "description": "Downloads your Rust project's dependencies and builds your project",
       "install_id": "cargo",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "cargo-1.99.0",
       "pname": "cargo",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.161007Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:58.729332Z",
       "stabilities": [
         "unstable"
       ],
@@ -122,7 +122,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/ncm2in4gd8s5gggz212qy21jx83ph0c1-cargo-1.99.0"
+        "out": "/nix/store/fbw7w7blbj5yvxz4fz2gc0ihm898lwgq-cargo-1.99.0"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -131,17 +131,17 @@
     {
       "attr_path": "cargo",
       "broken": false,
-      "derivation": "/nix/store/bdmb49af716r2micrhahqs3893gpabys-cargo-1.99.0.drv",
+      "derivation": "/nix/store/45ial5wyx19y9hbfz1asqbzyx1vq4gdz-cargo-1.99.0.drv",
       "description": "Downloads your Rust project's dependencies and builds your project",
       "install_id": "cargo",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "cargo-1.99.0",
       "pname": "cargo",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:52.613072Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.176242Z",
       "stabilities": [
         "unstable"
       ],
@@ -151,7 +151,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/1jwkiz96iwqdhm4bh2hvgd86ysb0b67q-cargo-1.99.0"
+        "out": "/nix/store/l3jrya2cdjmzxgdpnxzwvx3h416lcbr6-cargo-1.99.0"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -164,19 +164,20 @@
       "description": "C language family frontend for LLVM (wrapper script)",
       "install_id": "clang",
       "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "clang-wrapper-21.1.8",
       "pname": "clang",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T05:50:28.795368Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T05:51:32.499100Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
       "version": "21.1.8",
       "outputs_to_install": [
+        "out",
         "out",
         "out"
       ],
@@ -194,13 +195,13 @@
       "description": "C language family frontend for LLVM (wrapper script)",
       "install_id": "clang",
       "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "clang-wrapper-21.1.8",
       "pname": "clang",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.166825Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:58.734811Z",
       "stabilities": [
         "unstable"
       ],
@@ -223,13 +224,13 @@
       "description": "C language family frontend for LLVM (wrapper script)",
       "install_id": "clang",
       "license": "[ NCSA, [ Apache-2.0 LLVM-exception ] ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "clang-wrapper-21.1.8",
       "pname": "clang",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:52.618953Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.182223Z",
       "stabilities": [
         "unstable"
       ],
@@ -252,13 +253,13 @@
       "description": "GNU Compiler Collection, version 16.2.0",
       "install_id": "gcc-runtime",
       "license": "GPL-3.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "gcc-16.2.0",
       "pname": "gcc-unwrapped",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.239989Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:58.762845Z",
       "stabilities": [
         "unstable"
       ],
@@ -266,6 +267,7 @@
       "version": "16.2.0",
       "outputs_to_install": [
         "man",
+        "out",
         "out",
         "out",
         "out"
@@ -289,13 +291,13 @@
       "description": "GNU Compiler Collection, version 16.2.0",
       "install_id": "gcc-runtime",
       "license": "GPL-3.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "gcc-16.2.0",
       "pname": "gcc-unwrapped",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:52.638099Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.200498Z",
       "stabilities": [
         "unstable"
       ],
@@ -303,6 +305,7 @@
       "version": "16.2.0",
       "outputs_to_install": [
         "man",
+        "out",
         "out",
         "out",
         "out"
@@ -326,19 +329,20 @@
       "description": "GNU C Library",
       "install_id": "glibc",
       "license": "LGPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "glibc-2.44-57",
       "pname": "glibc",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.242748Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:58.765650Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
       "version": "2.44-57",
       "outputs_to_install": [
+        "bin",
         "bin",
         "bin",
         "bin"
@@ -362,19 +366,20 @@
       "description": "GNU C Library",
       "install_id": "glibc",
       "license": "LGPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "glibc-2.44-57",
       "pname": "glibc",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:52.640673Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.203148Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
       "version": "2.44-57",
       "outputs_to_install": [
+        "bin",
         "bin",
         "bin",
         "bin"
@@ -398,19 +403,20 @@
       "description": "Iconv(3) implementation",
       "install_id": "libiconv",
       "license": "[ BSD-2-Clause, BSD-3-Clause, APSL-1.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "libiconv-115.100.1",
       "pname": "libiconv",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T05:50:28.959571Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T05:51:32.617324Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
       "version": "115.100.1",
       "outputs_to_install": [
+        "out",
         "out",
         "out",
         "out"
@@ -426,17 +432,17 @@
     {
       "attr_path": "mdbook",
       "broken": false,
-      "derivation": "/nix/store/97x5v6r2xz2rmmyanpfh6yg07mqq37fk-mdbook-0.5.4.drv",
+      "derivation": "/nix/store/cyn8f4n4mq10cmz2g7lpb7swvpjd39qw-mdbook-0.5.4.drv",
       "description": "Create books from MarkDown",
       "install_id": "mdbook",
       "license": "MPL-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "mdbook-0.5.4",
       "pname": "mdbook",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T05:50:28.986767Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T05:51:32.628415Z",
       "stabilities": [
         "unstable"
       ],
@@ -446,7 +452,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/j8jnn4fg5fs0xvi8j7b3s7n77h1rsfbk-mdbook-0.5.4"
+        "out": "/nix/store/9qi8wczw4as909119bfqggahy4x3ycln-mdbook-0.5.4"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
@@ -455,17 +461,17 @@
     {
       "attr_path": "mdbook",
       "broken": false,
-      "derivation": "/nix/store/d41cj8rc9cx4hk84dgx5w81pi8j3pjid-mdbook-0.5.4.drv",
+      "derivation": "/nix/store/xdvzgx88plbjc0g0vpzwalnya83p87vr-mdbook-0.5.4.drv",
       "description": "Create books from MarkDown",
       "install_id": "mdbook",
       "license": "MPL-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "mdbook-0.5.4",
       "pname": "mdbook",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.635628Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:58.894868Z",
       "stabilities": [
         "unstable"
       ],
@@ -475,7 +481,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/545zjk7kmbmcagry3s30y8p8n37hn275-mdbook-0.5.4"
+        "out": "/nix/store/bgnw2i5b35i2h9llbsparbn0q6b450fm-mdbook-0.5.4"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
@@ -484,17 +490,17 @@
     {
       "attr_path": "mdbook",
       "broken": false,
-      "derivation": "/nix/store/32935ixza2fgk4l09zjmgjxi9p992bdc-mdbook-0.5.4.drv",
+      "derivation": "/nix/store/imazkgikrk5hmgybnps01k48as29y4vh-mdbook-0.5.4.drv",
       "description": "Create books from MarkDown",
       "install_id": "mdbook",
       "license": "MPL-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "mdbook-0.5.4",
       "pname": "mdbook",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:52.904865Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.380372Z",
       "stabilities": [
         "unstable"
       ],
@@ -504,7 +510,7 @@
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/qha2cw54h1qw9xgvmvyik13dj7yzxwp4-mdbook-0.5.4"
+        "out": "/nix/store/0c0ffzx8v8km2l7q08qwdfv0cw5cm36j-mdbook-0.5.4"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
@@ -517,13 +523,13 @@
       "description": "Tool that allows packages to find out information about other packages (wrapper script)",
       "install_id": "pkg-config",
       "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "pkg-config-wrapper-0.29.2",
       "pname": "pkg-config",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T05:50:29.043005Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T05:51:32.673697Z",
       "stabilities": [
         "unstable"
       ],
@@ -549,13 +555,13 @@
       "description": "Tool that allows packages to find out information about other packages (wrapper script)",
       "install_id": "pkg-config",
       "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "pkg-config-wrapper-0.29.2",
       "pname": "pkg-config",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.693387Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:58.941584Z",
       "stabilities": [
         "unstable"
       ],
@@ -563,6 +569,8 @@
       "version": "0.29.2",
       "outputs_to_install": [
         "man",
+        "out",
+        "out",
         "out",
         "out"
       ],
@@ -582,13 +590,13 @@
       "description": "Tool that allows packages to find out information about other packages (wrapper script)",
       "install_id": "pkg-config",
       "license": "GPL-2.0-or-later",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "pkg-config-wrapper-0.29.2",
       "pname": "pkg-config",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:52.954863Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.426446Z",
       "stabilities": [
         "unstable"
       ],
@@ -596,6 +604,8 @@
       "version": "0.29.2",
       "outputs_to_install": [
         "man",
+        "out",
+        "out",
         "out",
         "out"
       ],
@@ -615,13 +625,13 @@
       "description": "Safe, concurrent, practical language (wrapper script)",
       "install_id": "rustc",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "rustc-wrapper-1.99.0",
       "pname": "rustc",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T05:50:29.207665Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T05:51:32.911698Z",
       "stabilities": [
         "unstable"
       ],
@@ -647,13 +657,13 @@
       "description": "Safe, concurrent, practical language (wrapper script)",
       "install_id": "rustc",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "rustc-wrapper-1.99.0",
       "pname": "rustc",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T06:26:17.803225Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T06:24:59.071515Z",
       "stabilities": [
         "unstable"
       ],
@@ -679,13 +689,13 @@
       "description": "Safe, concurrent, practical language (wrapper script)",
       "install_id": "rustc",
       "license": "[ MIT, Apache-2.0 ]",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=02c087f3fe673c9e317f206a627cb6b910336dbe",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
       "name": "rustc-wrapper-1.99.0",
       "pname": "rustc",
-      "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
-      "rev_count": 1097682,
-      "rev_date": "2026-10-20T13:28:04Z",
-      "scrape_date": "2026-10-21T07:05:53.066590Z",
+      "rev": "3ec636362e1816bc2f0888fa0fa2c69f1bc9e504",
+      "rev_count": 1100280,
+      "rev_date": "2026-10-23T16:35:39Z",
+      "scrape_date": "2026-10-25T07:01:24.539714Z",
       "stabilities": [
         "unstable"
       ],
