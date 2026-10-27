@@ -14,6 +14,11 @@ on:
         description: Optional Flox packaging fix ref (must retain the release version)
         required: false
         type: string
+      flox-only:
+        description: Republish only the Flox package
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -29,11 +34,12 @@ jobs:
   check-nix:
     uses: ./.github/workflows/nix.yml
     with:
-      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      ref: ${{ inputs.flox-only && (inputs.flox-source-ref || inputs.tag) || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
 
   create-release:
     name: Create GitHub release
     needs: check-nix
+    if: ${{ !inputs.flox-only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +93,8 @@ jobs:
 
   publish-flox:
     name: Publish Flox (${{ matrix.system }})
-    needs: create-release
+    needs: [check-nix, create-release]
+    if: ${{ !cancelled() && needs.check-nix.result == 'success' && (needs.create-release.result == 'success' || inputs.flox-only) }}
     environment: flox
     permissions:
       contents: read
