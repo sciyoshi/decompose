@@ -471,7 +471,12 @@ pub(crate) fn write_bytes(bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     match STDOUT.try_with(|sender| sender.send(bytes.to_vec())) {
         Ok(result) => result.map_err(|_| std::io::ErrorKind::BrokenPipe.into()),
-        Err(_) => std::io::stdout().lock().write_all(bytes),
+        Err(_) => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(bytes)?;
+            // OSC reports and inline progress need delivery without a newline.
+            stdout.flush()
+        }
     }
 }
 
