@@ -192,6 +192,7 @@ decompose completion elvish > ~/.config/elvish/lib/decompose.elv
 - `decompose up -d` starts and returns immediately.
 - `decompose up --foreground` starts and streams logs.
 - `decompose up` (also `up --wait` or `up -d --wait`) waits for initialization and readiness, with an inline progress display on terminals and lifecycle messages when redirected. Use `--json` for one final machine-readable result.
+- Interactive `up` also reports startup progress and completion through [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status), supported by Rex. Set `DECOMPOSE_NO_PROGRAM_STATUS=1` to disable these reports; JSON, redirected output, and `TERM=dumb` never emit them.
 - `decompose ps` reports empty state instead of error when nothing is running.
 - Use `decompose down` from any tab/agent to stop the environment.
 

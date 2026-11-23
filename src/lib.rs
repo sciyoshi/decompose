@@ -46,6 +46,7 @@ pub mod output_model;
 pub mod paths;
 #[cfg(unix)]
 mod process_table;
+mod program_status;
 mod shutdown;
 pub mod tui;
 pub mod tuning;
@@ -160,7 +161,7 @@ pub async fn run_cli_from(
         tokio::select! {
             result = &mut invocation => break result,
             Some(bytes) = receiver.recv() => {
-                if output_error.is_none() && let Err(error) = stdout.write_all(&bytes) {
+                if output_error.is_none() && let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
                     output_error = Some(error);
                     receiver.close();
                 }
@@ -169,7 +170,7 @@ pub async fn run_cli_from(
     };
     while let Ok(bytes) = receiver.try_recv() {
         if output_error.is_none()
-            && let Err(error) = stdout.write_all(&bytes)
+            && let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush())
         {
             output_error = Some(error);
         }
@@ -463,6 +464,27 @@ enum ServiceOp {
 }
 
 async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
+    let mut status = program_status::Reporter::new(args.output.resolve());
+    status.working(
+        if args.no_start {
+            "Registering environment"
+        } else {
+            "Starting environment"
+        },
+        None,
+    );
+    let result = run_up_with_status(global, args, &mut status).await;
+    if let Err(error) = &result {
+        status.fail(error);
+    }
+    result
+}
+
+async fn run_up_with_status(
+    global: GlobalConfig,
+    args: UpArgs,
+    status: &mut program_status::Reporter,
+) -> Result<()> {
     let output_mode = args.output.resolve();
     // Only explicit foreground mode owns a newly launched environment.
     // Background startup (including the readiness wait and TUI) leaves the
@@ -523,7 +545,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
     // Request::RemoveOrphans variant is still used by other code paths.
 
     if let Some(selected) = &wait_set {
-        let result = wait_for_services_ready(&paths, selected, progress.as_mut()).await;
+        let result = wait_for_services_ready(&paths, selected, progress.as_mut(), status).await;
         if let Some(progress) = progress.as_mut() {
             progress.finish(result.is_ok())?;
         }
@@ -612,6 +634,17 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         )?;
     }
 
+    // Finish the startup report before handing control to a long-lived viewer.
+    // Subsequent viewer errors must not change the completed startup result.
+    if !got_ctrl_c {
+        status.done(if wait {
+            "Environment ready"
+        } else if args.no_start {
+            "Environment registered"
+        } else {
+            "Startup requested"
+        });
+    }
     if !attached {
         if args.tui {
             return tui::run(paths).await;
@@ -624,6 +657,7 @@ async fn run_up(global: GlobalConfig, args: UpArgs) -> Result<()> {
         } else {
             emit_detach(output_mode)?;
         }
+        status.cancel("Startup interrupted");
         return Ok(());
     }
 
@@ -2036,6 +2070,7 @@ async fn wait_for_services_ready(
     paths: &crate::model::RuntimePaths,
     selected: &std::collections::HashSet<String>,
     mut progress: Option<&mut WaitProgress>,
+    status: &mut program_status::Reporter,
 ) -> Result<()> {
     let mut signals = shutdown::Signals::new()?;
     let deadline = tokio::time::Instant::now() + crate::tuning::daemon_ready_timeout();
@@ -2065,6 +2100,7 @@ async fn wait_for_services_ready(
         });
         let mut pending = Vec::new();
         let mut failures = Vec::new();
+        let mut ready_count = 0;
         for process in eligible {
             if (process.state != "pending" && process.initialization.failure().is_some())
                 || matches!(process.state.as_str(), "failed" | "failed_to_start")
@@ -2088,6 +2124,8 @@ async fn wait_for_services_ready(
                     failures.push(process);
                 } else if !initialized || !ready {
                     pending.push(process);
+                } else {
+                    ready_count += 1;
                 }
             }
         }
@@ -2149,8 +2187,21 @@ async fn wait_for_services_ready(
             return Err(error.into());
         }
         if pending.is_empty() {
+            status.readiness(ready_count, ready_count, None);
             return Ok(());
         }
+        let detail = pending.first().map(|process| {
+            let initialization = crate::output::initialization_detail(process);
+            let detail = if !initialization.is_empty() {
+                initialization
+            } else if process.state == "running" && process.has_readiness_probe {
+                "waiting for readiness".into()
+            } else {
+                process.state.clone()
+            };
+            format!("{}: {detail}", process.name)
+        });
+        status.readiness(ready_count, ready_count + pending.len(), detail.as_deref());
         let poll = sleep(crate::tuning::daemon_ready_poll());
         tokio::pin!(poll);
         loop {

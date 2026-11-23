@@ -59,6 +59,17 @@ Consumers should ignore unfamiliar fields and event types.
   prioritize failures and pending services. A resize starts a fresh block to
   preserve earlier terminal output. Redirected output and `TERM=dumb` use
   line-by-line lifecycle messages.
+  Interactive text output also emits OSC 7501 Program Status reports for the
+  startup operation, with `app=decompose`. Progress counts ready services;
+  dependency waits remain `working`. Successful waits report `done` with
+  “Environment ready”; non-waiting starts report “Startup requested”, and
+  `--no-start` reports “Environment registered”. Failures report `error` and
+  an interrupted readiness wait reports `idle`, leaving the environment running.
+  Reporting ends before entering foreground log streaming or the TUI. These
+  reports do not monitor the background daemon or consume child status reports.
+  Set `DECOMPOSE_NO_PROGRAM_STATUS=1` to opt out. JSON, redirected stdout, and
+  `TERM=dumb` suppress reports; `NO_COLOR` only controls color. No terminal
+  capability query or stdin reading is needed.
 - `logs`, `logs -f`, `attach`, and `up --foreground` emit JSON Lines. Application
   stderr remains stdout data with `stream: "stderr"`. Log records retain
   service, process, replica, timestamp, message, partial-record, and hook

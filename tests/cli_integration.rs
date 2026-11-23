@@ -1,5 +1,7 @@
 #![cfg(not(windows))]
 
+#[path = "cli_integration/program_status.rs"]
+mod program_status;
 mod support;
 use nix::{
     sys::signal::{Signal, kill},
