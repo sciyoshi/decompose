@@ -22,7 +22,8 @@ fn terminal_command(mut command: Command, interrupt_wait: bool) -> Output {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                // libc declares winp as *const on Linux and *mut on macOS.
+                &raw mut size,
             )
         },
         0
