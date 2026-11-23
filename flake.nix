@@ -61,7 +61,7 @@
             nativeBuildInputs = [ pkgs.cargo pkgs.cacert ];
             # Includes Cargo.lock: refresh even for package-only version bumps.
             # See the Nix vendor check in .github/workflows/nix.yml.
-            outputHash = "sha256-ywsZIN5HehIcfKEyQq2O32IqJU2uwnVQB5nHX97+Mf4=";
+            outputHash = "sha256-ZYiMeFqKMtA7OUrKL3tw8a+iVopX1wpqLr7oCBzjXxU=";
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
             dontConfigure = true;
